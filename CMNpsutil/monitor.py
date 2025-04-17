@@ -4,262 +4,208 @@ import time
 import argparse
 import sys
 import os
-from datetime import datetime
-
-try:
-    from daemon import DaemonContext
-    import lockfile
-except ImportError:
-    print("Please install python-daemon: pip install python-daemon", file=sys.stderr)
-    sys.exit(1)
-
 import signal
-import ctypes
+import csv
+import subprocess
 
-# PID file for daemon tracking
 PID_FILE = '/tmp/monitor.pid'
+DEFAULT_INTERVAL = 5.0
 
-# TSC variables
-tsc_freq = None
-tsc_offset = 0
+def timestamp_ns():
+    ts = time.time_ns()
+    sec = ts // 1_000_000_000
+    nsec = ts % 1_000_000_000
+    return f"{sec}.{nsec:09d}"
 
-# --- Utility Functions ---
-
-def calibrate_tsc():
-    """Calibrate TSC frequency and offset to align with epoch time in nanoseconds."""
-    global tsc_freq, tsc_offset
+def get_interface_stats(interface):
     try:
-        libc = ctypes.CDLL(None)
-        libc.__cpuid(0, 0, 0, 0, 0)
-        tsc_start = read_tsc()
-        epoch_start = time.time_ns()
-        time.sleep(1)
-        libc.__cpuid(0, 0, 0, 0, 0)
-        tsc_end = read_tsc()
-        epoch_end = time.time_ns()
-        elapsed_tsc = tsc_end - tsc_start
-        elapsed_ns = epoch_end - epoch_start
-        tsc_freq = elapsed_tsc / elapsed_ns
-        tsc_offset = epoch_start - int(tsc_start / tsc_freq)
+        output = subprocess.check_output(
+            ['ip', '-s', 'link', 'show', 'dev', interface],
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        lines = output.splitlines()
+        rx_line = next(l for l in lines if l.strip().startswith('RX:'))
+        tx_line = next(l for l in lines if l.strip().startswith('TX:'))
+        rx_vals = list(map(int, lines[lines.index(rx_line) + 1].split()))
+        tx_vals = list(map(int, lines[lines.index(tx_line) + 1].split()))
+        return {
+            'rx_bytes': rx_vals[0],
+            'rx_packets': rx_vals[1],
+            'rx_errors': rx_vals[2],
+            'rx_dropped': rx_vals[3],
+            'tx_bytes': tx_vals[0],
+            'tx_packets': tx_vals[1],
+            'tx_errors': tx_vals[2],
+            'tx_dropped': tx_vals[3],
+        }
     except Exception:
-        tsc_freq = None
-        tsc_offset = 0
+        return {
+            'rx_bytes': '', 'rx_packets': '', 'rx_errors': '', 'rx_dropped': '',
+            'tx_bytes': '', 'tx_packets': '', 'tx_errors': '', 'tx_dropped': ''
+        }
 
-def read_tsc():
-    """Read the system clock (intended as TSC) or fall back to perf_counter_ns."""
-    try:
-        return ctypes.c_uint64(time.clock_gettime_ns(time.CLOCK_REALTIME)).value
-    except Exception:
-        return time.perf_counter_ns()
+def get_system_stats(prev_cpu, elapsed):
+    cpu = psutil.cpu_times()
+    total = sum(cpu)
+    idle = cpu.idle
+    sys_pct = 0.0
+    if prev_cpu and elapsed > 0:
+        dt_total = total - sum(prev_cpu)
+        dt_idle = idle - prev_cpu.idle
+        sys_pct = 100.0 * (dt_total - dt_idle) / dt_total if dt_total else 0.0
 
-def tsc_to_ns():
-    """Convert TSC-like clock to nanoseconds since epoch."""
-    if tsc_freq is None:
-        return time.perf_counter_ns()
-    return int(read_tsc() / tsc_freq) + tsc_offset
-
-def log_to_file(log_file, message):
-    """Append a message to the specified log file."""
-    with open(log_file, 'a') as f:
-        f.write(message + '\n')
-
-# --- Stats Collection Functions ---
-
-def find_pids(program_name):
-    """Find all process IDs for the given program name."""
-    pids = []
-    for proc in psutil.process_iter(['pid', 'name']):
-        try:
-            if program_name.lower() in proc.info['name'].lower():
-                pids.append(proc.info['pid'])
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            print(f"Error accessing process {proc.info['pid']}: {e}", file=sys.stderr)
-    return pids
-
-def get_system_stats(prev_cpu_times, elapsed_time):
-    """Retrieve system-wide CPU, memory, and network statistics."""
-    curr_cpu_times = psutil.cpu_times()
-    if prev_cpu_times and elapsed_time > 0:
-        total_delta = sum(curr_cpu_times) - sum(prev_cpu_times)
-        idle_delta = curr_cpu_times.idle - prev_cpu_times.idle
-        sys_cpu_total = 100 * (total_delta - idle_delta) / total_delta if total_delta > 0 else 0.0
-    else:
-        sys_cpu_total = 0.0
     mem = psutil.virtual_memory()
-    sys_mem_mb = mem.used / (1024 * 1024)
-    sys_mem_percent = mem.percent
-    net_io = psutil.net_io_counters()
-    return sys_cpu_total, sys_mem_mb, sys_mem_percent, net_io.bytes_sent, net_io.bytes_recv, curr_cpu_times
+    return sys_pct, mem.used, mem.percent, cpu
 
-def get_process_stats(pids, prev_proc_times, elapsed_time):
-    """Get process CPU, memory, and network stats for specified PIDs."""
-    proc_cpu_percent = 0.0
-    mem_mb = 0.0
-    mem_percent = 0.0
-    total_mem = psutil.virtual_memory().total
-    curr_proc_times = {}
+def get_process_stats(pids, prev_cpu, elapsed):
+    cpu_pct = 0.0
+    mem_used = 0
+    mem_pct = 0.0
+    new_prev = {}
     for pid in pids:
         try:
-            proc = psutil.Process(pid)
-            curr_times = proc.cpu_times()
-            curr_proc_times[pid] = curr_times
-            if pid in prev_proc_times and elapsed_time > 0:
-                delta_user = curr_times.user - prev_proc_times[pid].user
-                delta_system = curr_times.system - prev_proc_times[pid].system
-                proc_cpu_percent += (delta_user + delta_system) / elapsed_time * 100
-            mem_info = proc.memory_info()
-            mem_used = getattr(mem_info, 'pss', mem_info.rss)
-            mem_mb += mem_used / (1024 * 1024)
-            mem_percent += (mem_used / total_mem) * 100
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            print(f"Error accessing process {pid}: {e}", file=sys.stderr)
-    net_io = psutil.net_io_counters()
-    return proc_cpu_percent, mem_mb, mem_percent, net_io.bytes_sent, net_io.bytes_recv, curr_proc_times
+            p = psutil.Process(pid)
+            times = p.cpu_times()
+            if pid in prev_cpu and elapsed > 0:
+                dt = (times.user + times.system) - (
+                    prev_cpu[pid].user + prev_cpu[pid].system)
+                cpu_pct += 100.0 * dt / elapsed
+            new_prev[pid] = times
+            mi = p.memory_info()
+            mem_used += mi.rss
+            mem_pct += p.memory_percent()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return cpu_pct, mem_used, mem_pct, new_prev
 
-# --- Daemon Management ---
+def monitor(args, csv_output):
+    fieldnames = [
+        'time', 'sys_cpu_percent', 'sys_mem_used_mb', 'sys_mem_percent',
+        'proc_cpu_percent', 'proc_mem_mb', 'proc_mem_percent',
+        'rx_bytes', 'rx_packets', 'rx_errors', 'rx_dropped',
+        'tx_bytes', 'tx_packets', 'tx_errors', 'tx_dropped',
+        'pids'
+    ]
+    writer = csv.DictWriter(csv_output, fieldnames=fieldnames)
+    writer.writeheader()
 
-def kill_daemon():
-    """Kill the daemon process using the PID file."""
-    if not os.path.exists(PID_FILE):
-        print("No PID file found. Is the daemon running?", file=sys.stderr)
-        sys.exit(1)
-    try:
-        with open(PID_FILE, 'r') as f:
-            pid = int(f.read().strip())
-        os.kill(pid, signal.SIGTERM)
-        print(f"Daemon with PID {pid} terminated.", file=sys.stderr)
-        os.remove(PID_FILE)
-    except (ValueError, OSError) as e:
-        print(f"Failed to kill daemon: {e}", file=sys.stderr)
-        sys.exit(1)
+    def shutdown(signum, frame):
+        print("Shutting down monitor.", file=sys.stderr)
+        if args.daemon and os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+        sys.exit(0)
 
-# --- Main Monitoring Function ---
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
-def monitor_program(program_name, log_file, interval, daemonize=False):
-    """Monitor system and program resource usage with high-precision timestamp."""
-    calibrate_tsc()
+    if args.daemon:
+        with open(PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        print(f"Daemon started with PID {os.getpid()}.", file=sys.stderr)
 
-    last_sys_sent, last_sys_recv = 0, 0
-    last_proc_sent, last_proc_recv = 0, 0
-    prev_cpu_times = None
-    prev_proc_times = {}
+    prev_cpu = None
+    prev_proc_cpu = {}
     last_time = None
 
-    pid_refresh_interval = 10
-    pid_refresh_counter = 0
-    pids = None if program_name else []
-
-    header = f"Monitoring {'system and ' + program_name if program_name else 'system only'} (Refresh Interval: {interval}s, press Ctrl+C to stop)"
-    subheader = ("Time (s), CPU_Computer_Total (%), Mem_Computer (MB), Mem_Computer (%), Net_Computer (KB/s), "
-                 "CPU_Program (%), Mem_Program (MB), Mem_Program (%), Net_Program_SystemWide (KB/s)")
-    start_time_str = datetime.now().isoformat()
-    start_msg = f"Monitoring started at {start_time_str}"
-    note = "# Note: Net_Program_SystemWide is based on system-wide network I/O, not per-process."
-
-    if not daemonize:
-        print(header)
-        print(subheader)
-        print(start_msg)
-        if program_name:
-            print(note)
-    if log_file:
-        log_to_file(log_file, header)
-        log_to_file(log_file, subheader)
-        log_to_file(log_file, start_msg)
-        if program_name:
-            log_to_file(log_file, note)
-
-    net_io = psutil.net_io_counters()
-    last_sys_sent, last_sys_recv = net_io.bytes_sent, net_io.bytes_recv
-    last_proc_sent, last_proc_recv = net_io.bytes_sent, net_io.bytes_recv
-
+    print("Monitoring started.", file=sys.stderr)
     while True:
-        try:
-            start_time = time.time()
-            current_time_ns = tsc_to_ns()
-            elapsed_time = start_time - last_time if last_time is not None else 0.0
+        t0 = time.time()
+        ts = timestamp_ns()
+        elapsed = t0 - (last_time or t0)
 
-            if program_name:
-                if pids is None or pid_refresh_counter % pid_refresh_interval == 0:
-                    pids = find_pids(program_name)
-                pid_refresh_counter += 1
+        sys_pct, sys_mem, sys_mem_pct, cpu_t = get_system_stats(prev_cpu, elapsed)
 
-            sys_cpu_total, sys_mem_mb, sys_mem_percent, sys_current_sent, sys_current_recv, curr_cpu_times = get_system_stats(
-                prev_cpu_times, elapsed_time)
-            sys_net_rate = ((sys_current_sent - last_sys_sent) + (sys_current_recv - last_sys_recv)) / elapsed_time / 1024 if elapsed_time > 0 else 0.0
+        pids = []
+        if args.program:
+            for p in psutil.process_iter(['name']):
+                if p.info['name'] == args.program:
+                    pids.append(p.pid)
+        proc_cpu, proc_mem, proc_mem_pct, prev_proc_cpu = \
+            get_process_stats(pids, prev_proc_cpu, elapsed)
 
-            if not program_name:
-                message = f"{current_time_ns / 1e9:.6f}, {sys_cpu_total:.2f}, {sys_mem_mb:.2f}, {sys_mem_percent:.2f}, {sys_net_rate:.2f}, N/A, N/A, N/A, N/A"
-            elif not pids:
-                message = f"{current_time_ns / 1e9:.6f}, {sys_cpu_total:.2f}, {sys_mem_mb:.2f}, {sys_mem_percent:.2f}, {sys_net_rate:.2f}, 0.00, 0.00, 0.00, 0.00"
-            else:
-                proc_cpu_percent, proc_mem_mb, proc_mem_percent, proc_current_sent, proc_current_recv, curr_proc_times = get_process_stats(
-                    pids, prev_proc_times, elapsed_time)
-                proc_net_rate = ((proc_current_sent - last_proc_sent) + (proc_current_recv - last_proc_recv)) / elapsed_time / 1024 if elapsed_time > 0 else 0.0
-                message = f"{current_time_ns / 1e9:.6f}, {sys_cpu_total:.2f}, {sys_mem_mb:.2f}, {sys_mem_percent:.2f}, {sys_net_rate:.2f}, {proc_cpu_percent:.2f}, {proc_mem_mb:.2f}, {proc_mem_percent:.2f}, {proc_net_rate:.2f}"
-                last_proc_sent, last_proc_recv = proc_current_sent, proc_current_recv
-                prev_proc_times = curr_proc_times
+        iface_data = {
+            'rx_bytes': '', 'rx_packets': '', 'rx_errors': '', 'rx_dropped': '',
+            'tx_bytes': '', 'tx_packets': '', 'tx_errors': '', 'tx_dropped': ''
+        }
+        if args.iface:
+            iface_data = get_interface_stats(args.iface)
 
-            if not daemonize:
-                print(message)
-            if log_file:
-                log_to_file(log_file, message)
+        row = {
+            'time': ts,
+            'sys_cpu_percent': f"{sys_pct:.2f}",
+            'sys_mem_used_mb': f"{sys_mem / (1024*1024):.2f}",
+            'sys_mem_percent': f"{sys_mem_pct:.2f}",
+            'proc_cpu_percent': f"{proc_cpu:.2f}" if args.program else '',
+            'proc_mem_mb': f"{proc_mem / (1024*1024):.2f}" if args.program else '',
+            'proc_mem_percent': f"{proc_mem_pct:.2f}" if args.program else '',
+            'rx_bytes': iface_data['rx_bytes'],
+            'rx_packets': iface_data['rx_packets'],
+            'rx_errors': iface_data['rx_errors'],
+            'rx_dropped': iface_data['rx_dropped'],
+            'tx_bytes': iface_data['tx_bytes'],
+            'tx_packets': iface_data['tx_packets'],
+            'tx_errors': iface_data['tx_errors'],
+            'tx_dropped': iface_data['tx_dropped'],
+            'pids': f"[{';'.join(map(str, pids))}]" if pids else "[]",
+        }
 
-            last_sys_sent, last_sys_recv = sys_current_sent, sys_current_recv
-            prev_cpu_times = curr_cpu_times
-            last_time = start_time
+        writer.writerow(row)
+        csv_output.flush()
 
-            end_time = time.time()
-            execution_time = end_time - start_time
-            sleep_time = max(0, interval - execution_time)
-            time.sleep(sleep_time)
+        prev_cpu = cpu_t
+        last_time = t0
 
-        except KeyboardInterrupt:
-            stop_time_str = datetime.now().isoformat()
-            stop_msg = f"Monitoring stopped by user at {stop_time_str}"
-            if not daemonize:
-                print(stop_msg)
-            if log_file:
-                log_to_file(log_file, stop_msg)
-            break
-        except Exception as e:
-            error_msg = f"Error: {e}"
-            if not daemonize:
-                print(error_msg, file=sys.stderr)
-            if log_file:
-                log_to_file(log_file, error_msg)
-            time.sleep(interval)
+        time.sleep(max(0, args.interval - (time.time() - t0)))
 
-# --- Main Entry Point ---
+def daemonize_and_run(args, csv_output):
+    if os.fork() > 0:
+        return
+    os.setsid()
+    if os.fork() > 0:
+        sys.exit(0)
+    os.umask(0)
+    sys.stdin.flush(); sys.stdout.flush(); sys.stderr.flush()
+    with open(os.devnull, 'r') as r, open(os.devnull, 'a+') as w:
+        os.dup2(r.fileno(), sys.stdin.fileno())
+        os.dup2(w.fileno(), sys.stdout.fileno())
+        os.dup2(w.fileno(), sys.stderr.fileno())
+    monitor(args, csv_output)
 
 def main():
-    """Parse arguments and start monitoring or kill daemon."""
-    parser = argparse.ArgumentParser(description="Monitor system and program resource usage.")
-    parser.add_argument('-p', '--program', type=str, help="Name of the program to monitor (e.g., 'python')")
-    parser.add_argument('-l', '--log', type=str, help="Log file path to store output")
-    parser.add_argument('-i', '--interval', type=float, default=5.0, help="Monitoring interval in seconds (default: 5)")
-    parser.add_argument('-d', '--daemonize', action='store_true', help="Run as a daemon in the background")
-    parser.add_argument('-k', '--kill', action='store_true', help="Kill the running daemon")
+    parser = argparse.ArgumentParser(description="CSV output monitor with interface stats (raw ip -s link columns)")
+    parser.add_argument('-p', '--program', help="Exact process name to monitor")
+    parser.add_argument('-i', '--interval', type=float, default=DEFAULT_INTERVAL,
+                        help="Monitoring interval in seconds")
+    parser.add_argument('-d', '--daemon', action='store_true', help="Run as daemon")
+    parser.add_argument('-k', '--kill', action='store_true', help="Kill running daemon")
+    parser.add_argument('--iface', help="Network interface to monitor (e.g., enp0s3)")
+    parser.add_argument('-l', '--log', help="CSV output file path (writes CSV data here instead of stdout)")
     args = parser.parse_args()
 
     if args.kill:
-        kill_daemon()
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            print(f"Terminated daemon {pid}", file=sys.stderr)
+            os.remove(PID_FILE)
+        else:
+            print("No daemon PID file found.", file=sys.stderr)
         sys.exit(0)
 
-    if args.daemonize:
-        if not args.log:
-            print("Error: -l/--log is required when daemonizing.", file=sys.stderr)
-            sys.exit(1)
-        try:
-            with open(args.log, 'a') as f:
-                pass
-        except Exception as e:
-            print(f"Error: Cannot write to log file {args.log}: {e}", file=sys.stderr)
-            sys.exit(1)
-        with DaemonContext(pidfile=lockfile.FileLock(PID_FILE), stdout=open(args.log, 'a'), stderr=open(args.log, 'a')):
-            monitor_program(args.program, args.log, args.interval, daemonize=True)
+    if args.log:
+        with open(args.log, 'w', newline='') as csv_output:
+            if args.daemon:
+                daemonize_and_run(args, csv_output)
+            else:
+                monitor(args, csv_output)
     else:
-        monitor_program(args.program, args.log, args.interval, daemonize=False)
+        if args.daemon:
+            daemonize_and_run(args, sys.stdout)
+        else:
+            monitor(args, sys.stdout)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+
