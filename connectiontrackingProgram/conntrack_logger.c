@@ -1,4 +1,7 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,12 +17,17 @@
 #include <signal.h>
 #include <netdb.h>
 #include <stdatomic.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <sys/time.h>
 
 #include "spsc_queue.h"  // Your existing SPSC queue header
 
 #define MAX_MESSAGE_LEN 2048
 #define SYSLOG_PORT "514"
 #define MIN_BATCH_SIZE 5
+#define LOGFILE_PATH "/var/log/conntrack_logger.log"  // Change as needed
 
 struct config {
     char *syslog_ip;
@@ -62,6 +70,25 @@ struct syslog_data {
     atomic_int *overflow_flag;
 };
 
+// Timestamped logging function
+void log_with_timestamp(const char *fmt, ...) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm;
+    localtime_r(&tv.tv_sec, &tm);
+
+    char timestr[64];
+    strftime(timestr, sizeof(timestr), "%Y-%m-%dT%H:%M:%S", &tm);
+
+    fprintf(stdout, "[%s.%03ld] ", timestr, tv.tv_usec / 1000);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    fflush(stdout);
+}
+
 static void print_help(const char *progname) {
     printf("Usage: %s [options]\n", progname);
     printf("Options:\n");
@@ -72,6 +99,7 @@ static void print_help(const char *progname) {
     printf("  -k, --kill                Kill all running daemons (optional)\n");
     printf("  -c, --count <yes|no>      Prepend event count to each event (optional)\n");
 }
+
 
 static int parse_config(int argc, char *argv[], struct config *cfg) {
     static struct option long_options[] = {
@@ -108,7 +136,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
     }
 
     if (!cfg->kill_daemons && (!cfg->syslog_ip || !cfg->machine_name)) {
-        fprintf(stderr, "Syslog server IP/domain and machine name are required\n");
+        log_with_timestamp("Syslog server IP/domain and machine name are required\n");
         print_help(argv[0]);
         return 1;
     }
@@ -191,7 +219,6 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
     struct callback_data *cb_data = (struct callback_data *)data;
     struct conn_event event = {0};
     extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->event_counter);
-
     char buffer[1024];
     if (cb_data->count_enabled) {
         snprintf(buffer, sizeof(buffer),
@@ -211,13 +238,11 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
 
     if (!spsc_queue_enqueue(cb_data->queue, buffer)) {
         if (atomic_exchange(cb_data->overflow_flag, 1) == 0) {
-            printf("[WARNING] SPSC queue overflow: events are being dropped!\n");
-            fflush(stdout);
+            log_with_timestamp("[WARNING] SPSC queue overflow: events are being dropped!\n");
         }
     } else {
         if (atomic_exchange(cb_data->overflow_flag, 0) == 1) {
-            printf("[INFO] SPSC queue returned to normal: events are no longer being dropped.\n");
-            fflush(stdout);
+            log_with_timestamp("[INFO] SPSC queue returned to normal: events are no longer being dropped.\n");
         }
     }
 
@@ -234,7 +259,7 @@ static int connect_to_syslog(const char *host, const char *port_str) {
 
     int err = getaddrinfo(host, port_str, &hints, &res);
     if (err != 0) {
-        fprintf(stderr, "getaddrinfo failed for %s:%s: %s\n", host, port_str, gai_strerror(err));
+        log_with_timestamp("getaddrinfo failed for %s:%s: %s\n", host, port_str, gai_strerror(err));
         return -1;
     }
 
@@ -253,12 +278,11 @@ static int connect_to_syslog(const char *host, const char *port_str) {
     freeaddrinfo(res);
 
     if (sock == -1) {
-        fprintf(stderr, "Failed to connect to syslog server at %s:%s\n", host, port_str);
+        log_with_timestamp("Failed to connect to syslog server at %s:%s\n", host, port_str);
     }
 
     return sock;
 }
-
 
 static void create_syslog_message(char *msg, size_t len, const char *timestamp, const char *data) {
     snprintf(msg, len, "<134>1 %s localhost conntrack_logger - - - %s", timestamp, data);
@@ -270,8 +294,7 @@ static void *syslog_thread(void *arg) {
     char batch[MAX_MESSAGE_LEN * MIN_BATCH_SIZE] = "";
     int message_count = 0;
 
-    printf("[INFO] Syslog thread started. Waiting for events...\n");
-    fflush(stdout);
+    log_with_timestamp("[INFO] Syslog thread started. Waiting for events...\n");
 
     while (1) {
         if (!spsc_queue_dequeue(sdata->queue, &buffer)) {
@@ -303,10 +326,10 @@ static void *syslog_thread(void *arg) {
             ssize_t sent = send(sdata->syslog_fd, syslog_msg, strlen(syslog_msg), 0);
             if (sent > 0) {
                 atomic_fetch_add(sdata->bytes_transferred, sent);
-                printf("[INFO] Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
+                log_with_timestamp("[INFO] Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
                        sent, atomic_load(sdata->bytes_transferred));
             } else {
-                perror("Failed to send to syslog");
+                log_with_timestamp("Failed to send to syslog: %s\n", strerror(errno));
                 close(sdata->syslog_fd);
                 sdata->syslog_fd = -1;
             }
@@ -322,7 +345,7 @@ static void kill_all_daemons() {
     pid_t current_pid = getpid();
     FILE *fp = popen("pidof conntrack_logger", "r");
     if (!fp) {
-        perror("Failed to run pidof");
+        log_with_timestamp("Failed to run pidof\n");
         return;
     }
     char pid_str[16];
@@ -330,7 +353,7 @@ static void kill_all_daemons() {
         pid_t pid = atoi(pid_str);
         if (pid != current_pid) {
             if (kill(pid, SIGTERM) == -1) {
-                perror("Failed to kill process");
+                log_with_timestamp("Failed to kill process %d: %s\n", pid, strerror(errno));
             }
         }
     }
@@ -343,19 +366,39 @@ int main(int argc, char *argv[]) {
 
     if (cfg.kill_daemons) {
         kill_all_daemons();
-        printf("Killed all running daemons\n");
+        log_with_timestamp("Killed all running daemons\n");
         return 0;
     }
 
     if (getuid() != 0) {
-        fprintf(stderr, "This program requires root privileges. Please run with sudo.\n");
+        log_with_timestamp("This program requires root privileges. Please run with sudo.\n");
         return 1;
     }
 
-    int syslog_fd = connect_to_syslog(cfg.syslog_ip, SYSLOG_PORT);
+    // Daemonize and redirect stdout/stderr BEFORE creating threads/sockets
+    if (cfg.daemonize) {
+        if (daemon(0, 0) < 0) {
+            log_with_timestamp("Failed to daemonize: %s\n", strerror(errno));
+            return 1;
+        }
+        int logfd = open(LOGFILE_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (logfd < 0) {
+            // Can't use redirected stderr yet, so print to original stderr
+            perror("Failed to open log file for daemon output");
+            return 1;
+        }
+        if (dup2(logfd, STDOUT_FILENO) < 0 || dup2(logfd, STDERR_FILENO) < 0) {
+            perror("Failed to redirect stdout/stderr to log file");
+            close(logfd);
+            return 1;
+        }
+        close(logfd);
+        log_with_timestamp("[INFO] conntrack_logger daemon started, output redirected to %s\n", LOGFILE_PATH);
+    }
 
+    int syslog_fd = connect_to_syslog(cfg.syslog_ip, SYSLOG_PORT);
     if (syslog_fd < 0) {
-        fprintf(stderr, "Failed to connect to syslog server at %s:%d\n", cfg.syslog_ip, SYSLOG_PORT);
+        log_with_timestamp("Failed to connect to syslog server at %s:%s\n", cfg.syslog_ip, SYSLOG_PORT);
         return 1;
     }
 
@@ -377,21 +420,12 @@ int main(int argc, char *argv[]) {
     };
     pthread_t syslog_tid;
     if (pthread_create(&syslog_tid, NULL, syslog_thread, &sdata) != 0) {
-        perror("Failed to create syslog thread");
+        log_with_timestamp("Failed to create syslog thread\n");
         close(syslog_fd);
         spsc_queue_destroy(&queue);
         return 1;
     }
     pthread_detach(syslog_tid);
-
-    if (cfg.daemonize) {
-        if (daemon(0, 0) < 0) {
-            perror("Failed to daemonize");
-            close(syslog_fd);
-            spsc_queue_destroy(&queue);
-            return 1;
-        }
-    }
 
     struct callback_data cb_data = {
         .queue = &queue,
@@ -403,7 +437,7 @@ int main(int argc, char *argv[]) {
                                         NF_NETLINK_CONNTRACK_UPDATE |
                                         NF_NETLINK_CONNTRACK_DESTROY);
     if (!cth) {
-        perror("Failed to open conntrack handle");
+        log_with_timestamp("Failed to open conntrack handle: %s\n", strerror(errno));
         close(syslog_fd);
         spsc_queue_destroy(&queue);
         return 1;
@@ -411,7 +445,7 @@ int main(int argc, char *argv[]) {
 
     nfct_callback_register(cth, NFCT_T_ALL, event_cb, &cb_data);
     if (nfct_catch(cth) < 0) {
-        perror("Failed to catch conntrack events");
+        log_with_timestamp("Failed to catch conntrack events: %s\n", strerror(errno));
     }
 
     nfct_close(cth);
