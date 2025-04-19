@@ -27,6 +27,7 @@
 #define MAX_MESSAGE_LEN 2048
 #define SYSLOG_PORT "514"
 #define MIN_BATCH_SIZE 5
+#define BATCH_TIMEOUT_US 1000000  // 1 second timeout for batching
 #define LOGFILE_PATH "/var/log/conntrack_logger.log"  // Change as needed
 
 struct config {
@@ -35,12 +36,12 @@ struct config {
     int daemonize;
     int kill_daemons;
     int count_enabled;
+    int debug_enabled;  // New: Debug logging toggle
 };
 
 struct conn_event {
     long long count;
     long long timestamp_ns;
-    char hash[65];
     char src_ip[INET_ADDRSTRLEN];
     uint16_t src_port;
     char dst_ip[INET_ADDRSTRLEN];
@@ -65,13 +66,22 @@ struct syslog_data {
     int syslog_fd;
     char *machine_name;
     int count_enabled;
-    pthread_mutex_t mutex;
+    int debug_enabled;  // New: Pass debug flag to syslog thread
     atomic_size_t *bytes_transferred;
     atomic_int *overflow_flag;
 };
 
-// Timestamped logging function
+// Global debug flag for log_with_timestamp (set once in main)
+static int global_debug_enabled = 0;
+
+// Timestamped logging function with debug toggle
 void log_with_timestamp(const char *fmt, ...) {
+    // Check if message is a debug message
+    int is_debug = (strncmp(fmt, "[DEBUG]", 7) == 0);
+    if (is_debug && !global_debug_enabled) {
+        return;  // Skip debug messages if debug is disabled
+    }
+
     struct timeval tv;
     gettimeofday(&tv, NULL);
     struct tm tm;
@@ -98,8 +108,8 @@ static void print_help(const char *progname) {
     printf("  -d, --daemonize           Daemonize the program (optional)\n");
     printf("  -k, --kill                Kill all running daemons (optional)\n");
     printf("  -c, --count <yes|no>      Prepend event count to each event (optional)\n");
+    printf("  -D, --debug               Enable debug logging (optional)\n");
 }
-
 
 static int parse_config(int argc, char *argv[], struct config *cfg) {
     static struct option long_options[] = {
@@ -109,6 +119,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
         {"daemonize", no_argument, 0, 'd'},
         {"kill", no_argument, 0, 'k'},
         {"count", required_argument, 0, 'c'},
+        {"debug", no_argument, 0, 'D'},
         {0, 0, 0, 0}
     };
     int opt;
@@ -117,8 +128,9 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
     cfg->daemonize = 0;
     cfg->kill_daemons = 0;
     cfg->count_enabled = 0;
+    cfg->debug_enabled = 0;
 
-    while ((opt = getopt_long(argc, argv, "hn:l:dkc:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hn:l:dkc:D", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h': print_help(argv[0]); exit(0);
             case 'n': cfg->machine_name = optarg; break;
@@ -131,6 +143,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
                 else
                     cfg->count_enabled = 0;
                 break;
+            case 'D': cfg->debug_enabled = 1; break;
             default: print_help(argv[0]); return 1;
         }
     }
@@ -178,10 +191,6 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
     else if (proto == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
     else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %u", proto);
 
-    char hash_input[256];
-    snprintf(hash_input, sizeof(hash_input), "%s%s%u%u%s", event->src_ip, event->dst_ip, event->src_port, event->dst_port, event->protocol_str);
-    calculate_sha256(hash_input, event->hash);
-
     switch (type) {
         case NFCT_T_NEW:     event->msg_type_str = "NEW";     break;
         case NFCT_T_UPDATE:  event->msg_type_str = "UPDATE";  break;
@@ -219,32 +228,37 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
     struct callback_data *cb_data = (struct callback_data *)data;
     struct conn_event event = {0};
     extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->event_counter);
-    char buffer[1024];
+    char buffer[1024] = {0};
     if (cb_data->count_enabled) {
         snprintf(buffer, sizeof(buffer),
-            "%lld,%lld,%s,%s,%u,%s,%u,%s,%s,%u,%s,%s\n",
-            event.count, event.timestamp_ns, event.hash,
+            "%lld,%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
+            event.count, event.timestamp_ns,
             event.src_ip, event.src_port, event.dst_ip, event.dst_port,
             event.protocol_str, event.msg_type_str, event.timeout,
             event.state_str, event.assured_str);
     } else {
         snprintf(buffer, sizeof(buffer),
-            "%lld,%s,%s,%u,%s,%u,%s,%s,%u,%s,%s\n",
-            event.timestamp_ns, event.hash,
+            "%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
+            event.timestamp_ns,
             event.src_ip, event.src_port, event.dst_ip, event.dst_port,
             event.protocol_str, event.msg_type_str, event.timeout,
             event.state_str, event.assured_str);
     }
 
+    log_with_timestamp("[DEBUG] Captured conntrack event: %s\n", buffer);
+
     if (!spsc_queue_enqueue(cb_data->queue, buffer)) {
         if (atomic_exchange(cb_data->overflow_flag, 1) == 0) {
             log_with_timestamp("[WARNING] SPSC queue overflow: events are being dropped!\n");
         }
+        return NFCT_CB_CONTINUE;
     } else {
         if (atomic_exchange(cb_data->overflow_flag, 0) == 1) {
             log_with_timestamp("[INFO] SPSC queue returned to normal: events are no longer being dropped.\n");
         }
     }
+
+    log_with_timestamp("[DEBUG] Successfully enqueued event\n");
 
     return NFCT_CB_CONTINUE;
 }
@@ -259,7 +273,7 @@ static int connect_to_syslog(const char *host, const char *port_str) {
 
     int err = getaddrinfo(host, port_str, &hints, &res);
     if (err != 0) {
-        log_with_timestamp("getaddrinfo failed for %s:%s: %s\n", host, port_str, gai_strerror(err));
+        log_with_timestamp("[ERROR] getaddrinfo failed for %s:%s: %s\n", host, port_str, gai_strerror(err));
         return -1;
     }
 
@@ -278,14 +292,20 @@ static int connect_to_syslog(const char *host, const char *port_str) {
     freeaddrinfo(res);
 
     if (sock == -1) {
-        log_with_timestamp("Failed to connect to syslog server at %s:%s\n", host, port_str);
+        log_with_timestamp("[ERROR] Failed to connect to syslog server at %s:%s\n", host, port_str);
+    } else {
+        log_with_timestamp("[INFO] Successfully connected to syslog server at %s:%s\n", host, port_str);
     }
 
     return sock;
 }
 
-static void create_syslog_message(char *msg, size_t len, const char *timestamp, const char *machine_name, const char *data) {
-    snprintf(msg, len, "<134>1 %s %s conntrack_logger - - - %s", timestamp, machine_name, data);
+static void create_syslog_message(char *msg, size_t len, const char *machine_name, const char *data, const char *hash) {
+    // Insert hash into the data string
+    char modified_data[MAX_MESSAGE_LEN];
+    const char *data_start = strchr(data, ',') + 1;  // Skip timestamp (and count if present)
+    snprintf(modified_data, sizeof(modified_data), "%s,%s,%s", data, hash, data_start);
+    snprintf(msg, len, "<134> %s conntrack_logger - - - %s", machine_name, modified_data);
 }
 
 static void *syslog_thread(void *arg) {
@@ -293,49 +313,115 @@ static void *syslog_thread(void *arg) {
     char *buffer = NULL;
     char batch[MAX_MESSAGE_LEN * MIN_BATCH_SIZE] = "";
     int message_count = 0;
+    struct timeval last_sent, now;
+    gettimeofday(&last_sent, NULL);
 
     log_with_timestamp("[INFO] Syslog thread started. Waiting for events...\n");
 
     while (1) {
-        if (!spsc_queue_dequeue(sdata->queue, &buffer)) {
-            usleep(1000);
-            continue;
+        // Check for timeout
+        gettimeofday(&now, NULL);
+        long elapsed_us = (now.tv_sec - last_sent.tv_sec) * 1000000 + (now.tv_usec - last_sent.tv_usec);
+        if (message_count > 0 && elapsed_us >= BATCH_TIMEOUT_US) {
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] Timeout reached, sending %d messages\n", message_count);
+            }
+            goto send_batch;
         }
 
-        strncat(batch, buffer, sizeof(batch) - strlen(batch) - 1);
-        strncat(batch, "; ", sizeof(batch) - strlen(batch) - 1);
-        message_count++;
+        // Try to dequeue
+        if (spsc_queue_dequeue(sdata->queue, &buffer)) {
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] Dequeued buffer: %s\n", buffer);
+            }
 
-        free(buffer);
-
-        if (message_count >= MIN_BATCH_SIZE) {
-            pthread_mutex_lock(&sdata->mutex);
-            if (sdata->syslog_fd < 0) {
-                sdata->syslog_fd = connect_to_syslog(sdata->syslog_ip, SYSLOG_PORT);
-                if (sdata->syslog_fd < 0) {
-                    pthread_mutex_unlock(&sdata->mutex);
+            // Parse buffer to extract fields for hash
+            long long count, timestamp_ns;
+            char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
+            unsigned int src_port, dst_port;
+            char protocol_str[16], msg_type_str[16], state_str[16], assured_str[16];
+            unsigned int timeout;
+            int parsed;
+            if (sdata->count_enabled) {
+                parsed = sscanf(buffer,
+                    "%lld,%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15s",
+                    &count, &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
+                    protocol_str, msg_type_str, &timeout, state_str, assured_str);
+                if (parsed != 11) {
+                    log_with_timestamp("[ERROR] Failed to parse buffer with count: %s\n", buffer);
+                    free(buffer);
+                    continue;
+                }
+            } else {
+                parsed = sscanf(buffer,
+                    "%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15s",
+                    &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
+                    protocol_str, msg_type_str, &timeout, state_str, assured_str);
+                if (parsed != 10) {
+                    log_with_timestamp("[ERROR] Failed to parse buffer without count: %s\n", buffer);
+                    free(buffer);
                     continue;
                 }
             }
-            char syslog_msg[MAX_MESSAGE_LEN * MIN_BATCH_SIZE];
-            time_t now = time(NULL);
-            struct tm *tm = gmtime(&now);
-            char timestamp[64];
-            strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", tm);
-            create_syslog_message(syslog_msg, sizeof(syslog_msg), timestamp, sdata->machine_name, batch);
-            ssize_t sent = send(sdata->syslog_fd, syslog_msg, strlen(syslog_msg), 0);
+
+            // Compute hash
+            char hash_input[256];
+            snprintf(hash_input, sizeof(hash_input), "%s%s%u%u%s", src_ip, dst_ip, src_port, dst_port, protocol_str);
+            char hash[65];
+            calculate_sha256(hash_input, hash);
+
+            // Format syslog message
+            char syslog_msg[MAX_MESSAGE_LEN];
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer, hash);
+            strncat(batch, syslog_msg, sizeof(batch) - strlen(batch) - 1);
+            strncat(batch, "\n", sizeof(batch) - strlen(batch) - 1);
+            message_count++;
+
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] Added message to batch, count: %d\n", message_count);
+            }
+
+            free(buffer);
+            buffer = NULL;
+        } else {
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] No data dequeued, sleeping...\n");
+            }
+            usleep(1000);  // 1ms sleep, as in reference program
+            continue;
+        }
+
+        if (message_count >= MIN_BATCH_SIZE) {
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] Batch size reached, sending %d messages\n", message_count);
+            }
+        send_batch:
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] Sending batch of %d messages: %s\n", message_count, batch);
+            }
+            if (sdata->syslog_fd < 0) {
+                sdata->syslog_fd = connect_to_syslog(sdata->syslog_ip, SYSLOG_PORT);
+                if (sdata->syslog_fd < 0) {
+                    log_with_timestamp("[ERROR] Failed to reconnect to syslog server\n");
+                    batch[0] = '\0';
+                    message_count = 0;
+                    gettimeofday(&last_sent, NULL);
+                    continue;
+                }
+            }
+            ssize_t sent = send(sdata->syslog_fd, batch, strlen(batch), 0);
             if (sent > 0) {
                 atomic_fetch_add(sdata->bytes_transferred, sent);
                 log_with_timestamp("[INFO] Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
-                       sent, atomic_load(sdata->bytes_transferred));
+                                   sent, atomic_load(sdata->bytes_transferred));
             } else {
-                log_with_timestamp("Failed to send to syslog: %s\n", strerror(errno));
+                log_with_timestamp("[ERROR] Failed to send to syslog: %s\n", strerror(errno));
                 close(sdata->syslog_fd);
                 sdata->syslog_fd = -1;
             }
-            pthread_mutex_unlock(&sdata->mutex);
             batch[0] = '\0';
             message_count = 0;
+            gettimeofday(&last_sent, NULL);
         }
     }
     return NULL;
@@ -364,6 +450,9 @@ int main(int argc, char *argv[]) {
     struct config cfg;
     if (parse_config(argc, argv, &cfg)) return 1;
 
+    // Set global debug flag
+    global_debug_enabled = cfg.debug_enabled;
+
     if (cfg.kill_daemons) {
         kill_all_daemons();
         log_with_timestamp("Killed all running daemons\n");
@@ -383,7 +472,6 @@ int main(int argc, char *argv[]) {
         }
         int logfd = open(LOGFILE_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (logfd < 0) {
-            // Can't use redirected stderr yet, so print to original stderr
             perror("Failed to open log file for daemon output");
             return 1;
         }
@@ -398,7 +486,7 @@ int main(int argc, char *argv[]) {
 
     int syslog_fd = connect_to_syslog(cfg.syslog_ip, SYSLOG_PORT);
     if (syslog_fd < 0) {
-        log_with_timestamp("Failed to connect to syslog server at %s:%s\n", cfg.syslog_ip, SYSLOG_PORT);
+        log_with_timestamp("[ERROR] Failed to connect to syslog server at %s:%s\n", cfg.syslog_ip, SYSLOG_PORT);
         return 1;
     }
 
@@ -414,13 +502,13 @@ int main(int argc, char *argv[]) {
         .syslog_fd = syslog_fd,
         .machine_name = cfg.machine_name,
         .count_enabled = cfg.count_enabled,
-        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .debug_enabled = cfg.debug_enabled,
         .bytes_transferred = &bytes_transferred,
         .overflow_flag = &overflow_flag
     };
     pthread_t syslog_tid;
     if (pthread_create(&syslog_tid, NULL, syslog_thread, &sdata) != 0) {
-        log_with_timestamp("Failed to create syslog thread\n");
+        log_with_timestamp("[ERROR] Failed to create syslog thread\n");
         close(syslog_fd);
         spsc_queue_destroy(&queue);
         return 1;
@@ -437,21 +525,20 @@ int main(int argc, char *argv[]) {
                                         NF_NETLINK_CONNTRACK_UPDATE |
                                         NF_NETLINK_CONNTRACK_DESTROY);
     if (!cth) {
-        log_with_timestamp("Failed to open conntrack handle: %s\n", strerror(errno));
+        log_with_timestamp("[ERROR] Failed to open conntrack handle: %s\n", strerror(errno));
         close(syslog_fd);
         spsc_queue_destroy(&queue);
         return 1;
     }
 
     nfct_callback_register(cth, NFCT_T_ALL, event_cb, &cb_data);
+    log_with_timestamp("[INFO] Starting to catch conntrack events\n");
     if (nfct_catch(cth) < 0) {
-        log_with_timestamp("Failed to catch conntrack events: %s\n", strerror(errno));
+        log_with_timestamp("[ERROR] Failed to catch conntrack events: %s\n", strerror(errno));
     }
 
     nfct_close(cth);
     close(syslog_fd);
     spsc_queue_destroy(&queue);
-    pthread_mutex_destroy(&sdata.mutex);
     return 0;
 }
-
