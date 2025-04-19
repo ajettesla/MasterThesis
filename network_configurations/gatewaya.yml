@@ -1,0 +1,14 @@
+network:
+  version: 2
+  ethernets:
+    enp0s3:
+      dhcp4: true
+    enp0s8:
+      addresses:
+        - 192.168.10.20/24
+    enp0s9:
+      addresses:
+        - 192.168.30.30/24
+    enp0s10:
+      addresses:
+        - 192.168.50.60/24
