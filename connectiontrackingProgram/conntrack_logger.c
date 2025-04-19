@@ -39,6 +39,7 @@ struct config {
     int kill_daemons;
     int count_enabled;
     int debug_enabled;
+    int hash_enabled;  // New field for hash option
 };
 
 /** Structure for connection event data */
@@ -54,6 +55,7 @@ struct conn_event {
     uint32_t timeout;
     const char *state_str;
     const char *assured_str;
+    char hash[65];  // New field for hash
 };
 
 /** Structure for event callback data */
@@ -61,6 +63,7 @@ struct callback_data {
     spsc_queue_t *queue;
     atomic_int *overflow_flag;
     int count_enabled;
+    int hash_enabled;  // New field for hash option
     atomic_llong *event_counter;
 };
 
@@ -72,6 +75,7 @@ struct syslog_data {
     char *machine_name;
     int count_enabled;
     int debug_enabled;
+    int hash_enabled;  // New field for hash option
     atomic_size_t *bytes_transferred;
     atomic_int *overflow_flag;
 };
@@ -112,6 +116,7 @@ static void print_help(const char *progname) {
     printf("  -k, --kill                Kill all running daemons (optional)\n");
     printf("  -c, --count <yes|no>      Prepend event count to each event (optional)\n");
     printf("  -D, --debug               Enable debug logging (optional)\n");
+    printf("  -H, --hash                Include SHA256 hash in log messages (optional)\n");
 }
 
 /** Parse command-line arguments */
@@ -124,6 +129,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
         {"kill", no_argument, 0, 'k'},
         {"count", required_argument, 0, 'c'},
         {"debug", no_argument, 0, 'D'},
+        {"hash", no_argument, 0, 'H'},
         {0, 0, 0, 0}
     };
     int opt;
@@ -133,8 +139,9 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
     cfg->kill_daemons = 0;
     cfg->count_enabled = 0;
     cfg->debug_enabled = 0;
+    cfg->hash_enabled = 0;
 
-    while ((opt = getopt_long(argc, argv, "hn:l:dkc:D", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DH", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h': print_help(argv[0]); exit(0);
             case 'n': cfg->machine_name = optarg; break;
@@ -146,6 +153,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
                 else cfg->count_enabled = 0;
                 break;
             case 'D': cfg->debug_enabled = 1; break;
+            case 'H': cfg->hash_enabled = 1; break;
             default: print_help(argv[0]); return 1;
         }
     }
@@ -171,7 +179,7 @@ static void calculate_sha256(const char *input, char *output) {
 }
 
 /** Extract connection event details from nf_conntrack */
-static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type, struct conn_event *event, int count_enabled, atomic_llong *event_counter) {
+static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type, struct conn_event *event, int count_enabled, int hash_enabled, atomic_llong *event_counter) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     event->timestamp_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -211,7 +219,7 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
             case 0: event->state_str = "NONE"; break;
             case 1: event->state_str = "SYN_SENT"; break;
             case 2: event->state_str = "SYN_RECV"; break;
-            case 3: event->state_str = "ESTABLISHED"; break;
+            case 3: event: event->state_str = "ESTABLISHED"; break;
             case 4: event->state_str = "FIN_WAIT"; break;
             case 5: event->state_str = "CLOSE_WAIT"; break;
             case 6: event->state_str = "LAST_ACK"; break;
@@ -226,28 +234,55 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
         uint32_t status = nfct_get_attr_u32(ct, ATTR_STATUS);
         if (status & IPS_ASSURED) event->assured_str = "ASSURED";
     }
+
+    if (hash_enabled) {
+        char hash_input[256];
+        snprintf(hash_input, sizeof(hash_input), "%s%s%u%u%s", event->src_ip, event->dst_ip, event->src_port, event->dst_port, event->protocol_str);
+        calculate_sha256(hash_input, event->hash);
+    } else {
+        event->hash[0] = '\0';
+    }
 }
 
 /** Callback for connection tracking events */
 static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     struct callback_data *cb_data = (struct callback_data *)data;
     struct conn_event event = {0};
-    extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->event_counter);
+    extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->hash_enabled, cb_data->event_counter);
     char buffer[1024] = {0};
+
     if (cb_data->count_enabled) {
-        snprintf(buffer, sizeof(buffer),
-            "%lld,%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
-            event.count, event.timestamp_ns,
-            event.src_ip, event.src_port, event.dst_ip, event.dst_port,
-            event.protocol_str, event.msg_type_str, event.timeout,
-            event.state_str, event.assured_str);
+        if (cb_data->hash_enabled) {
+            snprintf(buffer, sizeof(buffer),
+                "%lld,%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s,%s",
+                event.count, event.timestamp_ns,
+                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
+                event.protocol_str, event.msg_type_str, event.timeout,
+                event.state_str, event.assured_str, event.hash);
+        } else {
+            snprintf(buffer, sizeof(buffer),
+                "%lld,%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
+                event.count, event.timestamp_ns,
+                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
+                event.protocol_str, event.msg_type_str, event.timeout,
+                event.state_str, event.assured_str);
+        }
     } else {
-        snprintf(buffer, sizeof(buffer),
-            "%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
-            event.timestamp_ns,
-            event.src_ip, event.src_port, event.dst_ip, event.dst_port,
-            event.protocol_str, event.msg_type_str, event.timeout,
-            event.state_str, event.assured_str);
+        if (cb_data->hash_enabled) {
+            snprintf(buffer, sizeof(buffer),
+                "%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s,%s",
+                event.timestamp_ns,
+                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
+                event.protocol_str, event.msg_type_str, event.timeout,
+                event.state_str, event.assured_str, event.hash);
+        } else {
+            snprintf(buffer, sizeof(buffer),
+                "%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
+                event.timestamp_ns,
+                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
+                event.protocol_str, event.msg_type_str, event.timeout,
+                event.state_str, event.assured_str);
+        }
     }
 
     log_with_timestamp("[DEBUG] Captured conntrack event: %s\n", buffer);
@@ -303,10 +338,8 @@ static int connect_to_syslog(const char *host, const char *port_str) {
 }
 
 /** Format a syslog message */
-static void create_syslog_message(char *msg, size_t len, const char *machine_name, const char *data, const char *hash) {
-    char modified_data[MAX_MESSAGE_LEN];
-    snprintf(modified_data, sizeof(modified_data), "%s,%s", data, hash);
-    snprintf(msg, len, "<134> %s conntrack_logger - - - %s", machine_name, modified_data);
+static void create_syslog_message(char *msg, size_t len, const char *machine_name, const char *data) {
+    snprintf(msg, len, "<134> %s conntrack_logger - - - %s", machine_name, data);
 }
 
 /** Syslog thread to batch and send events */
@@ -338,38 +371,58 @@ static void *syslog_thread(void *arg) {
             long long count, timestamp_ns;
             char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
             unsigned int src_port, dst_port;
-            char protocol_str[16], msg_type_str[16], state_str[16], assured_str[16];
+            char protocol_str[16], msg_type_str[16], state_str[16], assured_str[16], hash[65];
             unsigned int timeout;
             int parsed;
+
             if (sdata->count_enabled) {
-                parsed = sscanf(buffer,
-                    "%lld,%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15s",
-                    &count, &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
-                    protocol_str, msg_type_str, &timeout, state_str, assured_str);
-                if (parsed != 11) {
-                    log_with_timestamp("[ERROR] Failed to parse buffer with count: %s\n", buffer);
-                    free(buffer);
-                    continue;
+                if (sdata->hash_enabled) {
+                    parsed = sscanf(buffer,
+                        "%lld,%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,],%64s",
+                        &count, &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
+                        protocol_str, msg_type_str, &timeout, state_str, assured_str, hash);
+                    if (parsed != 12) {
+                        log_with_timestamp("[ERROR] Failed to parse buffer with count and hash: %s\n", buffer);
+                        free(buffer);
+                        continue;
+                    }
+                } else {
+                    parsed = sscanf(buffer,
+                        "%lld,%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,]",
+                        &count, &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
+                        protocol_str, msg_type_str, &timeout, state_str, assured_str);
+                    if (parsed != 11) {
+                        log_with_timestamp("[ERROR] Failed to parse buffer with count: %s\n", buffer);
+                        free(buffer);
+                        continue;
+                    }
                 }
             } else {
-                parsed = sscanf(buffer,
-                    "%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15s",
-                    &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
-                    protocol_str, msg_type_str, &timeout, state_str, assured_str);
-                if (parsed != 10) {
-                    log_with_timestamp("[ERROR] Failed to parse buffer without count: %s\n", buffer);
-                    free(buffer);
-                    continue;
+                if (sdata->hash_enabled) {
+                    parsed = sscanf(buffer,
+                        "%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,],%64s",
+                        &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
+                        protocol_str, msg_type_str, &timeout, state_str, assured_str, hash);
+                    if (parsed != 11) {
+                        log_with_timestamp("[ERROR] Failed to parse buffer with hash: %s\n", buffer);
+                        free(buffer);
+                        continue;
+                    }
+                } else {
+                    parsed = sscanf(buffer,
+                        "%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,]",
+                        &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
+                        protocol_str, msg_type_str, &timeout, state_str, assured_str);
+                    if (parsed != 10) {
+                        log_with_timestamp("[ERROR] Failed to parse buffer: %s\n", buffer);
+                        free(buffer);
+                        continue;
+                    }
                 }
             }
 
-            char hash_input[256];
-            snprintf(hash_input, sizeof(hash_input), "%s%s%u%u%s", src_ip, dst_ip, src_port, dst_port, protocol_str);
-            char hash[65];
-            calculate_sha256(hash_input, hash);
-
             char syslog_msg[MAX_MESSAGE_LEN];
-            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer, hash);
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer);
             strncat(batch, syslog_msg, sizeof(batch) - strlen(batch) - 1);
             strncat(batch, "\n", sizeof(batch) - strlen(batch) - 1);
             message_count++;
@@ -500,6 +553,7 @@ int main(int argc, char *argv[]) {
         .machine_name = cfg.machine_name,
         .count_enabled = cfg.count_enabled,
         .debug_enabled = cfg.debug_enabled,
+        .hash_enabled = cfg.hash_enabled,
         .bytes_transferred = &bytes_transferred,
         .overflow_flag = &overflow_flag
     };
@@ -516,6 +570,7 @@ int main(int argc, char *argv[]) {
         .queue = &queue,
         .overflow_flag = &overflow_flag,
         .count_enabled = cfg.count_enabled,
+        .hash_enabled = cfg.hash_enabled,
         .event_counter = &event_counter
     };
     struct nfct_handle *cth = nfct_open(CONNTRACK, NF_NETLINK_CONNTRACK_NEW |
