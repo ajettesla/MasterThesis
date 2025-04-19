@@ -22,7 +22,8 @@
 #include <stdarg.h>
 #include <sys/time.h>
 
-#include "spsc_queue.h"  // Your existing SPSC queue header
+// Replace with your SPSC queue implementation header
+#include "spsc_queue.h"
 
 #define MAX_MESSAGE_LEN 2048
 #define SYSLOG_PORT "514"
@@ -30,15 +31,17 @@
 #define BATCH_TIMEOUT_US 1000000  // 1 second timeout for batching
 #define LOGFILE_PATH "/var/log/conntrack_logger.log"  // Change as needed
 
+/** Configuration structure for command-line options */
 struct config {
     char *syslog_ip;
     char *machine_name;
     int daemonize;
     int kill_daemons;
     int count_enabled;
-    int debug_enabled;  // New: Debug logging toggle
+    int debug_enabled;
 };
 
+/** Structure for connection event data */
 struct conn_event {
     long long count;
     long long timestamp_ns;
@@ -53,6 +56,7 @@ struct conn_event {
     const char *assured_str;
 };
 
+/** Structure for event callback data */
 struct callback_data {
     spsc_queue_t *queue;
     atomic_int *overflow_flag;
@@ -60,27 +64,25 @@ struct callback_data {
     atomic_llong *event_counter;
 };
 
+/** Structure for syslog thread data */
 struct syslog_data {
     spsc_queue_t *queue;
     char *syslog_ip;
     int syslog_fd;
     char *machine_name;
     int count_enabled;
-    int debug_enabled;  // New: Pass debug flag to syslog thread
+    int debug_enabled;
     atomic_size_t *bytes_transferred;
     atomic_int *overflow_flag;
 };
 
-// Global debug flag for log_with_timestamp (set once in main)
+// Global debug flag for logging
 static int global_debug_enabled = 0;
 
-// Timestamped logging function with debug toggle
+/** Log messages with timestamps, respecting debug toggle */
 void log_with_timestamp(const char *fmt, ...) {
-    // Check if message is a debug message
     int is_debug = (strncmp(fmt, "[DEBUG]", 7) == 0);
-    if (is_debug && !global_debug_enabled) {
-        return;  // Skip debug messages if debug is disabled
-    }
+    if (is_debug && !global_debug_enabled) return;
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -99,6 +101,7 @@ void log_with_timestamp(const char *fmt, ...) {
     fflush(stdout);
 }
 
+/** Display help message */
 static void print_help(const char *progname) {
     printf("Usage: %s [options]\n", progname);
     printf("Options:\n");
@@ -111,6 +114,7 @@ static void print_help(const char *progname) {
     printf("  -D, --debug               Enable debug logging (optional)\n");
 }
 
+/** Parse command-line arguments */
 static int parse_config(int argc, char *argv[], struct config *cfg) {
     static struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
@@ -138,10 +142,8 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
             case 'd': cfg->daemonize = 1; break;
             case 'k': cfg->kill_daemons = 1; break;
             case 'c':
-                if (strcasecmp(optarg, "yes") == 0)
-                    cfg->count_enabled = 1;
-                else
-                    cfg->count_enabled = 0;
+                if (strcasecmp(optarg, "yes") == 0) cfg->count_enabled = 1;
+                else cfg->count_enabled = 0;
                 break;
             case 'D': cfg->debug_enabled = 1; break;
             default: print_help(argv[0]); return 1;
@@ -158,6 +160,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
 
 static atomic_llong event_counter = 0;
 
+/** Compute SHA256 hash of a string */
 static void calculate_sha256(const char *input, char *output) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256((unsigned char *)input, strlen(input), hash);
@@ -167,6 +170,7 @@ static void calculate_sha256(const char *input, char *output) {
     output[64] = '\0';
 }
 
+/** Extract connection event details from nf_conntrack */
 static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type, struct conn_event *event, int count_enabled, atomic_llong *event_counter) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -224,6 +228,7 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
     }
 }
 
+/** Callback for connection tracking events */
 static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     struct callback_data *cb_data = (struct callback_data *)data;
     struct conn_event event = {0};
@@ -251,7 +256,6 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
         if (atomic_exchange(cb_data->overflow_flag, 1) == 0) {
             log_with_timestamp("[WARNING] SPSC queue overflow: events are being dropped!\n");
         }
-        return NFCT_CB_CONTINUE;
     } else {
         if (atomic_exchange(cb_data->overflow_flag, 0) == 1) {
             log_with_timestamp("[INFO] SPSC queue returned to normal: events are no longer being dropped.\n");
@@ -259,17 +263,17 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
     }
 
     log_with_timestamp("[DEBUG] Successfully enqueued event\n");
-
     return NFCT_CB_CONTINUE;
 }
 
+/** Establish TCP connection to syslog server */
 static int connect_to_syslog(const char *host, const char *port_str) {
     struct addrinfo hints, *res, *rp;
     int sock = -1;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;      // IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM;  // TCP
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
     int err = getaddrinfo(host, port_str, &hints, &res);
     if (err != 0) {
@@ -279,11 +283,9 @@ static int connect_to_syslog(const char *host, const char *port_str) {
 
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock == -1)
-            continue;
+        if (sock == -1) continue;
 
-        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;  // success
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
 
         close(sock);
         sock = -1;
@@ -300,14 +302,14 @@ static int connect_to_syslog(const char *host, const char *port_str) {
     return sock;
 }
 
+/** Format a syslog message */
 static void create_syslog_message(char *msg, size_t len, const char *machine_name, const char *data, const char *hash) {
-    // Insert hash into the data string
     char modified_data[MAX_MESSAGE_LEN];
-    const char *data_start = strchr(data, ',') + 1;  // Skip timestamp (and count if present)
-    snprintf(modified_data, sizeof(modified_data), "%s,%s,%s", data, hash, data_start);
+    snprintf(modified_data, sizeof(modified_data), "%s,%s", data, hash);
     snprintf(msg, len, "<134> %s conntrack_logger - - - %s", machine_name, modified_data);
 }
 
+/** Syslog thread to batch and send events */
 static void *syslog_thread(void *arg) {
     struct syslog_data *sdata = (struct syslog_data *)arg;
     char *buffer = NULL;
@@ -319,7 +321,6 @@ static void *syslog_thread(void *arg) {
     log_with_timestamp("[INFO] Syslog thread started. Waiting for events...\n");
 
     while (1) {
-        // Check for timeout
         gettimeofday(&now, NULL);
         long elapsed_us = (now.tv_sec - last_sent.tv_sec) * 1000000 + (now.tv_usec - last_sent.tv_usec);
         if (message_count > 0 && elapsed_us >= BATCH_TIMEOUT_US) {
@@ -329,13 +330,11 @@ static void *syslog_thread(void *arg) {
             goto send_batch;
         }
 
-        // Try to dequeue
         if (spsc_queue_dequeue(sdata->queue, &buffer)) {
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] Dequeued buffer: %s\n", buffer);
             }
 
-            // Parse buffer to extract fields for hash
             long long count, timestamp_ns;
             char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
             unsigned int src_port, dst_port;
@@ -364,13 +363,11 @@ static void *syslog_thread(void *arg) {
                 }
             }
 
-            // Compute hash
             char hash_input[256];
             snprintf(hash_input, sizeof(hash_input), "%s%s%u%u%s", src_ip, dst_ip, src_port, dst_port, protocol_str);
             char hash[65];
             calculate_sha256(hash_input, hash);
 
-            // Format syslog message
             char syslog_msg[MAX_MESSAGE_LEN];
             create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer, hash);
             strncat(batch, syslog_msg, sizeof(batch) - strlen(batch) - 1);
@@ -387,7 +384,7 @@ static void *syslog_thread(void *arg) {
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] No data dequeued, sleeping...\n");
             }
-            usleep(1000);  // 1ms sleep, as in reference program
+            usleep(1000);
             continue;
         }
 
@@ -427,6 +424,7 @@ static void *syslog_thread(void *arg) {
     return NULL;
 }
 
+/** Kill all running instances of the program */
 static void kill_all_daemons() {
     pid_t current_pid = getpid();
     FILE *fp = popen("pidof conntrack_logger", "r");
@@ -446,11 +444,11 @@ static void kill_all_daemons() {
     pclose(fp);
 }
 
+/** Main function */
 int main(int argc, char *argv[]) {
     struct config cfg;
     if (parse_config(argc, argv, &cfg)) return 1;
 
-    // Set global debug flag
     global_debug_enabled = cfg.debug_enabled;
 
     if (cfg.kill_daemons) {
@@ -464,7 +462,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Daemonize and redirect stdout/stderr BEFORE creating threads/sockets
     if (cfg.daemonize) {
         if (daemon(0, 0) < 0) {
             log_with_timestamp("Failed to daemonize: %s\n", strerror(errno));
