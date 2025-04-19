@@ -284,8 +284,8 @@ static int connect_to_syslog(const char *host, const char *port_str) {
     return sock;
 }
 
-static void create_syslog_message(char *msg, size_t len, const char *timestamp, const char *data) {
-    snprintf(msg, len, "<134>1 %s localhost conntrack_logger - - - %s", timestamp, data);
+static void create_syslog_message(char *msg, size_t len, const char *timestamp, const char *machine_name, const char *data) {
+    snprintf(msg, len, "<134>1 %s %s conntrack_logger - - - %s", timestamp, machine_name, data);
 }
 
 static void *syslog_thread(void *arg) {
@@ -322,7 +322,7 @@ static void *syslog_thread(void *arg) {
             struct tm *tm = gmtime(&now);
             char timestamp[64];
             strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", tm);
-            create_syslog_message(syslog_msg, sizeof(syslog_msg), timestamp, batch);
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), timestamp, sdata->machine_name, batch);
             ssize_t sent = send(sdata->syslog_fd, syslog_msg, strlen(syslog_msg), 0);
             if (sent > 0) {
                 atomic_fetch_add(sdata->bytes_transferred, sent);
