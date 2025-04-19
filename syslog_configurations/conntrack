@@ -1,0 +1,11 @@
+/var/log/conntrack.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 640 syslog adm
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}
