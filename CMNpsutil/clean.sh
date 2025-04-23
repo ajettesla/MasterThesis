@@ -1,2 +1,2 @@
 #!/usr/bin/bash 
-sudo rm -rf monitor_stdout.log 
+sudo rm -rf monitor_stdout.log *.csv
