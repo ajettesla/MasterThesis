@@ -15,6 +15,7 @@ static int debug = 0;
 static atomic_int connection_counter = 0;
 static int total_connections = 0;
 static int concurrency = 0;
+static double wait_time = 0;  // Use double for fractional wait time
 static char *srv_ip = NULL;
 static char *srv_port = NULL;
 
@@ -101,6 +102,11 @@ void *worker(void *arg) {
 
         close(fd);
         atomic_fetch_add(&connection_counter, 1);
+
+        // Add sleep time between connections (supporting fractional seconds)
+        if (wait_time > 0) {
+            usleep((useconds_t)(wait_time * 1000000));  // Convert to microseconds
+        }
     }
     return NULL;
 }
@@ -150,15 +156,16 @@ void *monitor_conntrack(void *arg) {
 
 int main(int argc, char **argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:c:D")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:c:w:D")) != -1) {  // Added 'w' option for wait time
         switch (opt) {
         case 's': srv_ip = strdup(optarg); break;
         case 'p': srv_port = strdup(optarg); break;
         case 'n': total_connections = atoi(optarg); break;
         case 'c': concurrency = atoi(optarg); break;
+        case 'w': wait_time = atof(optarg); break;  // Parse the wait time argument as a double
         case 'D': debug = 1; break;
         default:
-            fprintf(stderr, "Usage: %s -s <server IP> -p <port> -n <total connections> -c <concurrency> [-D]\n", argv[0]);
+            fprintf(stderr, "Usage: %s -s <server IP> -p <port> -n <total connections> -c <concurrency> [-w <wait time>] [-D]\n", argv[0]);
             exit(1);
         }
     }
@@ -170,6 +177,9 @@ int main(int argc, char **argv) {
 
     printf("Starting %d connections to %s:%s with concurrency %d\n",
            total_connections, srv_ip, srv_port, concurrency);
+    if (wait_time > 0) {
+        printf("Time wait between connections: %.3f seconds\n", wait_time);
+    }
 
     pthread_t mon_thread;
     if (pthread_create(&mon_thread, NULL, monitor_conntrack, NULL) != 0) {
