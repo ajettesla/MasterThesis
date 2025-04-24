@@ -15,12 +15,26 @@ static int debug = 0;
 static atomic_int connection_counter = 0;
 static int total_connections = 0;
 static int concurrency = 0;
+static double wait_time = 0;  // Wait time between connections (fractional seconds)
 static char *srv_ip = NULL;
 static char *srv_port = NULL;
 
 struct worker_arg {
     int id;
 };
+
+// Helper function to print usage
+void print_usage(const char *prog_name) {
+    printf("Usage: %s -s <server IP> -p <port> -n <total connections> -c <concurrency> [-w <wait time>] [-D] [-h]\n", prog_name);
+    printf("  -s <server IP>       Server IP address\n");
+    printf("  -p <port>            Server port\n");
+    printf("  -n <total connections> Total number of connections to make\n");
+    printf("  -c <concurrency>     Number of concurrent workers\n");
+    printf("  -w <wait time>       Wait time (in seconds) between connections (supports fractional seconds)\n");
+    printf("  -D                   Enable debug mode\n");
+    printf("  -h                   Show this help message\n");
+    exit(0);
+}
 
 void *worker(void *arg) {
     struct worker_arg *wa = (struct worker_arg *)arg;
@@ -31,7 +45,7 @@ void *worker(void *arg) {
         int current = atomic_load(&connection_counter);
         if (current >= total_connections) break;
 
-        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }; // UDP socket type
         struct addrinfo *res;
         if (getaddrinfo(srv_ip, srv_port, &hints, &res) != 0) {
             if (debug) perror("getaddrinfo");
@@ -45,9 +59,9 @@ void *worker(void *arg) {
             continue;
         }
 
-        // Set receive timeout
+        // Set receive timeout for UDP
         struct timeval tv;
-        tv.tv_sec = 1;
+        tv.tv_sec = 1;  // Timeout of 1 second
         tv.tv_usec = 0;
         if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
             if (debug) perror("setsockopt");
@@ -56,7 +70,7 @@ void *worker(void *arg) {
             continue;
         }
 
-        // Send message to server
+        // Send message to server (UDP)
         const char *msg = "hello this is client";
         if (sendto(fd, msg, 19, 0, res->ai_addr, res->ai_addrlen) != 19) {
             if (debug) perror("sendto");
@@ -65,7 +79,7 @@ void *worker(void *arg) {
             continue;
         }
 
-        // Receive response from server
+        // Receive response from server (UDP)
         char buf[20];
         struct sockaddr_storage from;
         socklen_t fromlen = sizeof(from);
@@ -86,6 +100,11 @@ void *worker(void *arg) {
         close(fd);
         freeaddrinfo(res);
         atomic_fetch_add(&connection_counter, 1);
+
+        // Add sleep time between connections (supports fractional seconds)
+        if (wait_time > 0) {
+            usleep((useconds_t)(wait_time * 1000000));  // Convert to microseconds
+        }
     }
     return NULL;
 }
@@ -135,26 +154,32 @@ void *monitor_conntrack(void *arg) {
 
 int main(int argc, char **argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:c:D")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:c:w:Dh")) != -1) {  // Added 'h' for help
         switch (opt) {
         case 's': srv_ip = strdup(optarg); break;
         case 'p': srv_port = strdup(optarg); break;
         case 'n': total_connections = atoi(optarg); break;
         case 'c': concurrency = atoi(optarg); break;
+        case 'w': wait_time = atof(optarg); break;  // Parse wait time as a double
         case 'D': debug = 1; break;
+        case 'h':  // Show help message and exit
+            print_usage(argv[0]);
+            break;
         default:
-            fprintf(stderr, "Usage: %s -s <server IP> -p <port> -n <total connections> -c <concurrency> [-D]\n", argv[0]);
-            exit(1);
+            print_usage(argv[0]);
         }
     }
 
     if (!srv_ip || !srv_port || total_connections <= 0 || concurrency <= 0) {
         fprintf(stderr, "Missing or invalid required arguments\n");
-        exit(1);
+        print_usage(argv[0]);
     }
 
     printf("Starting %d connections to %s:%s with concurrency %d\n",
            total_connections, srv_ip, srv_port, concurrency);
+    if (wait_time > 0) {
+        printf("Time wait between connections: %.3f seconds\n", wait_time);
+    }
 
     pthread_t mon_thread;
     if (pthread_create(&mon_thread, NULL, monitor_conntrack, NULL) != 0) {
