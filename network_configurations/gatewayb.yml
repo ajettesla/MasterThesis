@@ -1,14 +1,26 @@
 network:
   version: 2
+  renderer: networkd
+
   ethernets:
     enp0s3:
+      dhcp4: false
       addresses:
-        - 192.168.20.30/24
+        - 192.168.20.20/24
     enp0s8:
+      dhcp4: false
       addresses:
         - 192.168.30.40/24
     enp0s9:
+      dhcp4: false
       addresses:
-        - 192.168.40.40/24
+        - 192.168.40.5/24
+      routes:
+        # reach Server’s other net
+        - to:   192.168.10.0/24
+          via:  192.168.30.30
+        # reach GW-A’s downstream net
+        - to:   192.168.50.0/24
+          via:  192.168.30.30
     enp0s10:
       dhcp4: true
