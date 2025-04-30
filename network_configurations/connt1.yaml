@@ -1,0 +1,16 @@
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno1:
+      dhcp4: true
+
+    enp3s0:
+      dhcp4: false
+      addresses:
+        - 192.168.2.41/24
+
+    enp3s1:
+      dhcp4: false
+      addresses:
+        - 192.168.1.20/24
