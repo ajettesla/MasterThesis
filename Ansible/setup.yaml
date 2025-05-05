@@ -1,0 +1,5 @@
+---
+- hosts: conntrack
+  become: true
+  roles:
+    - keepalived

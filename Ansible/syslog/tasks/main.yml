@@ -1,0 +1,35 @@
+- name: Install rsyslog
+  package:
+    name: rsyslog
+    state: present
+
+- name: Create log directory
+  file:
+    path: "{{ syslog_log_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Deploy rsyslog.conf
+  template:
+    src: rsyslog.conf.j2
+    dest: /etc/rsyslog.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart rsyslog
+
+  - name: Deploy logrotate configuration for conntrack.log
+  template:
+    src: logrotate_conntrack.j2
+    dest: /etc/logrotate.d/conntrack
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Ensure rsyslog is started and enabled
+  service:
+    name: rsyslog
+    state: started
+    enabled: yes

@@ -1,0 +1,46 @@
+---
+keepalived_vrrp_instances:
+  - name: CLIENT_VIP
+    virtual_router_id: 51
+    advert_int: 1
+    authentication:
+      auth_type: PASS
+      auth_pass: verysecret
+    virtual_ipaddress:
+      - 172.16.1.1
+  - name: SERVER_VIP
+    virtual_router_id: 52
+    advert_int: 1
+    authentication:
+      auth_type: PASS
+      auth_pass: verysecret
+    virtual_ipaddress:
+      - 172.16.2.1
+
+keepalived_virtual_servers:
+  - ip: 172.16.1.1
+    port: 2000
+    delay_loop: 3
+    lb_algo: rr
+    lb_kind: NAT
+    protocol: TCP
+    real_servers:
+      - ip: 172.16.2.10
+        port: 8000
+        weight: 1
+      - ip: 172.16.2.30
+        port: 8000
+        weight: 1
+  - ip: 172.16.1.1
+    port: 3000
+    delay_loop: 3
+    lb_algo: rr
+    lb_kind: NAT
+    protocol: UDP
+    real_servers:
+      - ip: 172.16.2.10
+        port: 9000
+        weight: 1
+      - ip: 172.16.2.30
+        port: 9000
+        weight: 1

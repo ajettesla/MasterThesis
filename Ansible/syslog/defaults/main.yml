@@ -1,0 +1,7 @@
+---
+# defaults/main.yml
+syslog_port: 514
+syslog_log_dir: "/var/log/syslog_server"
+syslog_log_rules:
+  - selector: "*.*"
+    filepath: "{{ syslog_log_dir }}/all.log"

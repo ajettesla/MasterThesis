@@ -1,0 +1,19 @@
+###############
+#### RULES ####
+###############
+
+# Rule for conntrack_logger
+if $msg contains "conntrack_logger ---" then {
+    action(type="omfile" file="/var/log/conntrack.log")
+    stop
+}
+
+# Standard log files, log by facility
+auth,authpriv.*			/var/log/auth.log
+*.*;auth,authpriv.none		-/var/log/syslog
+daemon.*			-/var/log/daemon.log
+
+# Remote logging
+{% for rule in syslog_log_rules %}
+{{ rule.selector }} {{ rule.filepath }}
+{% endfor %}

@@ -1,0 +1,5 @@
+keepalived_router_id: LVS_GATEWAY2
+keepalived_role: backup
+keepalived_interfaces:
+  CLIENT_VIP: enp1s1
+  SERVER_VIP: enp1s2

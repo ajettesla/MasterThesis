@@ -1,0 +1,5 @@
+keepalived_router_id: LVS_GATEWAY1
+keepalived_role: master
+keepalived_interfaces:
+  CLIENT_VIP: enp3s2
+  SERVER_VIP: enp3s1
