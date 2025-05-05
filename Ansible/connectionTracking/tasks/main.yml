@@ -1,0 +1,43 @@
+---
+- name: Install required packages
+  package:
+    name:
+      - git
+      - make
+      - gcc
+    state: present
+
+- name: Clone repository
+  git:
+    repo: "{{ repo_url }}"
+    dest: "{{ repo_dest }}"
+
+- name: Build connection tracking program
+  make:
+    chdir: "{{ repo_dest }}/connectiontrackingProgram"
+
+- name: Create systemd service for conntrack_logger
+  template:
+    src: conntrack_logger.service.j2
+    dest: /etc/systemd/system/conntrack_logger.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Set up logrotate for conntrack_logger logs
+  template:
+    src: logrotate_conntrack.j2
+    dest: /etc/logrotate.d/conntrack_logger
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Enable and start conntrack_logger service
+  systemd:
+    name: conntrack_logger
+    enabled: yes
+    state: started

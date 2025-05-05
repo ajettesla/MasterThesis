@@ -1,0 +1,13 @@
+[Unit]
+Description=UDP Server
+After=network.target
+
+[Service]
+ExecStartPre=/bin/sh -c 'echo "" > {{ log_dir }}/udp.log'
+ExecStart={{ repo_dest }}/trafGen/udp_server -p {{ udp_server_port }}
+StandardOutput=file:{{ log_dir }}/udp.log
+StandardError=file:{{ log_dir }}/udp.log
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

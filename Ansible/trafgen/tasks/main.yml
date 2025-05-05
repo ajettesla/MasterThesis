@@ -1,0 +1,86 @@
+---
+- name: Install required packages
+  package:
+    name:
+      - git
+      - make
+      - gcc
+    state: present
+
+- name: Remove existing repository directory
+  file:
+    path: "{{ repo_dest }}"
+    state: absent
+  become: yes
+  become_user: "{{ repo_user }}"
+
+- name: Ensure repository directory exists with correct ownership
+  file:
+    path: "{{ repo_dest }}"
+    state: directory
+    owner: "{{ repo_user }}"
+    group: "{{ repo_group }}"
+    mode: '0755'
+  become: yes
+  become_user: "{{ repo_user }}"
+
+- name: Mark repository directory as safe for Git
+  command: git config --global --add safe.directory {{ repo_dest }}
+  become: yes
+  become_user: "{{ repo_user }}"
+  changed_when: false
+
+- name: Clone repository
+  git:
+    repo: "{{ repo_url }}"
+    dest: "{{ repo_dest }}"
+    accept_hostkey: yes
+    update: no
+  become: yes
+  become_user: "{{ repo_user }}"
+
+- name: Build traffic generator programs
+  make:
+    chdir: "{{ repo_dest }}/trafGen"
+  become: yes
+  become_user: "{{ repo_user }}"
+
+- name: Create systemd service for tcp_server
+  template:
+    src: tcp_server.service.j2
+    dest: /etc/systemd/system/tcp_server.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Create systemd service for udp_server
+  template:
+    src: udp_server.service.j2
+    dest: /etc/systemd/system/udp_server.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Set up logrotate for traffic generator logs
+  template:
+    src: logrotate_trafgen.j2
+    dest: /etc/logrotate.d/trafgen
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+
+- name: Enable and start tcp_server service
+  systemd:
+    name: tcp_server
+    enabled: yes
+    state: started
+
+- name: Enable and start udp_server service
+  systemd:
+    name: udp_server
+    enabled: yes
+    state: started

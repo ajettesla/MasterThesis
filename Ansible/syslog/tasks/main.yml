@@ -20,7 +20,7 @@
     mode: '0644'
   notify: restart rsyslog
 
-  - name: Deploy logrotate configuration for conntrack.log
+- name: Deploy logrotate configuration for conntrack.log
   template:
     src: logrotate_conntrack.j2
     dest: /etc/logrotate.d/conntrack

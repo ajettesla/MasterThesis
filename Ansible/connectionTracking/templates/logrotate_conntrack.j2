@@ -1,0 +1,8 @@
+{{ log_dir }}/conntrack_logger.log {
+    size 10M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    create 0640 root adm
+}

@@ -1,0 +1,8 @@
+---
+repo_url: 'https://github.com/ajettesla/MasterThesis.git'
+repo_dest: '/home/ansible/traffic_ops'
+tcp_server_port: 8000
+udp_server_port: 9000
+log_dir: '/var/log'
+repo_user: 'ansible'
+repo_group: 'ansible'

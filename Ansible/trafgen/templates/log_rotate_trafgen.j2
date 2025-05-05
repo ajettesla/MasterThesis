@@ -1,0 +1,15 @@
+{{ log_dir }}/tcp.log {
+    size 10M
+    rotate 5
+    compress
+    missingok
+    notifempty
+}
+
+{{ log_dir }}/udp.log {
+    size 10M
+    rotate 5
+    compress
+    missingok
+    notifempty
+}

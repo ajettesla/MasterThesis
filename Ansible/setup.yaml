@@ -8,3 +8,14 @@
   become: true
   roles:
     - syslog
+
+- hosts: convsrc_net2
+  become: true
+  roles:
+    - trafgen
+
+- hosts: conntrack
+  become: true
+  roles:
+    - connectionTracking
+

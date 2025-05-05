@@ -1,0 +1,4 @@
+repo_url: 'https://github.com/ajettesla/MasterThesis.git'
+repo_dest: '/opt/MasterThesis'
+syslog_server_ip: '172.16.1.30'
+log_dir: '/var/log'
