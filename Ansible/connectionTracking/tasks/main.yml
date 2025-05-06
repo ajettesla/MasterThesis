@@ -17,10 +17,15 @@
     repo: "{{ repo_url }}"
     dest: "{{ repo_dest }}"
 
+- name: Run make clean
+  make:
+    chdir: "{{ repo_dest }}/connectiontrackingProgram"
+    target: clean
 
 - name: Build connection tracking program
   make:
     chdir: "{{ repo_dest }}/connectiontrackingProgram"
+
 
 - name: Create systemd service for conntrack_logger
   template:
