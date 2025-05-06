@@ -1,0 +1,50 @@
+- name: Check status of tcp_server and udp_server services
+  hosts: convsrc_net2
+  become: yes
+  tasks:
+    - name: Check status of tcp_server
+      systemd:
+        name: tcp_server
+      register: tcp_server_status
+
+    - name: Debug tcp_server status
+      debug:
+        msg: "tcp_server is {{ 'active' if tcp_server_status.status.ActiveState == 'active' else 'not active' }}"
+
+    - name: Check status of udp_server
+      systemd:
+        name: udp_server
+      register: udp_server_status
+
+    - name: Debug udp_server status
+      debug:
+        msg: "udp_server is {{ 'active' if udp_server_status.status.ActiveState == 'active' else 'not active' }}"
+
+- name: Check syslog service (rsyslog) status
+  hosts: convsrc2
+  become: yes
+  tasks:
+
+    - name: Check status of rsyslog.service
+      systemd:
+        name: rsyslog
+      register: rsyslog_status
+
+    - name: Debug rsyslog status
+      debug:
+        msg: "rsyslog is {{ 'active' if rsyslog_status.status.ActiveState == 'active' else 'not active' }}"
+
+- name: Check conntrack_logger.service status
+  hosts: conntrack
+  become: yes
+  tasks:
+
+    - name: Check status of conntrack_logger.service
+      systemd:
+        name: conntrack_logger.service
+      register: conntrack_logger_status
+
+    - name: Debug conntrack_logger status
+      debug:
+        msg: "conntrack_logger is {{ 'active' if conntrack_logger_status.status.ActiveState == 'active' else 'not active' }}"
+
