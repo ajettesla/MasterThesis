@@ -1,50 +1,91 @@
-- name: Check status of tcp_server and udp_server services
-  hosts: convsrc_net2
+- name: Check and restart services if inactive
+  hosts:
+    - convsrc_net2
+    - convsrc2
+    - conntrack
   become: yes
   tasks:
+
+    # Check and restart tcp_server service
     - name: Check status of tcp_server
       systemd:
         name: tcp_server
       register: tcp_server_status
 
+    - name: Restart tcp_server if inactive
+      systemd:
+        name: tcp_server
+        state: restarted
+      when: tcp_server_status.status.ActiveState != 'active'
+
+    - name: Check status of tcp_server after restart
+      systemd:
+        name: tcp_server
+      register: tcp_server_status_after_restart
+
     - name: Debug tcp_server status
       debug:
-        msg: "tcp_server is {{ 'active' if tcp_server_status.status.ActiveState == 'active' else 'not active' }}"
+        msg: "tcp_server is {{ 'active' if tcp_server_status_after_restart.status.ActiveState == 'active' else 'not active' }}"
 
+    # Check and restart udp_server service
     - name: Check status of udp_server
       systemd:
         name: udp_server
       register: udp_server_status
 
+    - name: Restart udp_server if inactive
+      systemd:
+        name: udp_server
+        state: restarted
+      when: udp_server_status.status.ActiveState != 'active'
+
+    - name: Check status of udp_server after restart
+      systemd:
+        name: udp_server
+      register: udp_server_status_after_restart
+
     - name: Debug udp_server status
       debug:
-        msg: "udp_server is {{ 'active' if udp_server_status.status.ActiveState == 'active' else 'not active' }}"
+        msg: "udp_server is {{ 'active' if udp_server_status_after_restart.status.ActiveState == 'active' else 'not active' }}"
 
-- name: Check syslog service (rsyslog) status
-  hosts: convsrc2
-  become: yes
-  tasks:
-
+    # Check and restart rsyslog service
     - name: Check status of rsyslog.service
       systemd:
         name: rsyslog
       register: rsyslog_status
 
+    - name: Restart rsyslog if inactive
+      systemd:
+        name: rsyslog
+        state: restarted
+      when: rsyslog_status.status.ActiveState != 'active'
+
+    - name: Check status of rsyslog after restart
+      systemd:
+        name: rsyslog
+      register: rsyslog_status_after_restart
+
     - name: Debug rsyslog status
       debug:
-        msg: "rsyslog is {{ 'active' if rsyslog_status.status.ActiveState == 'active' else 'not active' }}"
+        msg: "rsyslog is {{ 'active' if rsyslog_status_after_restart.status.ActiveState == 'active' else 'not active' }}"
 
-- name: Check conntrack_logger.service status
-  hosts: conntrack
-  become: yes
-  tasks:
-
+    # Check and restart conntrack_logger service
     - name: Check status of conntrack_logger.service
       systemd:
-        name: conntrack_logger.service
+        name: conntrack_logger
       register: conntrack_logger_status
+
+    - name: Restart conntrack_logger if inactive
+      systemd:
+        name: conntrack_logger
+        state: restarted
+      when: conntrack_logger_status.status.ActiveState != 'active'
+
+    - name: Check status of conntrack_logger after restart
+      systemd:
+        name: conntrack_logger
+      register: conntrack_logger_status_after_restart
 
     - name: Debug conntrack_logger status
       debug:
-        msg: "conntrack_logger is {{ 'active' if conntrack_logger_status.status.ActiveState == 'active' else 'not active' }}"
-
+        msg: "conntrack_logger is {{ 'active' if conntrack_logger_status_after_restart.status.ActiveState == 'active' else 'not active' }}"
