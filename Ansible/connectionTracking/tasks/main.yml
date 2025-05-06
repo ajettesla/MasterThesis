@@ -7,10 +7,16 @@
       - gcc
     state: present
 
+- name: Ensure the destination is clean
+  file:
+    path: "{{ repo_dest }}"
+    state: absent
+
 - name: Clone repository
   git:
     repo: "{{ repo_url }}"
     dest: "{{ repo_dest }}"
+
 
 - name: Build connection tracking program
   make:
