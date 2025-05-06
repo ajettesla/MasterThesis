@@ -11,6 +11,14 @@
     group: root
     mode: '0755'
 
+- name: Ensure conntrack.log exists with proper ownership and mode
+  file:
+    path: /var/log/conntrack.log
+    state: touch
+    owner: syslog
+    group: adm
+    mode: '0640'
+
 - name: Deploy rsyslog.conf
   template:
     src: rsyslog.conf.j2
