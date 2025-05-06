@@ -45,6 +45,18 @@
   become: yes
   become_user: "{{ repo_user }}"
 
+- name: Ensure log files exist
+  file:
+    path: "{{ log_dir }}/{{ item }}"
+    state: touch
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - tcp.log
+    - udp.log
+  become: yes
+
 - name: Create systemd service for tcp_server
   template:
     src: tcp_server.service.j2
