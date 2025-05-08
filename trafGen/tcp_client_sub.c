@@ -13,12 +13,15 @@
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <stdbool.h>
+#include <signal.h>
+
+#define INITIAL_OPEN_FDS 1000
 
 static int debug = 0;
 static atomic_int connection_counter = 0;
 static int total_connections = 0;
 static int concurrency = 0;
-static double wait_time = 0; // in milliseconds
+static double wait_time = 0;
 static char *srv_ip = NULL;
 static char *srv_port = NULL;
 static char *client_ip_range = NULL;
@@ -28,10 +31,21 @@ static int num_ips = 0;
 static int start_port = 0;
 static int num_ports = 0;
 static atomic_int next_k = 0;
+static bool abrupt_close = false;
+static bool reuse_addr = false;
+static volatile sig_atomic_t should_exit = 0;
 
 struct worker_arg {
     int id;
+    int *open_fds;
+    int num_open_fds;
+    int max_open_fds;
 };
+
+void sigint_handler(int sig) {
+    printf("Received SIGINT\n");
+    should_exit = 1;
+}
 
 ssize_t read_n(int fd, char *buf, size_t len) {
     size_t total = 0;
@@ -54,11 +68,11 @@ ssize_t write_n(int fd, const char *buf, size_t len) {
 }
 
 void *worker(void *arg) {
-    struct worker_arg *wa = (struct worker_arg *)arg;
+    struct worker_arg *wa = arg;
     int id = wa->id;
-    free(wa);
 
     while (1) {
+        if (should_exit) break;
         int k = atomic_fetch_add(&next_k, 1);
         if (k >= total_connections) break;
 
@@ -71,6 +85,11 @@ void *worker(void *arg) {
         if (fd < 0) {
             if (debug) perror("socket");
             continue;
+        }
+
+        if (reuse_addr) {
+            int opt = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         }
 
         struct sockaddr_in local_addr;
@@ -127,13 +146,36 @@ void *worker(void *arg) {
             if (debug) printf("Received: %s\n", buf);
         }
 
-        close(fd);
+        if (abrupt_close) {
+            if (wa->num_open_fds >= wa->max_open_fds) {
+                int new_max = wa->max_open_fds * 2;
+                int *new_open_fds = realloc(wa->open_fds, sizeof(int) * new_max);
+                if (!new_open_fds) {
+                    perror("realloc");
+                    close(fd);
+                } else {
+                    wa->open_fds = new_open_fds;
+                    wa->max_open_fds = new_max;
+                    wa->open_fds[wa->num_open_fds++] = fd;
+                }
+            } else {
+                wa->open_fds[wa->num_open_fds++] = fd;
+            }
+        } else {
+            close(fd);
+        }
         atomic_fetch_add(&connection_counter, 1);
 
         if (wait_time > 0) {
-            usleep((useconds_t)(wait_time * 1000)); // Convert ms to microseconds
+            usleep((useconds_t)(wait_time * 1000));
         }
     }
+
+    for (int i = 0; i < wa->num_open_fds; i++) {
+        close(wa->open_fds[i]);
+    }
+    free(wa->open_fds);
+    free(wa);
     return NULL;
 }
 
@@ -174,21 +216,23 @@ bool validate_port_range(int start, int end) {
 }
 
 void print_help() {
-    printf("Usage: <program_name> -s <server IP> -p <server port> -n <total connections> -c <concurrency> [-w <wait time>] [-D] [-a <client IP range>] [-r <client port range>]\n");
+    printf("Usage: <program_name> -s <server IP> -p <server port> -n <total connections> -c <concurrency> [-w <wait time>] [-D] [-a <client IP range>] [-r <client port range>] [-k] [-R]\n");
     printf("Options:\n");
     printf("  -s <server IP>         IP address of the server to connect to\n");
     printf("  -p <server port>       Port number of the server\n");
     printf("  -n <total connections> Total number of connections to make\n");
-    printf("  -c <concurrency>       Number of worker threads (concurrent connections)\n");
-    printf("  -w <wait time>         Time to wait (in milliseconds) between each connection (default: 0, no wait)\n");
+    printf("  -c <concurrency>       Number of worker threads\n");
+    printf("  -w <wait time>         Time to wait (in milliseconds) between each connection\n");
     printf("  -D                     Enable debug mode\n");
-    printf("  -a <client IP range>   IP range for source client addresses (e.g., 192.168.1.1-192.168.1.100)\n");
-    printf("  -r <client port range> Port range for source client ports (e.g., 5000-6000)\n");
+    printf("  -a <client IP range>   IP range for source client addresses\n");
+    printf("  -r <client port range> Port range for source client ports\n");
+    printf("  -k                     Keep connections open with RST\n");
+    printf("  -R                     Enable SO_REUSEADDR for sockets\n");
 }
 
 int main(int argc, char **argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:c:w:D:a:r:")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:c:w:D:a:r:kR")) != -1) {
         switch (opt) {
         case 's': srv_ip = strdup(optarg); break;
         case 'p': srv_port = strdup(optarg); break;
@@ -198,6 +242,8 @@ int main(int argc, char **argv) {
         case 'D': debug = 1; break;
         case 'a': client_ip_range = strdup(optarg); break;
         case 'r': client_port_range = strdup(optarg); break;
+        case 'k': abrupt_close = true; break;
+        case 'R': reuse_addr = true; break;
         default:
             print_help();
             exit(1);
@@ -210,7 +256,16 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    // Parse and validate port range
+    signal(SIGINT, sigint_handler);
+
+    char cmd[256];
+    if (abrupt_close) {
+        snprintf(cmd, sizeof(cmd), "iptables -A OUTPUT -p tcp -d %s --dport %s --tcp-flags RST RST -j DROP", srv_ip, srv_port);
+        system(cmd);
+        snprintf(cmd, sizeof(cmd), "iptables -A OUTPUT -p tcp -d %s --dport %s --tcp-flags FIN FIN -j DROP", srv_ip, srv_port);
+        system(cmd);
+    }
+
     char *port_dash = strchr(client_port_range, '-');
     if (!port_dash) {
         fprintf(stderr, "Invalid port range format\n");
@@ -220,12 +275,11 @@ int main(int argc, char **argv) {
     start_port = atoi(client_port_range);
     int end_port = atoi(port_dash + 1);
     if (!validate_port_range(start_port, end_port)) {
-        fprintf(stderr, "Invalid port range %d-%d (must be between 1 and 65535, start <= end)\n", start_port, end_port);
+        fprintf(stderr, "Invalid port range %d-%d\n", start_port, end_port);
         exit(1);
     }
     num_ports = end_port - start_port + 1;
 
-    // Parse client IP range
     char *ip_dash = strchr(client_ip_range, '-');
     if (!ip_dash) {
         fprintf(stderr, "Invalid IP range format\n");
@@ -256,7 +310,6 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    // Check IP availability
     bool all_ips_available = true;
     for (int i = 0; i < num_ips; i++) {
         char ip_str[16];
@@ -290,8 +343,12 @@ int main(int argc, char **argv) {
         struct worker_arg *wa = malloc(sizeof(*wa));
         if (!wa) { perror("malloc"); continue; }
         wa->id = i;
+        wa->open_fds = malloc(sizeof(int) * INITIAL_OPEN_FDS);
+        if (!wa->open_fds) { perror("malloc"); free(wa); continue; }
+        wa->num_open_fds = 0;
+        wa->max_open_fds = INITIAL_OPEN_FDS;
         if (pthread_create(&threads[i], NULL, worker, wa) != 0) {
-            perror("pthread_create"); free(wa);
+            perror("pthread_create"); free(wa->open_fds); free(wa);
         }
     }
 
@@ -300,11 +357,12 @@ int main(int argc, char **argv) {
     int last_milestone = 0;
 
     while (1) {
+        if (should_exit) break;
         int current = atomic_load(&connection_counter);
         if (current >= total_connections) break;
         int milestone = (current / ten_percent) * ten_percent;
         if (milestone > last_milestone) {
-            printf("Completed %d connections (%d%%)\n",
+            printf("Attempted %d connections (%d%%)\n",
                    milestone, (milestone * 100) / total_connections);
             last_milestone = milestone;
         }
@@ -314,7 +372,14 @@ int main(int argc, char **argv) {
     for (int i = 0; i < concurrency; i++)
         pthread_join(threads[i], NULL);
 
-    printf("Completed %d connections.\n", total_connections);
+    printf("Completed %d out of %d connections.\n", atomic_load(&connection_counter), total_connections);
+
+    if (abrupt_close) {
+        snprintf(cmd, sizeof(cmd), "iptables -D OUTPUT -p tcp -d %s --dport %s --tcp-flags RST RST -j DROP 2>/dev/null", srv_ip, srv_port);
+        system(cmd);
+        snprintf(cmd, sizeof(cmd), "iptables -D OUTPUT -p tcp -d %s --dport %s --tcp-flags FIN FIN -j DROP 2>/dev/null", srv_ip, srv_port);
+        system(cmd);
+    }
 
     free(srv_ip);
     free(srv_port);
