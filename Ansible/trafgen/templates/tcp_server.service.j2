@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 ExecStartPre=/bin/sh -c 'echo "" > {{ log_dir }}/tcp.log'
-ExecStart={{ repo_dest }}/trafGen/tcp_server_adp -p {{ tcp_server_port }} -k
+ExecStart={{ repo_dest }}/trafGen/tcp_server_er -p {{ tcp_server_port }} -k -t 1 -r
 StandardOutput=file:{{ log_dir }}/tcp.log
 StandardError=file:{{ log_dir }}/tcp.log
 Restart=always
