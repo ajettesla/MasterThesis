@@ -1,0 +1,20 @@
+./tcp_client_er -s 192.168.10.10 -p 5000 -n 1000 -c 2 -w 1 -a 192.168.50.10-20 -r 50000-65000 -k -R -D
+
+server ip is -s 
+port is -p 
+no of connection -n 
+concurrency -c 
+client ip range -a
+client port range -r 
+Reuse the prot and ip  -R
+debug -D
+reset the socket instead of fin -k 
+
+./tcp_server_er  -p 5000 -t 1 -r -k -D
+
+
+-p port number 
+-t intial threads
+-r reset instead of fin
+-k iptables appply 
+-D debug.
