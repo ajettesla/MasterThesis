@@ -39,6 +39,13 @@
   become: yes
   become_user: "{{ repo_user }}"
 
+- name: Run make clean
+  make:
+    chdir: "{{ repo_dest }}/trafGen"
+    target: clean
+  become: yes
+  become_user: "{{ repo_user }}"
+
 - name: Build traffic generator programs
   make:
     chdir: "{{ repo_dest }}/trafGen"
