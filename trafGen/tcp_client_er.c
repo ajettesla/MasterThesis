@@ -18,61 +18,68 @@
 
 #define INITIAL_OPEN_FDS 1000
 
-static atomic_int connection_counter = 0;
-static int total_connections = 0;
-static int concurrency = 0;
-static double wait_time = 0;
-static char *server_ip = NULL;
-static char *server_port = NULL;
-static char *client_ip_range = NULL;
-static char *client_port_range = NULL;
-static struct in_addr *source_ips = NULL;
-static int num_source_ips = 0;
-static int *source_ports = NULL;
-static int num_source_ports = 0;
-static atomic_int next_task = 0;
-static bool kill_flag = false;
-static bool reuse_addr = true; // SO_REUSEADDR by default
-static bool debug_mode = false;
-static volatile sig_atomic_t should_exit = 0;
-static char **add_commands = NULL;
-static char **del_commands = NULL;
-static int num_rules = 0;
+// Function prototype to fix implicit declaration
+void debug_print(const char *fmt, ...);
 
+// Global variables
+static atomic_int connection_counter = 0; // Tracks completed connections
+static int total_connections = 0;         // Total connections to make
+static int concurrency = 0;               // Number of worker threads
+static double wait_time = 0;              // Wait time after closing (ms)
+static char *server_ip = NULL;            // Server IP (single-server mode)
+static char *server_port = NULL;          // Server port (single-server mode)
+static char *client_ip_range = NULL;      // Source IP range
+static char *client_port_range = NULL;    // Source port range
+static struct in_addr *source_ips = NULL; // Parsed source IPs
+static int num_source_ips = 0;            // Number of source IPs
+static int *source_ports = NULL;          // Parsed source ports
+static int num_source_ports = 0;          // Number of source ports
+static atomic_int next_task = 0;          // Next task index for threads
+static bool kill_flag = false;            // Force RST with iptables
+static bool debug_mode = false;           // Enable debug output
+static volatile sig_atomic_t should_exit = 0; // Signal flag for exit
+static char *add_command = NULL;          // iptables add command
+static char *del_command = NULL;          // iptables delete command
+
+// Structure for target servers
 struct target_t {
     char *host;
     int port;
 };
 
-static struct target_t *targets = NULL;
-static int num_targets = 0;
-static bool single_server_mode = false;
+static struct target_t *targets = NULL;   // Array of target servers
+static int num_targets = 0;               // Number of targets
+static bool single_server_mode = false;   // Single vs. multiple server mode
 
+// Print usage instructions
 void print_help(void) {
     printf("Usage:\n");
-    printf("  Single-server mode: %s -s <server IP> -p <server port> -n <total connections> [options]\n", "tcp_client");
+    printf("  %s -s <server IP> -p <server port> -n <total connections> [options]\n", "tcp_client");
     printf("\nOptions:\n");
-    printf("  -s <server IP>         IP address of the server (single-server mode)\n");
-    printf("  -p <server port>       Port number of the server (single-server mode)\n");
-    printf("  -n <total connections> Number of connections to make (single-server mode)\n");
+    printf("  -s <server IP>         IP address of the server\n");
+    printf("  -p <server port>       Port number of the server\n");
+    printf("  -n <total connections> Number of connections to make\n");
     printf("  -c <concurrency>       Number of worker threads\n");
     printf("  -w <wait time>         Wait time (ms) after closing each connection\n");
     printf("  -a <client IP range>   Source IP range (e.g., 192.168.1.1-10)\n");
     printf("  -r <client port range> Source port range (e.g., 5000-5100)\n");
     printf("  -k                     Force RST on close with iptables rule\n");
-    printf("  -R                     Enable SO_REUSEADDR (default: enabled)\n");
     printf("  -D                     Enable debug mode\n");
     printf("  -h                     Show this help message\n");
+    printf("\nNote: Additional host-port pairs can be specified as arguments.\n");
     exit(0);
 }
 
+// Handle SIGINT (Ctrl+C) to clean up iptables rules
 void sigint_handler(int sig) {
     should_exit = 1;
-    for (int i = 0; i < num_rules; i++) {
-        system(del_commands[i]);
+    if (kill_flag) {
+        system(del_command);
+        debug_print("Removed general iptables rule on Ctrl+C");
     }
 }
 
+// Read exactly n bytes from a file descriptor
 ssize_t read_n(int fd, char *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -83,6 +90,7 @@ ssize_t read_n(int fd, char *buf, size_t len) {
     return total;
 }
 
+// Write exactly n bytes to a file descriptor
 ssize_t write_n(int fd, const char *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -93,6 +101,7 @@ ssize_t write_n(int fd, const char *buf, size_t len) {
     return total;
 }
 
+// Print debug messages if debug mode is enabled
 void debug_print(const char *fmt, ...) {
     if (debug_mode) {
         va_list args;
@@ -104,6 +113,7 @@ void debug_print(const char *fmt, ...) {
     }
 }
 
+// Check if an IP address is available on the local machine
 bool is_ip_local(const char *ip_str) {
     struct ifaddrs *ifaddr, *ifa;
     int family;
@@ -116,7 +126,6 @@ bool is_ip_local(const char *ip_str) {
 
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL) continue;
-
         family = ifa->ifa_addr->sa_family;
         if (family == AF_INET) {
             if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
@@ -128,11 +137,11 @@ bool is_ip_local(const char *ip_str) {
             }
         }
     }
-
     freeifaddrs(ifaddr);
     return false;
 }
 
+// Parse an IP range (e.g., "192.168.1.1-10") into an array of in_addr
 void parse_ip_range(char *range, struct in_addr **ips, int *num_ips) {
     char *dash = strchr(range, '-');
     if (!dash) {
@@ -179,6 +188,7 @@ void parse_ip_range(char *range, struct in_addr **ips, int *num_ips) {
     }
 }
 
+// Parse a port range (e.g., "5000-5100") into an array of integers
 void parse_port_range(char *range, int **ports, int *num_ports) {
     char *dash = strchr(range, '-');
     if (!dash) {
@@ -199,6 +209,7 @@ void parse_port_range(char *range, int **ports, int *num_ports) {
     }
 }
 
+// Worker thread function to handle connections
 void *worker(void *arg) {
     int id = *(int*)arg;
     free(arg);
@@ -208,16 +219,18 @@ void *worker(void *arg) {
         int task_id = atomic_fetch_add(&next_task, 1);
         if (task_id >= total_connections) break;
 
+        // Determine target host and port
         char *target_host;
         int target_port;
         if (single_server_mode) {
             target_host = server_ip;
             target_port = atoi(server_port);
         } else {
-            target_host = targets[task_id].host;
-            target_port = targets[task_id].port;
+            target_host = targets[task_id % num_targets].host;
+            target_port = targets[task_id % num_targets].port;
         }
 
+        // Select source IP and port
         struct in_addr source_ip;
         int source_port = 0;
         if (num_source_ips > 0) {
@@ -231,17 +244,19 @@ void *worker(void *arg) {
             source_port = source_ports[port_index];
         }
 
+        // Create socket
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             if (debug_mode) perror("socket");
             continue;
         }
 
-        if (reuse_addr) {
-            int opt = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        }
+        // Enable SO_REUSEADDR
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        debug_print("Worker %d: Enabled SO_REUSEADDR for task %d", id, task_id);
 
+        // Bind to source IP/port if specified
         if (num_source_ips > 0 || source_port != 0) {
             struct sockaddr_in local_addr;
             memset(&local_addr, 0, sizeof(local_addr));
@@ -257,8 +272,10 @@ void *worker(void *arg) {
                 close(fd);
                 continue;
             }
+            debug_print("Worker %d: Bound to %s:%d for task %d", id, inet_ntoa(source_ip), source_port, task_id);
         }
 
+        // Resolve target address
         struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
         struct addrinfo *res;
         char port_str[6];
@@ -269,6 +286,9 @@ void *worker(void *arg) {
             continue;
         }
 
+        debug_print("Worker %d: Connecting to %s:%d for task %d", id, target_host, target_port, task_id);
+
+        // Connect to target
         if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
             if (debug_mode) perror("connect");
             close(fd);
@@ -277,63 +297,60 @@ void *worker(void *arg) {
         }
         freeaddrinfo(res);
 
-        if (debug_mode) {
-            char source_ip_str[INET_ADDRSTRLEN] = "system";
-            if (num_source_ips > 0) {
-                inet_ntop(AF_INET, &source_ip, source_ip_str, INET_ADDRSTRLEN);
-            }
-            printf("Worker %d: Connected from %s:%d to %s:%d\n", id, source_ip_str, source_port, target_host, target_port);
-        }
+        debug_print("Worker %d: Connected to %s:%d for task %d", id, target_host, target_port, task_id);
 
+        // Send message
         const char *msg = "hello\n";
         if (write_n(fd, msg, strlen(msg)) < 0) {
             if (debug_mode) perror("write");
             close(fd);
             continue;
         }
+        debug_print("Worker %d: Sent 'hello' to %s:%d", id, target_host, target_port);
 
+        // Receive response
         char buf[1024];
         ssize_t n = read_n(fd, buf, 6);
         if (n < 0) {
             if (debug_mode) perror("read");
         } else if (n < 6) {
-            if (debug_mode) printf("Short read: %zd bytes\n", n);
+            debug_print("Worker %d: Short read from %s:%d, got %zd bytes", id, target_host, target_port, n);
         } else {
             buf[6] = '\0';
-            if (strcmp(buf, "hello\n") != 0) {
-                if (debug_mode) printf("Received unexpected response: '%s'\n", buf);
-            } else {
-                if (debug_mode) printf("Received expected response\n");
-            }
+            debug_print("Worker %d: Received '%s' from %s:%d", id, buf, target_host, target_port);
         }
 
+        // Force RST if enabled
         if (kill_flag) {
             struct linger sl = {1, 0};
             setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
-            if (debug_mode) printf("Set SO_LINGER to force RST on close\n");
+            debug_print("Worker %d: Set SO_LINGER to force RST for task %d", id, task_id);
         }
 
+        // Close connection
         close(fd);
-        if (debug_mode) printf("Closed connection\n");
+        debug_print("Worker %d: Closed connection to %s:%d", id, target_host, target_port);
 
+        // Wait if specified
         if (wait_time > 0) {
             usleep((useconds_t)(wait_time * 1000));
+            debug_print("Worker %d: Waited %.2f ms after closing", id, wait_time);
         }
 
+        // Update and report progress
         int current = atomic_fetch_add(&connection_counter, 1) + 1;
-        if (total_connections >= 10) {
-            int milestone = total_connections / 10;
-            if (current % milestone == 0) {
-                printf("Attempted %d connections (%d%%)\n", current, (current * 100) / total_connections);
-            }
+        if (total_connections >= 10 && current % (total_connections / 10) == 0) {
+            printf("Progress: %d/%d connections (%d%%)\n", current, total_connections, (current * 100) / total_connections);
         }
     }
+    debug_print("Worker %d: Exiting", id);
     return NULL;
 }
 
+// Main function
 int main(int argc, char **argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:c:w:a:r:kR:Dh")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:c:w:a:r:kDh")) != -1) {
         switch (opt) {
             case 's': server_ip = strdup(optarg); break;
             case 'p': server_port = strdup(optarg); break;
@@ -343,24 +360,19 @@ int main(int argc, char **argv) {
             case 'a': client_ip_range = strdup(optarg); break;
             case 'r': client_port_range = strdup(optarg); break;
             case 'k': kill_flag = true; break;
-            case 'R': reuse_addr = true; break;
             case 'D': debug_mode = true; break;
             case 'h': print_help(); break;
             default:
                 fprintf(stderr, "Usage: %s -s <server IP> -p <server port> -n <total connections> [options]\n", argv[0]);
-                fprintf(stderr, "Use -h for help\n");
                 exit(1);
         }
     }
 
+    // Determine mode and parse targets
     if (server_ip && server_port) {
         single_server_mode = true;
-        if (optind < argc) {
-            fprintf(stderr, "Extra arguments provided with -s and -p\n");
-            exit(1);
-        }
         if (total_connections <= 0) {
-            fprintf(stderr, "Must specify -n > 0 for single server mode\n");
+            fprintf(stderr, "Must specify -n > 0 with -s and -p\n");
             exit(1);
         }
         num_targets = 1;
@@ -371,55 +383,57 @@ int main(int argc, char **argv) {
             exit(1);
         }
         num_targets = remaining / 2;
-        if (num_targets == 0) {
-            fprintf(stderr, "Must specify either -s and -p or host-port pairs\n");
+        if (num_targets > 0) {
+            targets = malloc(sizeof(struct target_t) * num_targets);
+            for (int i = 0; i < num_targets; i++) {
+                targets[i].host = strdup(argv[optind + 2*i]);
+                targets[i].port = atoi(argv[optind + 2*i + 1]);
+            }
+            total_connections = num_targets;
+        } else {
+            fprintf(stderr, "Must specify -s and -p or host-port pairs\n");
             exit(1);
         }
-        targets = malloc(sizeof(struct target_t) * num_targets);
-        for (int i = 0; i < num_targets; i++) {
-            targets[i].host = strdup(argv[optind + 2*i]);
-            targets[i].port = atoi(argv[optind + 2*i + 1]);
-        }
-        total_connections = num_targets;
     }
 
+    // Validate concurrency
     if (concurrency <= 0) {
         fprintf(stderr, "Must specify -c > 0\n");
         exit(1);
     }
 
+    // Parse source IP range
     if (client_ip_range) {
         parse_ip_range(client_ip_range, &source_ips, &num_source_ips);
         for (int i = 0; i < num_source_ips; i++) {
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &source_ips[i], ip_str, INET_ADDRSTRLEN);
             if (!is_ip_local(ip_str)) {
-                fprintf(stderr, "Warning: IP address %s is not available on this machine\n", ip_str);
+                fprintf(stderr, "Warning: IP %s not local\n", ip_str);
             }
         }
     }
 
+    // Parse source port range
     if (client_port_range) {
         parse_port_range(client_port_range, &source_ports, &num_source_ports);
     }
 
+    // Set up signal handler
     signal(SIGINT, sigint_handler);
 
+    // Set up iptables rule if forcing RST
     if (kill_flag) {
-        add_commands = malloc(sizeof(char*) * num_targets);
-        del_commands = malloc(sizeof(char*) * num_targets);
-        for (int i = 0; i < num_targets; i++) {
-            char *host = single_server_mode ? server_ip : targets[i].host;
-            int port = single_server_mode ? atoi(server_port) : targets[i].port;
-            add_commands[i] = malloc(256);
-            del_commands[i] = malloc(256);
-            snprintf(add_commands[i], 256, "iptables -A OUTPUT -p tcp -d %s --dport %d --tcp-flags RST RST -j DROP", host, port);
-            snprintf(del_commands[i], 256, "iptables -D OUTPUT -p tcp -d %s --dport %d --tcp-flags RST RST -j DROP", host, port);
-            system(add_commands[i]);
+        add_command = "iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP";
+        del_command = "iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP";
+        if (system(add_command) != 0) {
+            fprintf(stderr, "Failed to add iptables rule\n");
+            exit(1);
         }
-        num_rules = num_targets;
+        debug_print("Added general iptables rule");
     }
 
+    // Create worker threads
     pthread_t *threads = malloc(sizeof(pthread_t) * concurrency);
     for (int i = 0; i < concurrency; i++) {
         int *id = malloc(sizeof(int));
@@ -430,22 +444,21 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Wait for threads to complete
     for (int i = 0; i < concurrency; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    if (kill_flag) {
-        for (int i = 0; i < num_rules; i++) {
-            system(del_commands[i]);
-            free(add_commands[i]);
-            free(del_commands[i]);
-        }
-        free(add_commands);
-        free(del_commands);
+    // Clean up iptables rule if not interrupted
+    if (kill_flag && !should_exit) {
+        system(del_command);
+        debug_print("Removed general iptables rule");
     }
 
-    printf("Completed %d out of %d connections.\n", atomic_load(&connection_counter), total_connections);
+    // Print final status
+    printf("Completed %d/%d connections\n", atomic_load(&connection_counter), total_connections);
 
+    // Free allocated memory
     if (server_ip) free(server_ip);
     if (server_port) free(server_port);
     if (client_ip_range) free(client_ip_range);
@@ -453,9 +466,7 @@ int main(int argc, char **argv) {
     if (source_ips) free(source_ips);
     if (source_ports) free(source_ports);
     if (targets) {
-        for (int i = 0; i < num_targets; i++) {
-            free(targets[i].host);
-        }
+        for (int i = 0; i < num_targets; i++) free(targets[i].host);
         free(targets);
     }
     free(threads);
