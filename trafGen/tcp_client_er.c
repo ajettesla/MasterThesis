@@ -348,7 +348,6 @@ int main(int argc, char **argv) {
             case 'h': print_help(); break;
             default:
                 fprintf(stderr, "Usage: %s -s <server IP> -p <server port> -n <total connections> [options]\n", argv[0]);
-                fprintf(stderr, "       %s [options] host1 port1 [host2 port2 ...]\n", argv[0]);
                 fprintf(stderr, "Use -h for help\n");
                 exit(1);
         }
