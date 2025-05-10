@@ -51,7 +51,6 @@ static bool single_server_mode = false;
 void print_help(void) {
     printf("Usage:\n");
     printf("  Single-server mode: %s -s <server IP> -p <server port> -n <total connections> [options]\n", "tcp_client");
-    printf("  Multiple-server mode: %s [options] host1 port1 [host2 port2 ...]\n", "tcp_client");
     printf("\nOptions:\n");
     printf("  -s <server IP>         IP address of the server (single-server mode)\n");
     printf("  -p <server port>       Port number of the server (single-server mode)\n");
