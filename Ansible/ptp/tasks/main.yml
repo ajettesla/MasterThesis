@@ -44,3 +44,28 @@
     name: ptp4l
     enabled: true
     state: started
+
+- name: Configure rsyslog to forward ptp4l logs
+  template:
+    src: rsyslog-ptp4l-forward.conf.j2
+    dest: /etc/rsyslog.d/50-ptp4l-forward.conf
+    mode: '0644'
+  notify: Restart rsyslog
+  when: ptp4l_mode == "slave"
+
+- name: Ensure journald forwards logs to syslog
+  lineinfile:
+    path: /etc/systemd/journald.conf
+    regexp: '^#?ForwardToSyslog='
+    line: 'ForwardToSyslog=yes'
+  notify: Restart journald
+  when: ptp4l_mode == "slave"
+
+- name: Restart journald
+  systemd:
+    name: systemd-journald
+    state: restarted
+  when: ptp4l_mode == "slave"
+
+
+

@@ -1,0 +1,7 @@
+# Forward ptp4l logs to remote syslog server
+{% if syslog_transport == 'tcp' %}
+if $programname == 'ptp4l' then @@{{ syslog_server_ip }}:{{ syslog_server_port }}
+{% else %}
+if $programname == 'ptp4l' then @{{ syslog_server_ip }}:{{ syslog_server_port }}
+{% endif %}
+& stop

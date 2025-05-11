@@ -3,3 +3,10 @@
     name: ptp4l
     state: restarted
     daemon_reload: yes
+
+- name: Restart rsyslog
+  systemd:
+    name: rsyslog
+    state: restarted
+  when: ptp4l_mode == "slave"
+
