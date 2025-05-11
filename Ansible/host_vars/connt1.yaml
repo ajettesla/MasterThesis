@@ -3,3 +3,6 @@ keepalived_role: master
 keepalived_interfaces:
   CLIENT_VIP: enp3s2
   SERVER_VIP: enp3s1
+
+ptp4l_mode: master
+ptp4l_interface: enp3s0

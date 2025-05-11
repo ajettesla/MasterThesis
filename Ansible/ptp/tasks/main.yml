@@ -1,0 +1,46 @@
+- name: Ensure linuxptp is installed
+  package:
+    name: linuxptp
+    state: present
+
+- name: Create PTP4L config directory
+  file:
+    path: "{{ ptp4l_config_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Deploy PTP4L config file (master)
+  template:
+    src: ptp4l-master.conf.j2
+    dest: "{{ ptp4l_config_dir }}/ptp4l.conf"
+  when: ptp4l_mode == "master"
+  notify: Restart ptp4l
+
+- name: Deploy PTP4L config file (slave)
+  template:
+    src: ptp4l-slave.conf.j2
+    dest: "{{ ptp4l_config_dir }}/ptp4l.conf"
+  when: ptp4l_mode == "slave"
+  notify: Restart ptp4l
+
+- name: Create systemd service for ptp4l
+  copy:
+    dest: /etc/systemd/system/ptp4l.service
+    content: |
+      [Unit]
+      Description=PTP IEEE 1588 daemon (ptp4l)
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/sbin/ptp4l -f {{ ptp4l_config_dir }}/ptp4l.conf -i {{ ptp4l_interface }} {% if ptp4l_mode == 'slave' %}-s{% endif %} -m
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart ptp4l
+
+- name: Enable and start ptp4l service
+  systemd:
+    name: ptp4l
+    enabled: true
+    state: started

@@ -3,3 +3,8 @@ keepalived_role: backup
 keepalived_interfaces:
   CLIENT_VIP: enp1s1
   SERVER_VIP: enp1s2
+
+ptp4l_mode: slave
+ptp4l_interface: enp1s0
+ptp4l_time_stamping: software  # or hardware
+

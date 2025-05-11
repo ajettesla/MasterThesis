@@ -1,0 +1,5 @@
+- name: Restart ptp4l
+  systemd:
+    name: ptp4l
+    state: restarted
+    daemon_reload: yes
