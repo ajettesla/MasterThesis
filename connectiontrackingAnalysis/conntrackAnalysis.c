@@ -2,362 +2,417 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/stat.h>
+#include <getopt.h>
+#include <signal.h>
+#include <sys/inotify.h>
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include "uthash.h"
 
-#define LINE_MAX          2048
-#define DEFAULT_BASE_WIN  200
-#define SLEEP_USEC        50000
-#define RATE_INTERVAL_SEC 1
-#define PRUNE_INTERVAL    100
-#define MATCH_FIELDS      9   // number of fields to compare
+#define EVENT_SIZE (sizeof(struct inotify_event))
+#define BUF_LEN (1024 * (EVENT_SIZE + 16))
+#define LINE_SIZE 1024
+#define INITIAL_CAPACITY 100
 
-// thread‑safe queue
-typedef struct line_node {
-    char *line;
-    struct line_node *next;
-} line_node;
-typedef struct {
-    line_node *head, *tail;
-    pthread_mutex_t mutex;
-    pthread_cond_t  cond;
-} line_queue;
+struct Entry {
+    long long timestamp;
+    int seq;
+};
 
-static line_queue queue = { NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
-static volatile int running = 1;
-static int debug = 0, daemonize_flag = 0;
-static char *logfile_path = NULL, *machine_a = NULL, *machine_b = NULL;
-static char *output_path = NULL;
-static FILE *output_fp = NULL;
-
-// tracking counts
-typedef struct {
-    unsigned long lines_rate;      // lines processed in last interval
-    unsigned long match_pairs;     // number of matched pairs
-    unsigned long total_lines;     // total lines processed
-    unsigned long neglected;       // filtered private-traffic lines
-} stats_t;
-static stats_t stats = {0, 0, 0, 0};
-
-// hash entry storing one side’s payload, sequence, and raw query
-typedef struct {
-    char *key;                    // concatenated MATCH_FIELDS
-    unsigned long long ts2;       // payload timestamp
-    unsigned long seq;            // sequence number
-    char *raw;                    // raw payload string
+struct KeyGroup {
+    char *key;
+    char *srcip;
+    int srcport;
+    char *dstip;
+    int dstport;
+    char *protocol;
+    char *state;
+    char *flag;
+    struct Entry *entries;
+    int count;
+    int capacity;
     UT_hash_handle hh;
-} entry_t;
+};
 
-static entry_t *hash_a = NULL, *hash_b = NULL;
-static pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
-static unsigned long long win_before = DEFAULT_BASE_WIN, win_after = DEFAULT_BASE_WIN;
+volatile sig_atomic_t sigint_received = 0;
+struct KeyGroup *deviceA = NULL, *deviceB = NULL;
+struct KeyGroup *unmatchedA = NULL, *unmatchedB = NULL;
+FILE *fout = NULL;
+FILE *fdebug = NULL;
+char *ip_range = NULL;
+pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// function prototypes
-static void print_usage(const char *prog);
-static void *reader_thr(void *), *processor_thr(void *), *rate_thr(void *);
-static int is_private_ip(const char *ip);
-static void enqueue_line(const char *), prune_b(unsigned long long), cleanup(void), do_daemon(void);
-static char *dequeue_line(void);
-
-void print_usage(const char *prog) {
-    fprintf(stderr,
-        "Usage: %s -l logfile -m MACHINE_A -s MACHINE_B [-D] [-d] [-o output.csv]\n"
-        "  -l logfile    Path to the log file to tail\n"
-        "  -m MACHINE_A  Identifier for machine A in log lines\n"
-        "  -s MACHINE_B  Identifier for machine B in log lines\n"
-        "  -D            Enable debug output to stderr\n"
-        "  -d            Run as a daemon (background)\n"
-        "  -o output.csv Write matched entries to CSV file\n",
-        prog);
-}
-
-int is_private_ip(const char *ipstr) {
-    struct in_addr a;
-    if (!inet_aton(ipstr, &a)) return 0;
-    unsigned long ip = ntohl(a.s_addr);
-    return (ip >> 24) == 10   ||
-           (ip >> 20) == 0xAC1 ||
-           (ip >> 16) == 0xC0A8;
-}
-
-void enqueue_line(const char *line) {
-    line_node *n = malloc(sizeof(*n));
-    if (!n) return;
-    n->line = strdup(line);
-    n->next = NULL;
-    pthread_mutex_lock(&queue.mutex);
-    if (queue.tail) queue.tail->next = n;
-    else           queue.head = n;
-    queue.tail = n;
-    pthread_cond_signal(&queue.cond);
-    pthread_mutex_unlock(&queue.mutex);
-    if (debug) fprintf(stderr, "[DEBUG] enqueued: %s", line);
-}
-
-char *dequeue_line(void) {
-    pthread_mutex_lock(&queue.mutex);
-    while (!queue.head && running)
-        pthread_cond_wait(&queue.cond, &queue.mutex);
-    if (!running && !queue.head) {
-        pthread_mutex_unlock(&queue.mutex);
-        return NULL;
+// Convert IP string to 32-bit integer
+uint32_t ip_to_int(const char *ip) {
+    unsigned int a, b, c, d;
+    if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+        fprintf(stderr, "Invalid IP format: %s\n", ip);
+        return 0;
     }
-    line_node *n = queue.head;
-    queue.head = n->next;
-    if (!queue.head) queue.tail = NULL;
-    pthread_mutex_unlock(&queue.mutex);
-    char *line = n->line;
-    free(n);
-    return line;
+    return (a << 24) | (b << 16) | (c << 8) | d;
 }
 
-void prune_b(unsigned long long pivot) {
-    unsigned long long lo = pivot > win_before ? pivot - win_before : 0;
-    unsigned long long hi = pivot + win_after;
-    pthread_mutex_lock(&hash_mutex);
-    entry_t *e, *tmp;
-    HASH_ITER(hh, hash_b, e, tmp) {
-        if (e->ts2 < lo || e->ts2 > hi) {
-            HASH_DEL(hash_b, e);
-            free(e->key);
-            free(e->raw);
-            free(e);
-        }
+// Check if an IP is within the specified CIDR range
+int is_ip_in_range(const char *ip) {
+    if (!ip_range) return 1;
+    char network_str[16];
+    int prefix;
+    if (sscanf(ip_range, "%[^/]/%d", network_str, &prefix) != 2) {
+        fprintf(stderr, "Invalid CIDR format: %s\n", ip_range);
+        return 0;
     }
-    pthread_mutex_unlock(&hash_mutex);
-    if (debug) fprintf(stderr, "[DEBUG] pruned B entries outside [%llu - %llu]\n", lo, hi);
+    uint32_t network_int = ip_to_int(network_str);
+    uint32_t ip_int = ip_to_int(ip);
+    uint32_t mask = ~((1U << (32 - prefix)) - 1);
+    return (ip_int & mask) == (network_int & mask);
 }
 
-void cleanup(void) {
-    char *line;
-    while ((line = dequeue_line()) != NULL) free(line);
+// Signal handler for Ctrl-C
+void sigint_handler(int sig) {
+    (void)sig;
+    sigint_received = 1;
+}
+
+// Sort entries by timestamp
+int compare_entries(const void *a, const void *b) {
+    const struct Entry *ea = (const struct Entry *)a;
+    const struct Entry *eb = (const struct Entry *)b;
+    return (ea->timestamp < eb->timestamp) ? -1 : (ea->timestamp > eb->timestamp) ? 1 : 0;
+}
+
+// Free a KeyGroup structure
+void free_key_group(struct KeyGroup *kg) {
+    free(kg->key);
+    free(kg->srcip);
+    free(kg->dstip);
+    free(kg->protocol);
+    free(kg->state);
+    free(kg->flag);
+    free(kg->entries);
+    free(kg);
+}
+
+// Process a log line and filter by IP range
+void process_line(char *line, char *device_a, char *device_b, struct KeyGroup **hash_table, char *device_name, int debug) {
+    (void)device_a;
+    (void)device_b;
+    char timestamp_str[64], hostname[64], device[64], logger[64], payload[512];
+    if (sscanf(line, "%63s %63s %63s %63s %*s %*s %*s %511[^\n]", timestamp_str, hostname, device, logger, payload) != 5) {
+        if (debug) fprintf(stderr, "Debug: Skipped malformed line: %s\n", line);
+        return;
+    }
+    if (strcmp(device, device_name) != 0) {
+        if (debug) fprintf(stderr, "Debug: Skipped line, device '%s' does not match '%s'\n", device, device_name);
+        return;
+    }
+
+    // Parse payload manually
+    char *fields[11];
+    int i = 0;
+    char *p = payload;
+    while (i < 11 && p) {
+        fields[i] = p;
+        p = strchr(p, ',');
+        if (p) *p++ = '\0';
+        i++;
+    }
+    if (i < 11) {
+        if (debug) fprintf(stderr, "Debug: Skipped line, incomplete payload (%d fields): %s\n", i, payload);
+        return;
+    }
+
+    char *srcip = fields[2];
+    if (!is_ip_in_range(srcip)) {
+        if (debug) fprintf(stderr, "Debug: Skipped line, src IP %s not in range %s\n", srcip, ip_range ? ip_range : "none");
+        return;
+    }
+
+    int seq = atoi(fields[0]);
+    long long timestamp = atoll(fields[1]);
+    int srcport = atoi(fields[3]);
+    char *dstip = fields[4];
+    int dstport = atoi(fields[5]);
+    char *protocol = fields[6];
+    char *state = fields[7];
+    char *flag = fields[9];
+
+    char key[256];
+    snprintf(key, sizeof(key), "%s|%d|%s|%d|%s|%s|%s", srcip, srcport, dstip, dstport, protocol, state, flag);
+
     pthread_mutex_lock(&hash_mutex);
-    entry_t *e, *tmp;
-    HASH_ITER(hh, hash_a, e, tmp) { HASH_DEL(hash_a, e); free(e->key); free(e->raw); free(e); }
-    HASH_ITER(hh, hash_b, e, tmp) { HASH_DEL(hash_b, e); free(e->key); free(e->raw); free(e); }
+    struct KeyGroup *kg;
+    HASH_FIND_STR(*hash_table, key, kg);
+    if (!kg) {
+        kg = (struct KeyGroup *)malloc(sizeof(struct KeyGroup));
+        if (!kg) {
+            perror("malloc");
+            pthread_mutex_unlock(&hash_mutex);
+            exit(EXIT_FAILURE);
+        }
+        kg->key = strdup(key);
+        kg->srcip = strdup(srcip);
+        kg->dstip = strdup(dstip);
+        kg->srcport = srcport;
+        kg->dstport = dstport;
+        kg->protocol = strdup(protocol);
+        kg->state = strdup(state);
+        kg->flag = strdup(flag);
+        kg->entries = (struct Entry *)malloc(INITIAL_CAPACITY * sizeof(struct Entry));
+        if (!kg->entries) {
+            perror("malloc");
+            pthread_mutex_unlock(&hash_mutex);
+            exit(EXIT_FAILURE);
+        }
+        kg->count = 0;
+        kg->capacity = INITIAL_CAPACITY;
+        HASH_ADD_STR(*hash_table, key, kg);
+    }
+
+    if (kg->count >= kg->capacity) {
+        kg->capacity *= 2;
+        struct Entry *new_entries = (struct Entry *)realloc(kg->entries, kg->capacity * sizeof(struct Entry));
+        if (!new_entries) {
+            perror("realloc");
+            pthread_mutex_unlock(&hash_mutex);
+            exit(EXIT_FAILURE);
+        }
+        kg->entries = new_entries;
+    }
+    kg->entries[kg->count].timestamp = timestamp;
+    kg->entries[kg->count].seq = seq;
+    kg->count++;
     pthread_mutex_unlock(&hash_mutex);
-    if (output_fp) fclose(output_fp);
+
+    if (debug) fprintf(stderr, "Debug: Added event to %s (key: %s, seq: %d, count: %d)\n", device_name, key, seq, kg->count);
 }
 
-void *reader_thr(void *_) {
-    (void) _;
-    FILE *f = NULL;
-    ino_t inode = 0;
-    char buf[LINE_MAX];
-    while (running) {
-        if (!f) {
-            f = fopen(logfile_path, "r");
-            if (!f) { perror("fopen"); sleep(1); continue; }
-            struct stat st;
-            if (!stat(logfile_path, &st)) inode = st.st_ino;
-            clearerr(f);
-        }
-        while (fgets(buf, sizeof(buf), f)) enqueue_line(buf);
-        if (feof(f)) {
-            struct stat st;
-            if (!stat(logfile_path, &st) && st.st_ino != inode) {
-                fclose(f);
-                f = NULL;
-            } else {
-                clearerr(f);
-                usleep(SLEEP_USEC);
+// Match events between devices and write positive differences
+int perform_matching(char *device_a, char *device_b, struct KeyGroup **hashA, struct KeyGroup **hashB, int debug, int debug_extra) {
+    pthread_mutex_lock(&hash_mutex);
+    int match_count = 0;
+    struct KeyGroup *kgA, *tmpA, *kgB;
+    HASH_ITER(hh, *hashA, kgA, tmpA) {
+        HASH_FIND_STR(*hashB, kgA->key, kgB);
+        if (kgB) {
+            qsort(kgA->entries, kgA->count, sizeof(struct Entry), compare_entries);
+            qsort(kgB->entries, kgB->count, sizeof(struct Entry), compare_entries);
+            int pairs = (kgA->count < kgB->count) ? kgA->count : kgB->count;
+            for (int i = 0; i < pairs; i++) {
+                long long diff = llabs(kgA->entries[i].timestamp - kgB->entries[i].timestamp);
+                fprintf(fout, "%lld,%s,%s\n", diff, kgA->protocol, kgA->flag);
+                fflush(fout);
+                if (debug) {
+                    printf("Match: (%s,%d,%s,%d,%s,%s,%d)(%s) -> (%s,%d,%s,%d,%s,%s,%d)(%s), diff=%lld\n",
+                           kgA->srcip, kgA->srcport, kgA->dstip, kgA->dstport, kgA->protocol, kgA->flag, kgA->entries[i].seq, device_a,
+                           kgB->srcip, kgB->srcport, kgB->dstip, kgB->dstport, kgB->protocol, kgB->flag, kgB->entries[i].seq, device_b, diff);
+                }
+                if (debug_extra && fdebug) {
+                    fprintf(fdebug, "(%s) (%s,%d,%s,%d,%s,%s,%d) -> (%s) (%s,%d,%s,%d,%s,%s,%d)\n",
+                            device_a, kgA->srcip, kgA->srcport, kgA->dstip, kgA->dstport, kgA->protocol, kgA->flag, kgA->entries[i].seq,
+                            device_b, kgB->srcip, kgB->srcport, kgB->dstip, kgB->dstport, kgB->protocol, kgB->flag, kgB->entries[i].seq);
+                    fflush(fdebug);
+                }
+                match_count++;
             }
-        }
-        if (f && ferror(f)) {
-            perror("fgets");
-            fclose(f);
-            f = NULL;
-        }
-    }
-    if (f) fclose(f);
-    return NULL;
-}
-
-void *processor_thr(void *_) {
-    (void) _;
-    const char *marker = "conntrack_logger - - -";
-    while (running) {
-        char *ln = dequeue_line();
-        if (!ln) break;
-        stats.lines_rate++;
-        stats.total_lines++;
-
-        char ts_wall[64], host[64], machine[64];
-        if (sscanf(ln, "%63s %63s %63s", ts_wall, host, machine) != 3) { free(ln); continue; }
-        char *p = strstr(ln, marker);
-        if (!p) { free(ln); continue; }
-        p += strlen(marker);
-        while (*p == ' ' || *p == '\t') p++;
-        char *cpy = strdup(p);
-        free(ln);
-        if (!cpy) continue;
-
-        // extract seq and ts2
-        char *raw = strdup(cpy);
-        char *seq_s = strsep(&cpy, ",");
-        char *ts2_s = strsep(&cpy, ",");
-        char *fields[MATCH_FIELDS];
-        int cnt = 0;
-        while (cnt < MATCH_FIELDS && cpy) fields[cnt++] = strsep(&cpy, ",");
-        if (cnt < MATCH_FIELDS) { free(raw); free(cpy); continue; }
-
-        char src[64], dst[64];
-        sscanf(fields[0], "%63[^,]", src);
-        sscanf(fields[2], "%63[^,]", dst);
-        if (is_private_ip(src) && is_private_ip(dst)) {
-            stats.neglected++;
-            free(raw);
-            free(cpy);
-            continue;
-        }
-        unsigned long seq = strtoul(seq_s, NULL, 10);
-        unsigned long long ts2 = strtoull(ts2_s, NULL, 10);
-
-        // build composite key
-        size_t kl = 1;
-        for (int i = 0; i < MATCH_FIELDS; i++) kl += strlen(fields[i]) + 1;
-        char *key = malloc(kl);
-        key[0] = '\0';
-        for (int i = 0; i < MATCH_FIELDS; i++) {
-            strcat(key, fields[i]);
-            if (i < MATCH_FIELDS - 1) strcat(key, "\t");
-        }
-
-        int isA = (strcmp(machine, machine_a) == 0);
-        pthread_mutex_lock(&hash_mutex);
-        entry_t **mine  = isA ? &hash_a : &hash_b;
-        entry_t **other = isA ? &hash_b : &hash_a;
-
-        entry_t *e;
-        HASH_FIND_STR(*mine, key, e);
-        if (e) {
-            free(e->raw);
-            e->ts2 = ts2;
-            e->seq = seq;
-            e->raw = raw;
-            free(key);
+            // Move unmatched entries to unmatched hash tables
+            if (pairs < kgA->count) {
+                memmove(kgA->entries, kgA->entries + pairs, (kgA->count - pairs) * sizeof(struct Entry));
+                kgA->count -= pairs;
+                HASH_DEL(*hashA, kgA);
+                HASH_ADD_STR(unmatchedA, key, kgA);
+            } else {
+                HASH_DEL(*hashA, kgA);
+                free_key_group(kgA);
+            }
+            if (pairs < kgB->count) {
+                memmove(kgB->entries, kgB->entries + pairs, (kgB->count - pairs) * sizeof(struct Entry));
+                kgB->count -= pairs;
+                HASH_DEL(*hashB, kgB);
+                HASH_ADD_STR(unmatchedB, key, kgB);
+            } else {
+                HASH_DEL(*hashB, kgB);
+                free_key_group(kgB);
+            }
         } else {
-            e = malloc(sizeof(*e));
-            e->key = key;
-            e->ts2 = ts2;
-            e->seq = seq;
-            e->raw = raw;
-            HASH_ADD_KEYPTR(hh, *mine, e->key, strlen(e->key), e);
+            // Move entire KeyGroup to unmatchedA
+            HASH_DEL(*hashA, kgA);
+            HASH_ADD_STR(unmatchedA, key, kgA);
         }
+    }
+    // Handle remaining events in hashB
+    HASH_ITER(hh, *hashB, kgB, tmpA) {
+        HASH_DEL(*hashB, kgB);
+        HASH_ADD_STR(unmatchedB, key, kgB);
+    }
+    pthread_mutex_unlock(&hash_mutex);
+    if (debug && match_count == 0) fprintf(stderr, "Debug: No matches found\n");
+    return match_count;
+}
 
-        entry_t *oe;
-        HASH_FIND_STR(*other, key, oe);
-        if (oe) {
-            unsigned long long tsA = isA ? ts2 : oe->ts2;
-            unsigned long long tsB = isA ? oe->ts2 : ts2;
-            unsigned long sA = isA ? seq : oe->seq;
-            unsigned long sB = isA ? oe->seq : seq;
-            unsigned long ds = sA > sB ? sA - sB : sB - sA;
-            unsigned long long dt = tsA > tsB ? tsA - tsB : tsB - tsA;
-            
-            // CSV output
-            if (output_fp) {
-                fprintf(output_fp, "%lu,%llu,%lu,%llu,%llu\n", sA, tsA, sB, tsB, dt);
-                fflush(output_fp);
-            }
-
-            // update stats and print info
-            stats.match_pairs++;
-            unsigned long matched_lines = 2 * stats.match_pairs;
-            unsigned long unmatched = stats.total_lines - matched_lines - stats.neglected;
-            
-            if (!debug) {
-                printf("INFO: 2*matched=%lu + unmatched=%lu + filtered=%lu = total=%lu "
-                       "rate=%lu win=[%llu-%llu] seqA=%lu seqB=%lu dt=%lluns ds=%luns\n",
-                       matched_lines, unmatched, stats.neglected, stats.total_lines,
-                       stats.lines_rate, win_before, win_after,
-                       sA, sB, dt, ds);
-            } else {
-                fprintf(stderr, "[DEBUG] FULL A: %s\n", isA ? e->raw : oe->raw);
-                fprintf(stderr, "[DEBUG] FULL B: %s\n", isA ? oe->raw : e->raw);
-            }
-
-            if (stats.match_pairs % PRUNE_INTERVAL == 0)
-                prune_b(isA ? oe->ts2 : ts2);
-        }
+// Periodic matching thread function
+void *periodic_matching(void *arg) {
+    char **devices = (char **)arg;
+    char *device_a = devices[0];
+    char *device_b = devices[1];
+    int debug = *(int *)devices[2];
+    int debug_extra = *(int *)devices[3];
+    while (!sigint_received) {
+        sleep(5);
+        pthread_mutex_lock(&hash_mutex);
+        int matches = perform_matching(device_a, device_b, &unmatchedA, &unmatchedB, debug, debug_extra);
         pthread_mutex_unlock(&hash_mutex);
-        free(cpy);
+        if (debug && matches > 0) fprintf(stderr, "Debug: Periodic thread found %d matches\n", matches);
     }
     return NULL;
 }
 
-void *rate_thr(void *_) {
-    (void) _;
-    while (running) {
-        sleep(RATE_INTERVAL_SEC);
-        unsigned long c = __sync_lock_test_and_set(&stats.lines_rate, 0);
-        win_before = DEFAULT_BASE_WIN + c/10;
-        win_after  = DEFAULT_BASE_WIN + c/10;
+// Clean up resources
+void cleanup() {
+    struct KeyGroup *kg, *tmp;
+    pthread_mutex_lock(&hash_mutex);
+    HASH_ITER(hh, deviceA, kg, tmp) {
+        HASH_DEL(deviceA, kg);
+        free_key_group(kg);
     }
-    return NULL;
+    HASH_ITER(hh, deviceB, kg, tmp) {
+        HASH_DEL(deviceB, kg);
+        free_key_group(kg);
+    }
+    HASH_ITER(hh, unmatchedA, kg, tmp) {
+        HASH_DEL(unmatchedA, kg);
+        free_key_group(kg);
+    }
+    HASH_ITER(hh, unmatchedB, kg, tmp) {
+        HASH_DEL(unmatchedB, kg);
+        free_key_group(kg);
+    }
+    pthread_mutex_unlock(&hash_mutex);
+    if (fout) fclose(fout);
+    if (fdebug) fclose(fdebug);
 }
 
-void do_daemon(void) {
-    pid_t pid = fork();
-    if (pid < 0) exit(EXIT_FAILURE);
-    if (pid > 0) exit(EXIT_SUCCESS);
-    if (setsid() < 0) exit(EXIT_FAILURE);
-    signal(SIGCHLD, SIG_IGN);
-    signal(SIGHUP, SIG_IGN);
-    pid = fork();
-    if (pid < 0) exit(EXIT_FAILURE);
-    if (pid > 0) exit(EXIT_SUCCESS);
-    umask(0);
-    chdir("/");
-    fclose(stdin);
-    fclose(stdout);
-    fclose(stderr);
-}
-
-int main(int argc, char **argv) {
+int main(int argc, char *argv[]) {
+    char *device_a = NULL, *device_b = NULL, *input_file = NULL, *output_file = NULL;
+    int debug = 0, debug_extra = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "l:m:s:Ddo:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:s:l:o:Dr:")) != -1) {
         switch (opt) {
-            case 'l': logfile_path = optarg; break;
-            case 'm': machine_a    = optarg; break;
-            case 's': machine_b    = optarg; break;
-            case 'D': debug        = 1;      break;
-            case 'd': daemonize_flag = 1;    break;
-            case 'o': output_path  = optarg; break;
-            default : print_usage(argv[0]); exit(EXIT_FAILURE);
+            case 'm': device_a = optarg; break;
+            case 's': device_b = optarg; break;
+            case 'l': input_file = optarg; break;
+            case 'o': output_file = optarg; break;
+            case 'D':
+                if (debug) debug_extra = 1;
+                debug = 1;
+                break;
+            case 'r': ip_range = optarg; break;
+            default:
+                fprintf(stderr, "Usage: %s -m device_a -s device_b -l input_file -o output_file [-D] [-DD] [-r ip_range]\n", argv[0]);
+                exit(EXIT_FAILURE);
         }
     }
-    if (!logfile_path || !machine_a || !machine_b) {
-        print_usage(argv[0]);
+    if (!device_a || !device_b || !input_file || !output_file) {
+        fprintf(stderr, "Missing required options\n");
         exit(EXIT_FAILURE);
     }
-    if (output_path) {
-        output_fp = fopen(output_path, "w");
-        if (!output_fp) { perror("fopen output"); exit(EXIT_FAILURE); }
-        fprintf(output_fp, "seqA,ts2_A,seqB,ts2_B,delta_time_ns\n");
+
+    FILE *fin = fopen(input_file, "r");
+    if (!fin) {
+        perror("Failed to open input file");
+        exit(EXIT_FAILURE);
     }
-    if (daemonize_flag) do_daemon();
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    fout = fopen(output_file, "w");
+    if (!fout) {
+        perror("Failed to open output file");
+        fclose(fin);
+        exit(EXIT_FAILURE);
+    }
 
-    pthread_t r_thr, p_thr, t_thr;
-    pthread_create(&r_thr, NULL, reader_thr, NULL);
-    pthread_create(&p_thr, NULL, processor_thr, NULL);
-    pthread_create(&t_thr, NULL, rate_thr, NULL);
+    if (debug_extra) {
+        char debug_file[256];
+        snprintf(debug_file, sizeof(debug_file), "%s.debug", output_file);
+        fdebug = fopen(debug_file, "a");
+        if (!fdebug) {
+            perror("Failed to open debug file");
+            fclose(fin);
+            fclose(fout);
+            exit(EXIT_FAILURE);
+        }
+        setvbuf(fdebug, NULL, _IOFBF, 1024 * 1024);
+    }
 
-    pthread_join(r_thr, NULL);
-    running = 0;
-    pthread_cond_broadcast(&queue.cond);
-    pthread_join(p_thr, NULL);
-    pthread_join(t_thr, NULL);
+    setvbuf(fin, NULL, _IOFBF, 1024 * 1024);
+    setvbuf(fout, NULL, _IOFBF, 1024 * 1024);
 
+    signal(SIGINT, sigint_handler);
+
+    int inotify_fd = inotify_init();
+    if (inotify_fd < 0) {
+        perror("inotify_init");
+        fclose(fin);
+        fclose(fout);
+        if (fdebug) fclose(fdebug);
+        exit(EXIT_FAILURE);
+    }
+    int wd = inotify_add_watch(inotify_fd, input_file, IN_MODIFY);
+    if (wd < 0) {
+        perror("inotify_add_watch");
+        close(inotify_fd);
+        fclose(fin);
+        fclose(fout);
+        if (fdebug) fclose(fdebug);
+        exit(EXIT_FAILURE);
+    }
+
+    // Start periodic matching thread
+    char *devices[4] = {device_a, device_b, (char *)&debug, (char *)&debug_extra};
+    pthread_t periodic_thread;
+    pthread_create(&periodic_thread, NULL, periodic_matching, devices);
+
+    char line[LINE_SIZE];
+    int events_processed = 0;
+    while (fgets(line, sizeof(line), fin)) {
+        process_line(line, device_a, device_b, &deviceA, device_a, debug);
+        process_line(line, device_a, device_b, &deviceB, device_b, debug);
+        events_processed++;
+    }
+    if (debug) fprintf(stderr, "Debug: Processed %d lines from initial file\n", events_processed);
+    int initial_matches = perform_matching(device_a, device_b, &deviceA, &deviceB, debug, debug_extra);
+    printf("%d\n", initial_matches);
+
+    while (!sigint_received) {
+        char buffer[BUF_LEN];
+        int length = read(inotify_fd, buffer, BUF_LEN);
+        if (length < 0) {
+            if (errno == EINTR) continue;
+            perror("read");
+            break;
+        }
+        int new_events = 0;
+        fseek(fin, 0, SEEK_END);
+        while (fgets(line, sizeof(line), fin)) {
+            process_line(line, device_a, device_b, &deviceA, device_a, debug);
+            process_line(line, device_a, device_b, &deviceB, device_b, debug);
+            new_events++;
+        }
+        if (debug && new_events > 0) fprintf(stderr, "Debug: Processed %d new lines\n", new_events);
+        int new_matches = perform_matching(device_a, device_b, &deviceA, &deviceB, debug, debug_extra);
+        printf("%d\n", new_matches);
+        clearerr(fin);
+    }
+
+    // Handle Ctrl+C
+    if (sigint_received) {
+        printf("Ctrl+C pressed. Waiting for periodic thread to finish...\n");
+        pthread_join(periodic_thread, NULL);
+        printf("Periodic thread finished. Clearing hash tables...\n");
+        sleep(5);
+    }
+
+    inotify_rm_watch(inotify_fd, wd);
+    close(inotify_fd);
+    fclose(fin);
     cleanup();
+
     return 0;
 }
-
