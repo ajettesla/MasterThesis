@@ -1,9 +1,4 @@
----
-- hosts: conntrack
-  become: true
-  roles:
-    - keepalived
-
+--- 
 - hosts: convsrc2
   become: true
   roles:
@@ -18,4 +13,5 @@
   become: true
   roles:
     - connectionTracking
+    - keepalived
 
