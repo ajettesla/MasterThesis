@@ -42,7 +42,6 @@ FILE *fdebug = NULL;
 char *ip_range = NULL;
 pthread_mutex_t hash_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Convert IP string to 32-bit integer
 uint32_t ip_to_int(const char *ip) {
     unsigned int a, b, c, d;
     if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
@@ -52,7 +51,6 @@ uint32_t ip_to_int(const char *ip) {
     return (a << 24) | (b << 16) | (c << 8) | d;
 }
 
-// Check if an IP is within the specified CIDR range
 int is_ip_in_range(const char *ip) {
     if (!ip_range) return 1;
     char network_str[16];
@@ -67,20 +65,17 @@ int is_ip_in_range(const char *ip) {
     return (ip_int & mask) == (network_int & mask);
 }
 
-// Signal handler for Ctrl-C
 void sigint_handler(int sig) {
     (void)sig;
     sigint_received = 1;
 }
 
-// Sort entries by timestamp
 int compare_entries(const void *a, const void *b) {
     const struct Entry *ea = (const struct Entry *)a;
     const struct Entry *eb = (const struct Entry *)b;
     return (ea->timestamp < eb->timestamp) ? -1 : (ea->timestamp > eb->timestamp) ? 1 : 0;
 }
 
-// Free a KeyGroup structure
 void free_key_group(struct KeyGroup *kg) {
     free(kg->key);
     free(kg->srcip);
@@ -92,10 +87,7 @@ void free_key_group(struct KeyGroup *kg) {
     free(kg);
 }
 
-// Process a log line and filter by IP range
 void process_line(char *line, char *device_a, char *device_b, struct KeyGroup **hash_table, char *device_name, int debug) {
-    (void)device_a;
-    (void)device_b;
     char timestamp_str[64], hostname[64], device[64], logger[64], payload[512];
     if (sscanf(line, "%63s %63s %63s %63s %*s %*s %*s %511[^\n]", timestamp_str, hostname, device, logger, payload) != 5) {
         if (debug) fprintf(stderr, "Debug: Skipped malformed line: %s\n", line);
@@ -106,7 +98,6 @@ void process_line(char *line, char *device_a, char *device_b, struct KeyGroup **
         return;
     }
 
-    // Parse payload manually
     char *fields[11];
     int i = 0;
     char *p = payload;
@@ -137,7 +128,7 @@ void process_line(char *line, char *device_a, char *device_b, struct KeyGroup **
     char *flag = fields[9];
 
     char key[256];
-    snprintf(key, sizeof(key), "%s|%d|%s|%d|%s|%s|%s", srcip, srcport, dstip, dstport, protocol, state, flag);
+    snprintf(key, sizeof(key), "%s|%d|%s|%d|%s", srcip, srcport, dstip, dstport, protocol);
 
     pthread_mutex_lock(&hash_mutex);
     struct KeyGroup *kg;
@@ -186,7 +177,6 @@ void process_line(char *line, char *device_a, char *device_b, struct KeyGroup **
     if (debug) fprintf(stderr, "Debug: Added event to %s (key: %s, seq: %d, count: %d)\n", device_name, key, seq, kg->count);
 }
 
-// Match events between devices and write positive differences
 int perform_matching(char *device_a, char *device_b, struct KeyGroup **hashA, struct KeyGroup **hashB, int debug, int debug_extra) {
     pthread_mutex_lock(&hash_mutex);
     int match_count = 0;
@@ -214,7 +204,6 @@ int perform_matching(char *device_a, char *device_b, struct KeyGroup **hashA, st
                 }
                 match_count++;
             }
-            // Move unmatched entries to unmatched hash tables
             if (pairs < kgA->count) {
                 memmove(kgA->entries, kgA->entries + pairs, (kgA->count - pairs) * sizeof(struct Entry));
                 kgA->count -= pairs;
@@ -234,12 +223,10 @@ int perform_matching(char *device_a, char *device_b, struct KeyGroup **hashA, st
                 free_key_group(kgB);
             }
         } else {
-            // Move entire KeyGroup to unmatchedA
             HASH_DEL(*hashA, kgA);
             HASH_ADD_STR(unmatchedA, key, kgA);
         }
     }
-    // Handle remaining events in hashB
     HASH_ITER(hh, *hashB, kgB, tmpA) {
         HASH_DEL(*hashB, kgB);
         HASH_ADD_STR(unmatchedB, key, kgB);
@@ -249,7 +236,6 @@ int perform_matching(char *device_a, char *device_b, struct KeyGroup **hashA, st
     return match_count;
 }
 
-// Periodic matching thread function
 void *periodic_matching(void *arg) {
     char **devices = (char **)arg;
     char *device_a = devices[0];
@@ -266,7 +252,6 @@ void *periodic_matching(void *arg) {
     return NULL;
 }
 
-// Clean up resources
 void cleanup() {
     struct KeyGroup *kg, *tmp;
     pthread_mutex_lock(&hash_mutex);
@@ -364,7 +349,6 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Start periodic matching thread
     char *devices[4] = {device_a, device_b, (char *)&debug, (char *)&debug_extra};
     pthread_t periodic_thread;
     pthread_create(&periodic_thread, NULL, periodic_matching, devices);
@@ -401,9 +385,9 @@ int main(int argc, char *argv[]) {
         clearerr(fin);
     }
 
-    // Handle Ctrl+C
     if (sigint_received) {
         printf("Ctrl+C pressed. Waiting for periodic thread to finish...\n");
+        pthread_cancel(periodic_thread);
         pthread_join(periodic_thread, NULL);
         printf("Periodic thread finished. Clearing hash tables...\n");
         sleep(5);
