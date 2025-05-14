@@ -52,8 +52,6 @@
     name: conntrack_logger
     enabled: yes
     state: started
----
-# tasks for conntrack tuning and forwarding
 
 - name: Ensure conntrack and network sysctl settings
   vars:
@@ -83,4 +81,5 @@
     ctstate: NEW,ESTABLISHED,RELATED
     jump: ACCEPT
     state: present
-    insert: yes
+    rule_num: 1  # insert at top of chain
+
