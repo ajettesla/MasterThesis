@@ -1,6 +1,7 @@
 repo_url: 'https://github.com/ajettesla/MasterThesis.git'
 repo_dest: '/home/ansible/connectionTracking'
 syslog_server_ip: '172.16.1.30'
+ip_range: "172.16.1.0/24"
 log_dir: '/var/log'
 conntrack_timeout_seconds: 7200
 ipvs_timeout_seconds: 7200
