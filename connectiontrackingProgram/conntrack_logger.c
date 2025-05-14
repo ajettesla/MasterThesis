@@ -21,7 +21,7 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <netinet/in.h>
-#include "blake3.h"
+#include <blake3.h>
 
 // Replace with your SPSC queue implementation header
 #include "spsc_queue.h"
@@ -57,7 +57,7 @@ struct conn_event {
     uint32_t timeout;
     const char *state_str;
     const char *assured_str;
-    char hash[65];
+    char hash[17]; // 16 hex chars + null terminator for 64-bit hash
 };
 
 // Callback data
@@ -209,17 +209,17 @@ int ip_in_range(const char *ip_str, const char *range) {
     return (ip_num & mask) == (net_num & mask);
 }
 
-// BLAKE3 hash
+// BLAKE3 hash (64-bit output)
 static void calculate_hash(const char *input, char *output) {
-    unsigned char hash[BLAKE3_OUT_LEN];
+    unsigned char hash[8]; // 64-bit (8-byte) output
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
     blake3_hasher_update(&hasher, input, strlen(input));
-    blake3_hasher_finalize(&hasher, hash, BLAKE3_OUT_LEN);
-    for (int i = 0; i < BLAKE3_OUT_LEN; i++) {
+    blake3_hasher_finalize(&hasher, hash, 8); // Set output length to 8 bytes
+    for (int i = 0; i < 8; i++) {
         sprintf(output + (i * 2), "%02x", hash[i]);
     }
-    output[64] = '\0';
+    output[16] = '\0'; // 16 hex chars for 8 bytes
 }
 
 // Extract conntrack event
