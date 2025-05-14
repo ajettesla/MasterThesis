@@ -9,7 +9,6 @@
 #include <pthread.h>
 #include <getopt.h>
 #include <libnetfilter_conntrack/libnetfilter_conntrack.h>
-#include <openssl/sha.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -21,6 +20,8 @@
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <sys/time.h>
+#include <netinet/in.h>
+#include "blake3.h"
 
 // Replace with your SPSC queue implementation header
 #include "spsc_queue.h"
@@ -28,10 +29,10 @@
 #define MAX_MESSAGE_LEN 2048
 #define SYSLOG_PORT "514"
 #define MIN_BATCH_SIZE 5
-#define BATCH_TIMEOUT_US 1000000  // 1 second timeout for batching
-#define LOGFILE_PATH "/var/log/conntrack_logger.log"  // Change as needed
+#define BATCH_TIMEOUT_US 1000000
+#define LOGFILE_PATH "/var/log/conntrack_logger.log"
 
-/** Configuration structure for command-line options */
+// Configuration structure
 struct config {
     char *syslog_ip;
     char *machine_name;
@@ -39,10 +40,11 @@ struct config {
     int kill_daemons;
     int count_enabled;
     int debug_enabled;
-    int hash_enabled;  // New field for hash option
+    int hash_enabled;
+    char *src_range;
 };
 
-/** Structure for connection event data */
+// Connection event data
 struct conn_event {
     long long count;
     long long timestamp_ns;
@@ -55,19 +57,20 @@ struct conn_event {
     uint32_t timeout;
     const char *state_str;
     const char *assured_str;
-    char hash[65];  // New field for hash
+    char hash[65];
 };
 
-/** Structure for event callback data */
+// Callback data
 struct callback_data {
     spsc_queue_t *queue;
     atomic_int *overflow_flag;
     int count_enabled;
-    int hash_enabled;  // New field for hash option
+    int hash_enabled;
     atomic_llong *event_counter;
+    const char *src_range;
 };
 
-/** Structure for syslog thread data */
+// Syslog thread data
 struct syslog_data {
     spsc_queue_t *queue;
     char *syslog_ip;
@@ -75,15 +78,14 @@ struct syslog_data {
     char *machine_name;
     int count_enabled;
     int debug_enabled;
-    int hash_enabled;  // New field for hash option
+    int hash_enabled;
     atomic_size_t *bytes_transferred;
     atomic_int *overflow_flag;
 };
 
-// Global debug flag for logging
 static int global_debug_enabled = 0;
 
-/** Log messages with timestamps, respecting debug toggle */
+// Log with timestamp
 void log_with_timestamp(const char *fmt, ...) {
     int is_debug = (strncmp(fmt, "[DEBUG]", 7) == 0);
     if (is_debug && !global_debug_enabled) return;
@@ -105,7 +107,7 @@ void log_with_timestamp(const char *fmt, ...) {
     fflush(stdout);
 }
 
-/** Display help message */
+// Help message
 static void print_help(const char *progname) {
     printf("Usage: %s [options]\n", progname);
     printf("Options:\n");
@@ -116,10 +118,12 @@ static void print_help(const char *progname) {
     printf("  -k, --kill                Kill all running daemons (optional)\n");
     printf("  -c, --count <yes|no>      Prepend event count to each event (optional)\n");
     printf("  -D, --debug               Enable debug logging (optional)\n");
-    printf("  -H, --hash                Include SHA256 hash in log messages (optional)\n");
+    printf("  -H, --hash                Include BLAKE3 hash in log messages (default)\n");
+    printf("  --no-hash                 Do not include hash, send detailed payload instead\n");
+    printf("  -r, --src-range <range>   Filter events by source IP range (CIDR, e.g., 192.168.1.0/24)\n");
 }
 
-/** Parse command-line arguments */
+// Parse command-line arguments
 static int parse_config(int argc, char *argv[], struct config *cfg) {
     static struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
@@ -130,6 +134,8 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
         {"count", required_argument, 0, 'c'},
         {"debug", no_argument, 0, 'D'},
         {"hash", no_argument, 0, 'H'},
+        {"no-hash", no_argument, 0, 'N'},
+        {"src-range", required_argument, 0, 'r'},
         {0, 0, 0, 0}
     };
     int opt;
@@ -139,9 +145,10 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
     cfg->kill_daemons = 0;
     cfg->count_enabled = 0;
     cfg->debug_enabled = 0;
-    cfg->hash_enabled = 0;
+    cfg->hash_enabled = 1;
+    cfg->src_range = NULL;
 
-    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DH", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DHNr:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h': print_help(argv[0]); exit(0);
             case 'n': cfg->machine_name = optarg; break;
@@ -154,6 +161,8 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
                 break;
             case 'D': cfg->debug_enabled = 1; break;
             case 'H': cfg->hash_enabled = 1; break;
+            case 'N': cfg->hash_enabled = 0; break;
+            case 'r': cfg->src_range = optarg; break;
             default: print_help(argv[0]); return 1;
         }
     }
@@ -168,17 +177,52 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
 
 static atomic_llong event_counter = 0;
 
-/** Compute SHA256 hash of a string */
-static void calculate_sha256(const char *input, char *output) {
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256((unsigned char *)input, strlen(input), hash);
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+// Check IP in CIDR range
+int ip_in_range(const char *ip_str, const char *range) {
+    struct in_addr ip;
+    if (inet_pton(AF_INET, ip_str, &ip) <= 0) return 0;
+
+    char *range_copy = strdup(range);
+    char *slash = strchr(range_copy, '/');
+    if (!slash) {
+        free(range_copy);
+        return 0;
+    }
+    *slash = '\0';
+    int prefix = atoi(slash + 1);
+    if (prefix < 0 || prefix > 32) {
+        free(range_copy);
+        return 0;
+    }
+
+    struct in_addr network;
+    if (inet_pton(AF_INET, range_copy, &network) <= 0) {
+        free(range_copy);
+        return 0;
+    }
+
+    uint32_t ip_num = ntohl(ip.s_addr);
+    uint32_t net_num = ntohl(network.s_addr);
+    uint32_t mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF;
+    free(range_copy);
+
+    return (ip_num & mask) == (net_num & mask);
+}
+
+// BLAKE3 hash
+static void calculate_hash(const char *input, char *output) {
+    unsigned char hash[BLAKE3_OUT_LEN];
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(&hasher, input, strlen(input));
+    blake3_hasher_finalize(&hasher, hash, BLAKE3_OUT_LEN);
+    for (int i = 0; i < BLAKE3_OUT_LEN; i++) {
         sprintf(output + (i * 2), "%02x", hash[i]);
     }
     output[64] = '\0';
 }
 
-/** Extract connection event details from nf_conntrack */
+// Extract conntrack event
 static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type, struct conn_event *event, int count_enabled, int hash_enabled, atomic_llong *event_counter) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -219,7 +263,7 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
             case 0: event->state_str = "NONE"; break;
             case 1: event->state_str = "SYN_SENT"; break;
             case 2: event->state_str = "SYN_RECV"; break;
-            case 3: event: event->state_str = "ESTABLISHED"; break;
+            case 3: event->state_str = "ESTABLISHED"; break;
             case 4: event->state_str = "FIN_WAIT"; break;
             case 5: event->state_str = "CLOSE_WAIT"; break;
             case 6: event->state_str = "LAST_ACK"; break;
@@ -237,57 +281,49 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
 
     if (hash_enabled) {
         char hash_input[256];
-        snprintf(hash_input, sizeof(hash_input), "%s%s%u%u%s", event->src_ip, event->dst_ip, event->src_port, event->dst_port, event->protocol_str);
-        calculate_sha256(hash_input, event->hash);
+        snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%u,%s",
+                 event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
+                 event->src_port, event->dst_port, event->msg_type_str);
+        calculate_hash(hash_input, event->hash);
     } else {
         event->hash[0] = '\0';
     }
 }
 
-/** Callback for connection tracking events */
+// Conntrack event callback
 static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     struct callback_data *cb_data = (struct callback_data *)data;
     struct conn_event event = {0};
     extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->hash_enabled, cb_data->event_counter);
-    char buffer[1024] = {0};
 
+    if (cb_data->src_range && !ip_in_range(event.src_ip, cb_data->src_range)) {
+        return NFCT_CB_CONTINUE;
+    }
+
+    char buffer[1024] = {0};
     if (cb_data->count_enabled) {
         if (cb_data->hash_enabled) {
-            snprintf(buffer, sizeof(buffer),
-                "%lld,%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s,%s",
-                event.count, event.timestamp_ns,
-                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
-                event.protocol_str, event.msg_type_str, event.timeout,
-                event.state_str, event.assured_str, event.hash);
+            snprintf(buffer, sizeof(buffer), "%lld,%lld,%s",
+                     event.count, event.timestamp_ns, event.hash);
         } else {
-            snprintf(buffer, sizeof(buffer),
-                "%lld,%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
-                event.count, event.timestamp_ns,
-                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
-                event.protocol_str, event.msg_type_str, event.timeout,
-                event.state_str, event.assured_str);
+            snprintf(buffer, sizeof(buffer), "%lld,%lld,%s,%u,%s,%u,%s,%s,%s",
+                     event.count, event.timestamp_ns, event.src_ip, event.src_port,
+                     event.dst_ip, event.dst_port, event.protocol_str, event.msg_type_str, event.state_str);
         }
     } else {
         if (cb_data->hash_enabled) {
-            snprintf(buffer, sizeof(buffer),
-                "%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s,%s",
-                event.timestamp_ns,
-                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
-                event.protocol_str, event.msg_type_str, event.timeout,
-                event.state_str, event.assured_str, event.hash);
+            snprintf(buffer, sizeof(buffer), "%lld,%s",
+                     event.timestamp_ns, event.hash);
         } else {
-            snprintf(buffer, sizeof(buffer),
-                "%lld,%s,%u,%s,%u,%s,%s,%u,%s,%s",
-                event.timestamp_ns,
-                event.src_ip, event.src_port, event.dst_ip, event.dst_port,
-                event.protocol_str, event.msg_type_str, event.timeout,
-                event.state_str, event.assured_str);
+            snprintf(buffer, sizeof(buffer), "%lld,%s,%u,%s,%u,%s,%s,%s",
+                     event.timestamp_ns, event.src_ip, event.src_port,
+                     event.dst_ip, event.dst_port, event.protocol_str, event.msg_type_str, event.state_str);
         }
     }
 
     log_with_timestamp("[DEBUG] Captured conntrack event: %s\n", buffer);
 
-    if (!spsc_queue_enqueue(cb_data->queue, buffer)) {
+    if (!spsc_queue_enqueue(cb_data->queue, strdup(buffer))) {
         if (atomic_exchange(cb_data->overflow_flag, 1) == 0) {
             log_with_timestamp("[WARNING] SPSC queue overflow: events are being dropped!\n");
         }
@@ -301,7 +337,7 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
     return NFCT_CB_CONTINUE;
 }
 
-/** Establish TCP connection to syslog server */
+// Connect to syslog server
 static int connect_to_syslog(const char *host, const char *port_str) {
     struct addrinfo hints, *res, *rp;
     int sock = -1;
@@ -337,12 +373,12 @@ static int connect_to_syslog(const char *host, const char *port_str) {
     return sock;
 }
 
-/** Format a syslog message */
+// Syslog message format
 static void create_syslog_message(char *msg, size_t len, const char *machine_name, const char *data) {
     snprintf(msg, len, "<134> %s conntrack_logger - - - %s", machine_name, data);
 }
 
-/** Syslog thread to batch and send events */
+// Syslog thread
 static void *syslog_thread(void *arg) {
     struct syslog_data *sdata = (struct syslog_data *)arg;
     char *buffer = NULL;
@@ -366,59 +402,6 @@ static void *syslog_thread(void *arg) {
         if (spsc_queue_dequeue(sdata->queue, &buffer)) {
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] Dequeued buffer: %s\n", buffer);
-            }
-
-            long long count, timestamp_ns;
-            char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
-            unsigned int src_port, dst_port;
-            char protocol_str[16], msg_type_str[16], state_str[16], assured_str[16], hash[65];
-            unsigned int timeout;
-            int parsed;
-
-            if (sdata->count_enabled) {
-                if (sdata->hash_enabled) {
-                    parsed = sscanf(buffer,
-                        "%lld,%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,],%64s",
-                        &count, &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
-                        protocol_str, msg_type_str, &timeout, state_str, assured_str, hash);
-                    if (parsed != 12) {
-                        log_with_timestamp("[ERROR] Failed to parse buffer with count and hash: %s\n", buffer);
-                        free(buffer);
-                        continue;
-                    }
-                } else {
-                    parsed = sscanf(buffer,
-                        "%lld,%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,]",
-                        &count, &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
-                        protocol_str, msg_type_str, &timeout, state_str, assured_str);
-                    if (parsed != 11) {
-                        log_with_timestamp("[ERROR] Failed to parse buffer with count: %s\n", buffer);
-                        free(buffer);
-                        continue;
-                    }
-                }
-            } else {
-                if (sdata->hash_enabled) {
-                    parsed = sscanf(buffer,
-                        "%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,],%64s",
-                        &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
-                        protocol_str, msg_type_str, &timeout, state_str, assured_str, hash);
-                    if (parsed != 11) {
-                        log_with_timestamp("[ERROR] Failed to parse buffer with hash: %s\n", buffer);
-                        free(buffer);
-                        continue;
-                    }
-                } else {
-                    parsed = sscanf(buffer,
-                        "%lld,%15[^,],%u,%15[^,],%u,%15[^,],%15[^,],%u,%15[^,],%15[^,]",
-                        &timestamp_ns, src_ip, &src_port, dst_ip, &dst_port,
-                        protocol_str, msg_type_str, &timeout, state_str, assured_str);
-                    if (parsed != 10) {
-                        log_with_timestamp("[ERROR] Failed to parse buffer: %s\n", buffer);
-                        free(buffer);
-                        continue;
-                    }
-                }
             }
 
             char syslog_msg[MAX_MESSAGE_LEN];
@@ -477,7 +460,7 @@ static void *syslog_thread(void *arg) {
     return NULL;
 }
 
-/** Kill all running instances of the program */
+// Kill running daemons
 static void kill_all_daemons() {
     pid_t current_pid = getpid();
     FILE *fp = popen("pidof conntrack_logger", "r");
@@ -497,12 +480,21 @@ static void kill_all_daemons() {
     pclose(fp);
 }
 
-/** Main function */
+// Signal handler
+static void signal_handler(int sig) {
+    log_with_timestamp("[INFO] Received signal %d, shutting down\n", sig);
+    exit(0);
+}
+
+// Main function
 int main(int argc, char *argv[]) {
     struct config cfg;
     if (parse_config(argc, argv, &cfg)) return 1;
 
     global_debug_enabled = cfg.debug_enabled;
+
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
 
     if (cfg.kill_daemons) {
         kill_all_daemons();
@@ -571,7 +563,8 @@ int main(int argc, char *argv[]) {
         .overflow_flag = &overflow_flag,
         .count_enabled = cfg.count_enabled,
         .hash_enabled = cfg.hash_enabled,
-        .event_counter = &event_counter
+        .event_counter = &event_counter,
+        .src_range = cfg.src_range
     };
     struct nfct_handle *cth = nfct_open(CONNTRACK, NF_NETLINK_CONNTRACK_NEW |
                                         NF_NETLINK_CONNTRACK_UPDATE |
