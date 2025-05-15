@@ -3,7 +3,7 @@ Description=Connection Tracking Logger
 After=network.target
 
 [Service]
-ExecStart={{ repo_dest }}/connectiontrackingProgram/conntrack_logger -n {{ inventory_hostname }} --lsip {{ syslog_server_ip }} -c yes -H -r {{ ip_range }}
+ExecStart={{ repo_dest }}/connectiontrackingProgram/conntrack_logger -n {{ inventory_hostname }} --lsip {{ syslog_server_ip }} -c yes -H -r {{ ip_range }} -P
 
 StandardOutput=file:{{ log_dir }}/conntrack_logger.log
 StandardError=file:{{ log_dir }}/conntrack_logger.log
