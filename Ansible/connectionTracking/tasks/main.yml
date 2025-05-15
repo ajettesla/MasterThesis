@@ -46,6 +46,12 @@
 - name: Reload systemd daemon
   systemd:
     daemon_reload: yes
+  
+- name: Enable and start conntrack_logger service
+  systemd:
+    name: conntrack_logger
+    enabled: yes
+    state: stop
 
 - name: Enable and start conntrack_logger service
   systemd:
