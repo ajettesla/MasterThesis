@@ -40,7 +40,8 @@ struct config {
     int kill_daemons;
     int count_enabled;
     int debug_enabled;
-    int hash_enabled;
+    int hash_enabled; // For -H option
+    int payload_enabled; // For --payload option
     char *src_range;
 };
 
@@ -57,7 +58,10 @@ struct conn_event {
     uint32_t timeout;
     const char *state_str;
     const char *assured_str;
-    char hash[17]; // 16 hex chars + null terminator for 64-bit hash
+    char hash[17]; // 16 hex chars + null terminator
+    int type_num; // Numeric type
+    int state_num; // Numeric state
+    int proto_num; // Numeric protocol
 };
 
 // Callback data
@@ -65,7 +69,8 @@ struct callback_data {
     spsc_queue_t *queue;
     atomic_int *overflow_flag;
     int count_enabled;
-    int hash_enabled;
+    int hash_enabled; // Added
+    int payload_enabled;
     atomic_llong *event_counter;
     const char *src_range;
 };
@@ -78,7 +83,6 @@ struct syslog_data {
     char *machine_name;
     int count_enabled;
     int debug_enabled;
-    int hash_enabled;
     atomic_size_t *bytes_transferred;
     atomic_int *overflow_flag;
 };
@@ -118,9 +122,10 @@ static void print_help(const char *progname) {
     printf("  -k, --kill                Kill all running daemons (optional)\n");
     printf("  -c, --count <yes|no>      Prepend event count to each event (optional)\n");
     printf("  -D, --debug               Enable debug logging (optional)\n");
-    printf("  -H, --hash                Include BLAKE3 hash in log messages (default)\n");
-    printf("  --no-hash                 Do not include hash, send detailed payload instead\n");
+    printf("  -H, --hash                Include BLAKE3 hash in log messages\n");
+    printf("  -P, --payload             Include detailed payload tuple\n");
     printf("  -r, --src-range <range>   Filter events by source IP range (CIDR, e.g., 192.168.1.0/24)\n");
+    printf("Note: At least one of -H or -P must be specified.\n");
 }
 
 // Parse command-line arguments
@@ -134,7 +139,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
         {"count", required_argument, 0, 'c'},
         {"debug", no_argument, 0, 'D'},
         {"hash", no_argument, 0, 'H'},
-        {"no-hash", no_argument, 0, 'N'},
+        {"payload", no_argument, 0, 'P'},
         {"src-range", required_argument, 0, 'r'},
         {0, 0, 0, 0}
     };
@@ -145,10 +150,11 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
     cfg->kill_daemons = 0;
     cfg->count_enabled = 0;
     cfg->debug_enabled = 0;
-    cfg->hash_enabled = 1;
+    cfg->hash_enabled = 0;
+    cfg->payload_enabled = 0;
     cfg->src_range = NULL;
 
-    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DHNr:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DHPr:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h': print_help(argv[0]); exit(0);
             case 'n': cfg->machine_name = optarg; break;
@@ -161,7 +167,7 @@ static int parse_config(int argc, char *argv[], struct config *cfg) {
                 break;
             case 'D': cfg->debug_enabled = 1; break;
             case 'H': cfg->hash_enabled = 1; break;
-            case 'N': cfg->hash_enabled = 0; break;
+            case 'P': cfg->payload_enabled = 1; break;
             case 'r': cfg->src_range = optarg; break;
             default: print_help(argv[0]); return 1;
         }
@@ -211,19 +217,21 @@ int ip_in_range(const char *ip_str, const char *range) {
 
 // BLAKE3 hash (64-bit output)
 static void calculate_hash(const char *input, char *output) {
-    unsigned char hash[8]; // 64-bit (8-byte) output
+    unsigned char hash[8];
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
     blake3_hasher_update(&hasher, input, strlen(input));
-    blake3_hasher_finalize(&hasher, hash, 8); // Set output length to 8 bytes
+    blake3_hasher_finalize(&hasher, hash, 8);
     for (int i = 0; i < 8; i++) {
         sprintf(output + (i * 2), "%02x", hash[i]);
     }
-    output[16] = '\0'; // 16 hex chars for 8 bytes
+    output[16] = '\0';
 }
 
 // Extract conntrack event
-static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type, struct conn_event *event, int count_enabled, int hash_enabled, atomic_llong *event_counter) {
+static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type,
+                               struct conn_event *event, int count_enabled, int hash_enabled,
+                               int payload_enabled, atomic_llong *event_counter) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     event->timestamp_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -242,44 +250,49 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
     event->src_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_SRC) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC)) : 0;
     event->dst_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_DST) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST)) : 0;
 
-    uint8_t proto = nfct_get_attr_u8(ct, ATTR_L4PROTO);
-    if (proto == IPPROTO_TCP) strcpy(event->protocol_str, "tcp");
-    else if (proto == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
-    else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %u", proto);
-
-    switch (type) {
-        case NFCT_T_NEW:     event->msg_type_str = "NEW";     break;
-        case NFCT_T_UPDATE:  event->msg_type_str = "UPDATE";  break;
-        case NFCT_T_DESTROY: event->msg_type_str = "DESTROY"; break;
-        default:             event->msg_type_str = "UNKNOWN"; break;
-    }
-
-    event->timeout = nfct_attr_is_set(ct, ATTR_TIMEOUT) ? nfct_get_attr_u32(ct, ATTR_TIMEOUT) : 0;
-
-    event->state_str = "N/A";
-    if (proto == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
-        uint8_t tcp_state = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
-        switch (tcp_state) {
-            case 0: event->state_str = "NONE"; break;
-            case 1: event->state_str = "SYN_SENT"; break;
-            case 2: event->state_str = "SYN_RECV"; break;
-            case 3: event->state_str = "ESTABLISHED"; break;
-            case 4: event->state_str = "FIN_WAIT"; break;
-            case 5: event->state_str = "CLOSE_WAIT"; break;
-            case 6: event->state_str = "LAST_ACK"; break;
-            case 7: event->state_str = "TIME_WAIT"; break;
-            case 8: event->state_str = "CLOSE"; break;
-            default: event->state_str = "UNKNOWN"; break;
+    if (payload_enabled) {
+        event->type_num = type;
+        event->proto_num = nfct_get_attr_u8(ct, ATTR_L4PROTO);
+        if (event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
+            event->state_num = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
+        } else {
+            event->state_num = -1;
         }
     }
 
-    event->assured_str = "N/A";
-    if (nfct_attr_is_set(ct, ATTR_STATUS)) {
-        uint32_t status = nfct_get_attr_u32(ct, ATTR_STATUS);
-        if (status & IPS_ASSURED) event->assured_str = "ASSURED";
-    }
-
     if (hash_enabled) {
+        if (event->proto_num == 0) event->proto_num = nfct_get_attr_u8(ct, ATTR_L4PROTO);
+        if (event->proto_num == IPPROTO_TCP) strcpy(event->protocol_str, "tcp");
+        else if (event->proto_num == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
+        else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %d", event->proto_num);
+
+        switch (type) {
+            case NFCT_T_NEW:     event->msg_type_str = "NEW";     break;
+            case NFCT_T_UPDATE:  event->msg_type_str = "UPDATE";  break;
+            case NFCT_T_DESTROY: event->msg_type_str = "DESTROY"; break;
+            default:             event->msg_type_str = "UNKNOWN"; break;
+        }
+
+        if (event->state_num < 0 && event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
+            event->state_num = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
+        }
+        if (event->state_num >= 0) {
+            switch (event->state_num) {
+                case 0: event->state_str = "NONE"; break;
+                case 1: event->state_str = "SYN_SENT"; break;
+                case 2: event->state_str = "SYN_RECV"; break;
+                case 3: event->state_str = "ESTABLISHED"; break;
+                case 4: event->state_str = "FIN_WAIT"; break;
+                case 5: event->state_str = "CLOSE_WAIT"; break;
+                case 6: event->state_str = "LAST_ACK"; break;
+                case 7: event->state_str = "TIME_WAIT"; break;
+                case 8: event->state_str = "CLOSE"; break;
+                default: event->state_str = "UNKNOWN"; break;
+            }
+        } else {
+            event->state_str = "N/A";
+        }
+
         char hash_input[256];
         snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%u,%s",
                  event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
@@ -288,37 +301,58 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
     } else {
         event->hash[0] = '\0';
     }
+
+    event->timeout = nfct_attr_is_set(ct, ATTR_TIMEOUT) ? nfct_get_attr_u32(ct, ATTR_TIMEOUT) : 0;
+
+    event->assured_str = "N/A";
+    if (nfct_attr_is_set(ct, ATTR_STATUS)) {
+        uint32_t status = nfct_get_attr_u32(ct, ATTR_STATUS);
+        if (status & IPS_ASSURED) event->assured_str = "ASSURED";
+    }
 }
 
 // Conntrack event callback
 static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     struct callback_data *cb_data = (struct callback_data *)data;
     struct conn_event event = {0};
-    extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->hash_enabled, cb_data->event_counter);
+    extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->hash_enabled,
+                       cb_data->payload_enabled, cb_data->event_counter);
 
     if (cb_data->src_range && !ip_in_range(event.src_ip, cb_data->src_range)) {
         return NFCT_CB_CONTINUE;
     }
 
     char buffer[1024] = {0};
+    char *ptr = buffer;
+    size_t remaining = sizeof(buffer);
+
     if (cb_data->count_enabled) {
-        if (cb_data->hash_enabled) {
-            snprintf(buffer, sizeof(buffer), "%lld,%lld,%s",
-                     event.count, event.timestamp_ns, event.hash);
-        } else {
-            snprintf(buffer, sizeof(buffer), "%lld,%lld,%s,%u,%s,%u,%s,%s,%s",
-                     event.count, event.timestamp_ns, event.src_ip, event.src_port,
-                     event.dst_ip, event.dst_port, event.protocol_str, event.msg_type_str, event.state_str);
+        ptr += snprintf(ptr, remaining, "%lld,", event.count);
+        remaining -= (ptr - buffer);
+    }
+
+    ptr += snprintf(ptr, remaining, "%lld", event.timestamp_ns);
+    remaining -= (ptr - buffer);
+
+    if (cb_data->hash_enabled || cb_data->payload_enabled) {
+        ptr += snprintf(ptr, remaining, ",");
+        remaining -= (ptr - buffer);
+    }
+
+    if (cb_data->hash_enabled) {
+        ptr += snprintf(ptr, remaining, "%s", event.hash);
+        remaining -= (ptr - buffer);
+        if (cb_data->payload_enabled) {
+            ptr += snprintf(ptr, remaining, ",");
+            remaining -= (ptr - buffer);
         }
-    } else {
-        if (cb_data->hash_enabled) {
-            snprintf(buffer, sizeof(buffer), "%lld,%s",
-                     event.timestamp_ns, event.hash);
-        } else {
-            snprintf(buffer, sizeof(buffer), "%lld,%s,%u,%s,%u,%s,%s,%s",
-                     event.timestamp_ns, event.src_ip, event.src_port,
-                     event.dst_ip, event.dst_port, event.protocol_str, event.msg_type_str, event.state_str);
-        }
+    }
+
+    if (cb_data->payload_enabled) {
+        ptr += snprintf(ptr, remaining, "%d,%d,%d,%s,%u,%s,%u",
+                        event.type_num, event.state_num, event.proto_num,
+                        event.src_ip, event.src_port, event.dst_ip, event.dst_port);
+        remaining -= (ptr - buffer);
     }
 
     log_with_timestamp("[DEBUG] Captured conntrack event: %s\n", buffer);
@@ -493,6 +527,12 @@ int main(int argc, char *argv[]) {
 
     global_debug_enabled = cfg.debug_enabled;
 
+    if (!cfg.kill_daemons && !cfg.hash_enabled && !cfg.payload_enabled) {
+        log_with_timestamp("Error: At least one of -H or -P must be specified.\n");
+        print_help(argv[0]);
+        return 1;
+    }
+
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
@@ -545,7 +585,6 @@ int main(int argc, char *argv[]) {
         .machine_name = cfg.machine_name,
         .count_enabled = cfg.count_enabled,
         .debug_enabled = cfg.debug_enabled,
-        .hash_enabled = cfg.hash_enabled,
         .bytes_transferred = &bytes_transferred,
         .overflow_flag = &overflow_flag
     };
@@ -563,6 +602,7 @@ int main(int argc, char *argv[]) {
         .overflow_flag = &overflow_flag,
         .count_enabled = cfg.count_enabled,
         .hash_enabled = cfg.hash_enabled,
+        .payload_enabled = cfg.payload_enabled,
         .event_counter = &event_counter,
         .src_range = cfg.src_range
     };
@@ -581,6 +621,7 @@ int main(int argc, char *argv[]) {
     if (nfct_catch(cth) < 0) {
         log_with_timestamp("[ERROR] Failed to catch conntrack events: %s\n", strerror(errno));
     }
+
 
     nfct_close(cth);
     close(syslog_fd);
