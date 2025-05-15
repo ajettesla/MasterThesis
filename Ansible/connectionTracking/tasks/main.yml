@@ -72,6 +72,10 @@
       net.core.wmem_max:                           134217728
       net.core.rmem_default:                       67108864
       net.core.wmem_default:                       67108864
+      net.ipv4.ip_local_port_range:                "1024 65535"
+      net.ipv4.tcp_tw_reuse:                       1
+      net.ipv4.tcp_tw_recycle:                     0  # Avoid using this on public networks
+
 
   block:
     - name: Apply sysctl setting for {{ item.key }}
