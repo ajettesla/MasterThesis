@@ -79,24 +79,68 @@ void sigint_handler(int sig) {
     }
 }
 
-// Read exactly n bytes from a file descriptor
+// Read exactly n bytes from a file descriptor with timeout
 ssize_t read_n(int fd, char *buf, size_t len) {
     size_t total = 0;
+    struct timeval timeout;
+    timeout.tv_sec = 1; // 1-second timeout
+    timeout.tv_usec = 0;
+
     while (total < len) {
-        ssize_t n = read(fd, buf + total, len - total);
-        if (n <= 0) return n == 0 ? total : -1;
-        total += n;
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+
+        int ret = select(fd + 1, &read_fds, NULL, NULL, &timeout);
+        if (ret < 0) {
+            return -1; // Error
+        } else if (ret == 0) {
+            // Timeout occurred
+            if (should_exit) {
+                return -2; // Custom error code for should_exit
+            }
+            continue; // Keep waiting
+        } else {
+            // Socket is readable
+            ssize_t n = read(fd, buf + total, len - total);
+            if (n <= 0) {
+                return n == 0 ? total : -1;
+            }
+            total += n;
+        }
     }
     return total;
 }
 
-// Write exactly n bytes to a file descriptor
+// Write exactly n bytes to a file descriptor with timeout
 ssize_t write_n(int fd, const char *buf, size_t len) {
     size_t total = 0;
+    struct timeval timeout;
+    timeout.tv_sec = 1; // 1-second timeout
+    timeout.tv_usec = 0;
+
     while (total < len) {
-        ssize_t n = write(fd, buf + total, len - total);
-        if (n < 0) return -1;
-        total += n;
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(fd, &write_fds);
+
+        int ret = select(fd + 1, NULL, &write_fds, NULL, &timeout);
+        if (ret < 0) {
+            return -1; // Error
+        } else if (ret == 0) {
+            // Timeout occurred
+            if (should_exit) {
+                return -2; // Custom error code for should_exit
+            }
+            continue; // Keep waiting
+        } else {
+            // Socket is writable
+            ssize_t n = write(fd, buf + total, len - total);
+            if (n < 0) {
+                return -1;
+            }
+            total += n;
+        }
     }
     return total;
 }
@@ -251,6 +295,19 @@ void *worker(void *arg) {
             continue;
         }
 
+        // Set socket to non-blocking
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags == -1) {
+            if (debug_mode) perror("fcntl F_GETFL");
+            close(fd);
+            continue;
+        }
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            if (debug_mode) perror("fcntl F_SETFL");
+            close(fd);
+            continue;
+        }
+
         // Enable SO_REUSEADDR
         int opt = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -288,12 +345,57 @@ void *worker(void *arg) {
 
         debug_print("Worker %d: Connecting to %s:%d for task %d", id, target_host, target_port, task_id);
 
-        // Connect to target
+        // Non-blocking connect
         if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-            if (debug_mode) perror("connect");
+            if (errno != EINPROGRESS) {
+                if (debug_mode) perror("connect");
+                close(fd);
+                freeaddrinfo(res);
+                continue;
+            }
+        }
+
+        // Wait for connect to complete
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(fd, &write_fds);
+        int ret = select(fd + 1, NULL, &write_fds, NULL, &timeout);
+        if (ret < 0) {
+            if (debug_mode) perror("select");
             close(fd);
             freeaddrinfo(res);
             continue;
+        } else if (ret == 0) {
+            // Timeout
+            if (should_exit) {
+                close(fd);
+                freeaddrinfo(res);
+                continue;
+            }
+            // Optionally retry or fail
+            debug_print("Worker %d: Connect timeout to %s:%d", id, target_host, target_port);
+            close(fd);
+            freeaddrinfo(res);
+            continue;
+        } else {
+            // Check if connect succeeded
+            int error = 0;
+            socklen_t len = sizeof(error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
+                if (debug_mode) perror("getsockopt");
+                close(fd);
+                freeaddrinfo(res);
+                continue;
+            }
+            if (error != 0) {
+                if (debug_mode) fprintf(stderr, "connect failed: %s\n", strerror(error));
+                close(fd);
+                freeaddrinfo(res);
+                continue;
+            }
         }
         freeaddrinfo(res);
 
@@ -302,6 +404,10 @@ void *worker(void *arg) {
         // Send message
         const char *msg = "hello\n";
         if (write_n(fd, msg, strlen(msg)) < 0) {
+            if (write_n(fd, msg, strlen(msg)) == -2 && should_exit) {
+                close(fd);
+                break;
+            }
             if (debug_mode) perror("write");
             close(fd);
             continue;
@@ -312,6 +418,10 @@ void *worker(void *arg) {
         char buf[1024];
         ssize_t n = read_n(fd, buf, 6);
         if (n < 0) {
+            if (n == -2 && should_exit) {
+                close(fd);
+                break;
+            }
             if (debug_mode) perror("read");
         } else if (n < 6) {
             debug_print("Worker %d: Short read from %s:%d, got %zd bytes", id, target_host, target_port, n);
@@ -445,7 +555,7 @@ int main(int argc, char **argv) {
     }
 
     // Wait for threads to complete
-    for (int i = 0; i < concurrency; i++) {
+    for (int i = 0; I < concurrency; i++) {
         pthread_join(threads[i], NULL);
     }
 
