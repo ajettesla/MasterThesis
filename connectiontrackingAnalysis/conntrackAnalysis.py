@@ -50,7 +50,8 @@ def parse_line(line):
         'srcport': srcport,
         'dstip': dstip,
         'dstport': dstport,
-        'payload': payload_str,  # Add full payload string
+        'payload': payload_str,
+        'timestamp_nano': timestamp_nano
     }
 
 def process_entry(entry, device_a, device_b, dict_a, dict_b, writer, totals, lock, debug_mode):
@@ -58,45 +59,38 @@ def process_entry(entry, device_a, device_b, dict_a, dict_b, writer, totals, loc
     Process a single log entry:
     - Check if it belongs to device_a or device_b.
     - If from device_a or device_b, check for matches in the other device.
-    - If a match is found (same hash and payload), calculate timestamp difference and write to CSV.
+    - If a match is found, calculate timestamp_nano difference and write to CSV.
     - If debug_mode is enabled, print match details.
     - Remove matched entries from both devices' dictionaries.
     - If no match is found, add the entry to the appropriate dictionary.
     """
     D = entry['device']
     if D not in [device_a, device_b]:
-        return  # Ignore entries not from specified devices
+        return
     K = (entry['hash'], entry['type_num'], entry['state_num'], entry['proto_num'], 
          entry['srcip'], entry['srcport'], entry['dstip'], entry['dstport'])
     if D == device_a:
         self_dict = dict_a
         other_dict = dict_b
         other_D = device_b
-    else:  # D == device_b
+    else:
         self_dict = dict_b
         other_dict = dict_a
         other_D = device_a
     matched = False
     if K in other_dict and other_dict[K]:
-        for item in list(other_dict[K]):
-            if debug_mode:
-                ts_other, payload_other = item
-            else:
-                ts_other = item
-                payload_other = None
-            diff = (entry['timestamp'] - ts_other).total_seconds()
-            writer.writerow([diff, entry['proto_num'], entry['state_num']])
+        for other_entry in list(other_dict[K]):
+            diff_nano = entry['timestamp_nano'] - other_entry['timestamp_nano']
+            debug_str = f"{D} ({entry['payload']}) -> {other_D} ({other_entry['payload']})" if debug_mode else ''
+            writer.writerow([diff_nano, entry['proto_num'], entry['state_num'], debug_str])
             with lock:
-                totals[1] += 1  # Increment match counter
+                totals[1] += 1
             if debug_mode:
-                print(f"Match found: {D} ({entry['payload']}) -> {other_D} ({payload_other}) (matched)")
-            other_dict[K].remove(item)
+                print(f"Match found: {D} ({entry['payload']}) -> {other_D} ({other_entry['payload']}) (matched)")
+            other_dict[K].remove(other_entry)
             matched = True
     if not matched:
-        if debug_mode:
-            self_dict[K].append((entry['timestamp'], entry['payload']))
-        else:
-            self_dict[K].append(entry['timestamp'])
+        self_dict[K].append(entry)
 
 def periodic_print(lock, totals):
     """
@@ -133,14 +127,14 @@ def main():
     if not os.path.exists(output_file):
         with open(output_file, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['timedifference', 'protocol_num', 'state_num'])
+            writer.writerow(['timedifference', 'protocol_num', 'state_num', 'debug_info'])
     
     # Open output file for appending
     csvfile = open(output_file, 'a', newline='')
     writer = csv.writer(csvfile)
     
     # Initialize dictionaries for storing unmatched entries
-    dict_a = defaultdict(list)  # Key: (hash, type_num, state_num, proto_num, srcip, srcport, dstip, dstport); Value: list of timestamps or (timestamp, payload)
+    dict_a = defaultdict(list)
     dict_b = defaultdict(list)
     
     # Initialize counters and timer for periodic reporting
