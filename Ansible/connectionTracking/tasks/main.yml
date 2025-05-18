@@ -51,7 +51,7 @@
   systemd:
     name: conntrack_logger
     enabled: yes
-    state: stop
+    state: stopped
 
 - name: Enable and start conntrack_logger service
   systemd:
