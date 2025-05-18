@@ -555,7 +555,7 @@ int main(int argc, char **argv) {
     }
 
     // Wait for threads to complete
-    for (int i = 0; I < concurrency; i++) {
+    for (int i = 0; i < concurrency; i++) {
         pthread_join(threads[i], NULL);
     }
 
