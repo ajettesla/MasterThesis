@@ -18,6 +18,14 @@
     owner: syslog
     group: adm
     mode: '0640'
+    
+- name: Ensure ptp.log exists with proper ownership and mode
+  file:
+    path: /var/log/ptp.log
+    state: touch
+    owner: syslog
+    group: adm
+    mode: '0640'
 
 - name: Deploy rsyslog.conf
   template:
@@ -32,6 +40,15 @@
   template:
     src: logrotate_conntrack.j2
     dest: /etc/logrotate.d/conntrack
+    owner: root
+    group: root
+    mode: '0644'
+
+
+- name: Deploy logrotate configuration for conntrack.log
+  template:
+    src: logrotate_ptp.j2
+    dest: /etc/logrotate.d/ptp
     owner: root
     group: root
     mode: '0644'
