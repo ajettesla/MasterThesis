@@ -1,6 +1,6 @@
 ptp4l_config_dir: /etc/linuxptp
 ptp4l_time_stamping: software
-syslog_server_ip: "192.0.2.5"     # Replace with your actual syslog server IP
+syslog_server_ip: "172.16.1.30"     # Replace with your actual syslog server IP
 syslog_server_port: 514           # Default TCP port
 syslog_transport: "tcp"           # 'tcp' or 'udp'
 
