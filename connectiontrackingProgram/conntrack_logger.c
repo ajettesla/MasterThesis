@@ -241,45 +241,71 @@ static void calculate_hash(const char *input, char *output) {
 }
 
 // Extract conntrack event
-static void extract_conn_event(struct event_data *ed, struct conn_event *event, int hash_enabled) {
-    event->count = ed->count;
-    event->timestamp_ns = ed->timestamp_ns;
 
-    inet_ntop(AF_INET, &ed->src_addr, event->src_ip, INET_ADDRSTRLEN);
-    inet_ntop(AF_INET, &ed->dst_addr, event->dst_ip, INET_ADDRSTRLEN);
+static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type,
+                               struct conn_event *event, int count_enabled, int hash_enabled,
+                               int payload_enabled, atomic_llong *event_counter) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    event->timestamp_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
 
-    event->src_port = ed->src_port;
-    event->dst_port = ed->dst_port;
-
-    if (ed->l4proto == IPPROTO_TCP) strcpy(event->protocol_str, "tcp");
-    else if (ed->l4proto == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
-    else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %d", ed->l4proto);
-
-    switch (ed->type) {
-        case NFCT_T_NEW: event->msg_type_str = "NEW"; break;
-        case NFCT_T_UPDATE: event->msg_type_str = "UPDATE"; break;
-        case NFCT_T_DESTROY: event->msg_type_str = "DESTROY"; break;
-        default: event->msg_type_str = "UNKNOWN"; break;
+    if (count_enabled) {
+        event->count = atomic_fetch_add(event_counter, 1) + 1;
+    } else {
+        event->count = 0;
     }
 
-    if (ed->l4proto == IPPROTO_TCP && ed->tcp_state != 255) {
-        switch (ed->tcp_state) {
-            case 0: event->state_str = "NONE"; break;
-            case 1: event->state_str = "SYN_SENT"; break;
-            case 2: event->state_str = "SYN_RECV"; break;
-            case 3: event->state_str = "ESTABLISHED"; break;
-            case 4: event->state_str = "FIN_WAIT"; break;
-            case 5: event->state_str = "CLOSE_WAIT"; break;
-            case 6: event->state_str = "LAST_ACK"; break;
-            case 7: event->state_str = "TIME_WAIT"; break;
-            case 8: event->state_str = "CLOSE"; break;
-            default: event->state_str = "UNKNOWN"; break;
+    struct in_addr src_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC) };
+    struct in_addr dst_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_DST) };
+    inet_ntop(AF_INET, &src_addr, event->src_ip, INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &dst_addr, event->dst_ip, INET_ADDRSTRLEN);
+
+    event->src_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_SRC) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC)) : 0;
+    event->dst_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_DST) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST)) : 0;
+
+    if (payload_enabled) {
+        event->type_num = type;
+        event->proto_num = nfct_get_attr_u8(ct, ATTR_L4PROTO);
+        if (event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
+            event->state_num = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
+        } else {
+            event->state_num = -1;
         }
-    } else {
-        event->state_str = "N/A";
     }
 
     if (hash_enabled) {
+        if (event->proto_num == 0) event->proto_num = nfct_get_attr_u8(ct, ATTR_L4PROTO);
+        if (event->proto_num == IPPROTO_TCP) strcpy(event->protocol_str, "tcp");
+        else if (event->proto_num == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
+        else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %d", event->proto_num);
+
+        switch (type) {
+            case NFCT_T_NEW:     event->msg_type_str = "NEW";     break;
+            case NFCT_T_UPDATE:  event->msg_type_str = "UPDATE";  break;
+            case NFCT_T_DESTROY: event->msg_type_str = "DESTROY"; break;
+            default:             event->msg_type_str = "UNKNOWN"; break;
+        }
+
+        if (event->state_num < 0 && event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
+            event->state_num = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
+        }
+        if (event->state_num >= 0) {
+            switch (event->state_num) {
+                case 0: event->state_str = "NONE"; break;
+                case 1: event->state_str = "SYN_SENT"; break;
+                case 2: event->state_str = "SYN_RECV"; break;
+                case 3: event->state_str = "ESTABLISHED"; break;
+                case 4: event->state_str = "FIN_WAIT"; break;
+                case 5: event->state_str = "CLOSE_WAIT"; break;
+                case 6: event->state_str = "LAST_ACK"; break;
+                case 7: event->state_str = "TIME_WAIT"; break;
+                case 8: event->state_str = "CLOSE"; break;
+                default: event->state_str = "UNKNOWN"; break;
+            }
+        } else {
+            event->state_str = "N/A";
+        }
+
         char hash_input[256];
         snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%u,%s",
                  event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
@@ -289,13 +315,15 @@ static void extract_conn_event(struct event_data *ed, struct conn_event *event, 
         event->hash[0] = '\0';
     }
 
-    event->timeout = ed->timeout;
-    event->assured_str = (ed->status & IPS_ASSURED) ? "ASSURED" : "N/A";
+    event->timeout = nfct_attr_is_set(ct, ATTR_TIMEOUT) ? nfct_get_attr_u32(ct, ATTR_TIMEOUT) : 0;
 
-    event->type_num = ed->type;
-    event->state_num = (ed->l4proto == IPPROTO_TCP && ed->tcp_state != 255) ? ed->tcp_state : -1;
-    event->proto_num = ed->l4proto;
+    event->assured_str = "N/A";
+    if (nfct_attr_is_set(ct, ATTR_STATUS)) {
+        uint32_t status = nfct_get_attr_u32(ct, ATTR_STATUS);
+        if (status & IPS_ASSURED) event->assured_str = "ASSURED";
+    }
 }
+
 
 // Conntrack event callback
 static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
