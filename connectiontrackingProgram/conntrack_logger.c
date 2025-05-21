@@ -631,6 +631,8 @@ int main(int argc, char *argv[]) {
         .machine_name = cfg.machine_name,
         .count_enabled = cfg.count_enabled,
         .debug_enabled = cfg.debug_enabled,
+        .hash_enabled = cfg.hash_enabled,
+        .payload_enabled = cfg.payload_enabled,
         .bytes_transferred = &bytes_transferred,
         .overflow_flag = &overflow_flag
     };
@@ -667,7 +669,6 @@ int main(int argc, char *argv[]) {
     if (nfct_catch(cth) < 0) {
         log_with_timestamp("[ERROR] Failed to catch conntrack events: %s\n", strerror(errno));
     }
-
 
     nfct_close(cth);
     close(syslog_fd);
