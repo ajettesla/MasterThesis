@@ -52,7 +52,6 @@ struct conn_event {
     char protocol_str[16];
     const char *msg_type_str;
     uint32_t timeout;
-    const char *state_str;
     const char *assured_str;
     char hash[17]; // 16 hex chars + null terminator
     int type_num; // Numeric type
@@ -60,12 +59,27 @@ struct conn_event {
     int proto_num; // Numeric protocol
 };
 
+// Event data for passing between threads
+struct event_data {
+    long long timestamp_ns;
+    long long count;
+    enum nf_conntrack_msg_type type;
+    struct in_addr src_addr;
+    struct in_addr dst_addr;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t l4proto;
+    uint32_t timeout;
+    uint32_t status;
+    uint8_t tcp_state; // 255 if not set
+};
+
 // Callback data
 struct callback_data {
     spsc_queue_t *queue;
     atomic_int *overflow_flag;
     int count_enabled;
-    int hash_enabled; // Added
+    int hash_enabled;
     int payload_enabled;
     atomic_llong *event_counter;
     const char *src_range;
@@ -79,6 +93,8 @@ struct syslog_data {
     char *machine_name;
     int count_enabled;
     int debug_enabled;
+    int hash_enabled;
+    int payload_enabled;
     atomic_size_t *bytes_transferred;
     atomic_int *overflow_flag;
 };
@@ -225,70 +241,45 @@ static void calculate_hash(const char *input, char *output) {
 }
 
 // Extract conntrack event
-static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_type type,
-                               struct conn_event *event, int count_enabled, int hash_enabled,
-                               int payload_enabled, atomic_llong *event_counter) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    event->timestamp_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+static void extract_conn_event(struct event_data *ed, struct conn_event *event, int hash_enabled) {
+    event->count = ed->count;
+    event->timestamp_ns = ed->timestamp_ns;
 
-    if (count_enabled) {
-        event->count = atomic_fetch_add(event_counter, 1) + 1;
-    } else {
-        event->count = 0;
+    inet_ntop(AF_INET, &ed->src_addr, event->src_ip, INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &ed->dst_addr, event->dst_ip, INET_ADDRSTRLEN);
+
+    event->src_port = ed->src_port;
+    event->dst_port = ed->dst_port;
+
+    if (ed->l4proto == IPPROTO_TCP) strcpy(event->protocol_str, "tcp");
+    else if (ed->l4proto == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
+    else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %d", ed->l4proto);
+
+    switch (ed->type) {
+        case NFCT_T_NEW: event->msg_type_str = "NEW"; break;
+        case NFCT_T_UPDATE: event->msg_type_str = "UPDATE"; break;
+        case NFCT_T_DESTROY: event->msg_type_str = "DESTROY"; break;
+        default: event->msg_type_str = "UNKNOWN"; break;
     }
 
-    struct in_addr src_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC) };
-    struct in_addr dst_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_DST) };
-    inet_ntop(AF_INET, &src_addr, event->src_ip, INET_ADDRSTRLEN);
-    inet_ntop(AF_INET, &dst_addr, event->dst_ip, INET_ADDRSTRLEN);
-
-    event->src_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_SRC) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC)) : 0;
-    event->dst_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_DST) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST)) : 0;
-
-    if (payload_enabled) {
-        event->type_num = type;
-        event->proto_num = nfct_get_attr_u8(ct, ATTR_L4PROTO);
-        if (event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
-            event->state_num = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
-        } else {
-            event->state_num = -1;
+    if (ed->l4proto == IPPROTO_TCP && ed->tcp_state != 255) {
+        switch (ed->tcp_state) {
+            case 0: event->state_str = "NONE"; break;
+            case 1: event->state_str = "SYN_SENT"; break;
+            case 2: event->state_str = "SYN_RECV"; break;
+            case 3: event->state_str = "ESTABLISHED"; break;
+            case 4: event->state_str = "FIN_WAIT"; break;
+            case 5: event->state_str = "CLOSE_WAIT"; break;
+            case 6: event->state_str = "LAST_ACK"; break;
+            case 7: event->state_str = "TIME_WAIT"; break;
+            case 8: event->state_str = "CLOSE"; break;
+            default: event->state_str = "UNKNOWN"; break;
         }
+    } else {
+        event->state_str = "N/A";
     }
 
     if (hash_enabled) {
-        if (event->proto_num == 0) event->proto_num = nfct_get_attr_u8(ct, ATTR_L4PROTO);
-        if (event->proto_num == IPPROTO_TCP) strcpy(event->protocol_str, "tcp");
-        else if (event->proto_num == IPPROTO_UDP) strcpy(event->protocol_str, "udp");
-        else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %d", event->proto_num);
-
-        switch (type) {
-            case NFCT_T_NEW:     event->msg_type_str = "NEW";     break;
-            case NFCT_T_UPDATE:  event->msg_type_str = "UPDATE";  break;
-            case NFCT_T_DESTROY: event->msg_type_str = "DESTROY"; break;
-            default:             event->msg_type_str = "UNKNOWN"; break;
-        }
-
-        if (event->state_num < 0 && event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
-            event->state_num = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
-        }
-        if (event->state_num >= 0) {
-            switch (event->state_num) {
-                case 0: event->state_str = "NONE"; break;
-                case 1: event->state_str = "SYN_SENT"; break;
-                case 2: event->state_str = "SYN_RECV"; break;
-                case 3: event->state_str = "ESTABLISHED"; break;
-                case 4: event->state_str = "FIN_WAIT"; break;
-                case 5: event->state_str = "CLOSE_WAIT"; break;
-                case 6: event->state_str = "LAST_ACK"; break;
-                case 7: event->state_str = "TIME_WAIT"; break;
-                case 8: event->state_str = "CLOSE"; break;
-                default: event->state_str = "UNKNOWN"; break;
-            }
-        } else {
-            event->state_str = "N/A";
-        }
-
         char hash_input[256];
         snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%u,%s",
                  event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
@@ -298,62 +289,57 @@ static void extract_conn_event(struct nf_conntrack *ct, enum nf_conntrack_msg_ty
         event->hash[0] = '\0';
     }
 
-    event->timeout = nfct_attr_is_set(ct, ATTR_TIMEOUT) ? nfct_get_attr_u32(ct, ATTR_TIMEOUT) : 0;
+    event->timeout = ed->timeout;
+    event->assured_str = (ed->status & IPS_ASSURED) ? "ASSURED" : "N/A";
 
-    event->assured_str = "N/A";
-    if (nfct_attr_is_set(ct, ATTR_STATUS)) {
-        uint32_t status = nfct_get_attr_u32(ct, ATTR_STATUS);
-        if (status & IPS_ASSURED) event->assured_str = "ASSURED";
-    }
+    event->type_num = ed->type;
+    event->state_num = (ed->l4proto == IPPROTO_TCP && ed->tcp_state != 255) ? ed->tcp_state : -1;
+    event->proto_num = ed->l4proto;
 }
 
 // Conntrack event callback
 static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     struct callback_data *cb_data = (struct callback_data *)data;
-    struct conn_event event = {0};
-    extract_conn_event(ct, type, &event, cb_data->count_enabled, cb_data->hash_enabled,
-                       cb_data->payload_enabled, cb_data->event_counter);
+    struct event_data *ed = malloc(sizeof(*ed));
+    if (!ed) {
+        log_with_timestamp("[ERROR] Out of memory\n");
+        return NFCT_CB_CONTINUE;
+    }
+    memset(ed, 0, sizeof(*ed));
 
-    if (cb_data->src_range && !ip_in_range(event.src_ip, cb_data->src_range)) {
+    ed->type = type;
+    ed->src_addr.s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC);
+    ed->dst_addr.s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_DST);
+    ed->src_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_SRC) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC)) : 0;
+    ed->dst_port = nfct_attr_is_set(ct, ATTR_ORIG_PORT_DST) ? ntohs(nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST)) : 0;
+    ed->l4proto = nfct_get_attr_u8(ct, ATTR_L4PROTO);
+    ed->timeout = nfct_attr_is_set(ct, ATTR_TIMEOUT) ? nfct_get_attr_u32(ct, ATTR_TIMEOUT) : 0;
+    ed->status = nfct_attr_is_set(ct, ATTR_STATUS) ? nfct_get_attr_u32(ct, ATTR_STATUS) : 0;
+    if (ed->l4proto == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
+        ed->tcp_state = nfct_get_attr_u8(ct, ATTR_TCP_STATE);
+    } else {
+        ed->tcp_state = 255;
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ed->timestamp_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    if (cb_data->count_enabled) {
+        ed->count = atomic_fetch_add(cb_data->event_counter, 1) + 1;
+    } else {
+        ed->count = 0;
+    }
+
+    char src_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &ed->src_addr, src_ip_str, INET_ADDRSTRLEN);
+    if (cb_data->src_range && !ip_in_range(src_ip_str, cb_data->src_range)) {
+        free(ed);
         return NFCT_CB_CONTINUE;
     }
 
-    char buffer[1024] = {0};
-    char *ptr = buffer;
-    size_t remaining = sizeof(buffer);
-
-    if (cb_data->count_enabled) {
-        ptr += snprintf(ptr, remaining, "%lld,", event.count);
-        remaining -= (ptr - buffer);
-    }
-
-    ptr += snprintf(ptr, remaining, "%lld", event.timestamp_ns);
-    remaining -= (ptr - buffer);
-
-    if (cb_data->hash_enabled || cb_data->payload_enabled) {
-        ptr += snprintf(ptr, remaining, ",");
-        remaining -= (ptr - buffer);
-    }
-
-    if (cb_data->hash_enabled) {
-        ptr += snprintf(ptr, remaining, "%s", event.hash);
-        remaining -= (ptr - buffer);
-        if (cb_data->payload_enabled) {
-            ptr += snprintf(ptr, remaining, ",");
-            remaining -= (ptr - buffer);
-        }
-    }
-
-    if (cb_data->payload_enabled) {
-        ptr += snprintf(ptr, remaining, "%d,%d,%d,%s,%u,%s,%u",
-                        event.type_num, event.state_num, event.proto_num,
-                        event.src_ip, event.src_port, event.dst_ip, event.dst_port);
-        remaining -= (ptr - buffer);
-    }
-
-    log_with_timestamp("[DEBUG] Captured conntrack event: %s\n", buffer);
-
-    if (!spsc_queue_enqueue(cb_data->queue, strdup(buffer))) {
+    if (!spsc_queue_enqueue(cb_data->queue, (void *)ed)) {
+        free(ed);
         if (atomic_exchange(cb_data->overflow_flag, 1) == 0) {
             log_with_timestamp("[WARNING] SPSC queue overflow: events are being dropped!\n");
         }
@@ -362,7 +348,6 @@ static int event_cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, vo
             log_with_timestamp("[INFO] SPSC queue returned to normal: events are no longer being dropped.\n");
         }
     }
-
     log_with_timestamp("[DEBUG] Successfully enqueued event\n");
     return NFCT_CB_CONTINUE;
 }
@@ -411,7 +396,6 @@ static void create_syslog_message(char *msg, size_t len, const char *machine_nam
 // Syslog thread
 static void *syslog_thread(void *arg) {
     struct syslog_data *sdata = (struct syslog_data *)arg;
-    char *buffer = NULL;
     char batch[MAX_MESSAGE_LEN * MIN_BATCH_SIZE] = "";
     int message_count = 0;
     struct timeval last_sent, now;
@@ -429,13 +413,54 @@ static void *syslog_thread(void *arg) {
             goto send_batch;
         }
 
-        if (spsc_queue_dequeue(sdata->queue, &buffer)) {
+        struct event_data *ed_ptr;
+        if (spsc_queue_dequeue(sdata->queue, (void **)&ed_ptr)) {
             if (sdata->debug_enabled) {
-                log_with_timestamp("[DEBUG] Dequeued buffer: %s\n", buffer);
+                log_with_timestamp("[DEBUG] Dequeued event data\n");
+            }
+
+            struct conn_event event = {0};
+            extract_conn_event(ed_ptr, &event, sdata->hash_enabled);
+
+            char data[1024] = {0};
+            char *ptr = data;
+            size_t remaining = sizeof(data);
+
+            if (sdata->count_enabled) {
+                ptr += snprintf(ptr, remaining, "%lld,", event.count);
+                remaining -= (ptr - data);
+            }
+
+            ptr += snprintf(ptr, remaining, "%lld", event.timestamp_ns);
+            remaining -= (ptr - data);
+
+            if (sdata->hash_enabled || sdata->payload_enabled) {
+                ptr += snprintf(ptr, remaining, ",");
+                remaining -= (ptr - data);
+            }
+
+            if (sdata->hash_enabled) {
+                ptr += snprintf(ptr, remaining, "%s", event.hash);
+                remaining -= (ptr - data);
+                if (sdata->payload_enabled) {
+                    ptr += snprintf(ptr, remaining, ",");
+                    remaining -= (ptr - data);
+                }
+            }
+
+            if (sdata->payload_enabled) {
+                ptr += snprintf(ptr, remaining, "%d,%d,%d,%s,%u,%s,%u",
+                                event.type_num, event.state_num, event.proto_num,
+                                event.src_ip, event.src_port, event.dst_ip, event.dst_port);
+                remaining -= (ptr - data);
+            }
+
+            if (sdata->debug_enabled) {
+                log_with_timestamp("[DEBUG] Formatted event: %s\n", data);
             }
 
             char syslog_msg[MAX_MESSAGE_LEN];
-            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer);
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, data);
             strncat(batch, syslog_msg, sizeof(batch) - strlen(batch) - 1);
             strncat(batch, "\n", sizeof(batch) - strlen(batch) - 1);
             message_count++;
@@ -444,8 +469,7 @@ static void *syslog_thread(void *arg) {
                 log_with_timestamp("[DEBUG] Added message to batch, count: %d\n", message_count);
             }
 
-            free(buffer);
-            buffer = NULL;
+            free(ed_ptr);
         } else {
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] No data dequeued, sleeping...\n");
@@ -458,33 +482,59 @@ static void *syslog_thread(void *arg) {
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] Batch size reached, sending %d messages\n", message_count);
             }
-        send_batch:
-            if (sdata->debug_enabled) {
-                log_with_timestamp("[DEBUG] Sending batch of %d messages: %s\n", message_count, batch);
-            }
+            goto send_batch;
+        }
+
+    send_batch:
+        if (sdata->debug_enabled) {
+            log_with_timestamp("[DEBUG] Sending batch of %d messages: %s\n", message_count, batch);
+        }
+        if (sdata->syslog_fd < 0) {
+            sdata->syslog_fd = connect_to_syslog(sdata->syslog_ip, SYSLOG_PORT);
             if (sdata->syslog_fd < 0) {
-                sdata->syslog_fd = connect_to_syslog(sdata->syslog_ip, SYSLOG_PORT);
-                if (sdata->syslog_fd < 0) {
-                    log_with_timestamp("[ERROR] Failed to reconnect to syslog server\n");
-                    batch[0] = '\0';
-                    message_count = 0;
-                    gettimeofday(&last_sent, NULL);
-                    continue;
-                }
+                log_with_timestamp("[ERROR] Failed to reconnect to syslog server\n");
+                continue;
             }
-            ssize_t sent = send(sdata->syslog_fd, batch, strlen(batch), 0);
+        }
+        size_t total_to_send = strlen(batch);
+        size_t sent_so_far = 0;
+        while (sent_so_far < total_to_send) {
+            ssize_t sent = send(sdata->syslog_fd, batch + sent_so_far, total_to_send - sent_so_far, 0);
             if (sent > 0) {
-                atomic_fetch_add(sdata->bytes_transferred, sent);
-                log_with_timestamp("[INFO] Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
-                                   sent, atomic_load(sdata->bytes_transferred));
-            } else {
-                log_with_timestamp("[ERROR] Failed to send to syslog: %s\n", strerror(errno));
+                sent_so_far += sent;
+            } else if (sent == 0) {
+                log_with_timestamp("[ERROR] Connection closed while sending\n");
                 close(sdata->syslog_fd);
                 sdata->syslog_fd = -1;
+                break;
+            } else {
+                if (errno == EINTR) continue;
+                log_with_timestamp("[ERROR] Failed to send to syslog: %s\n", strerror(errno));
+                if (errno == ENOTSOCK || errno == EBADF) {
+                    close(sdata->syslog_fd);
+                    sdata->syslog_fd = -1;
+                }
+                break;
             }
+        }
+        if (sent_so_far == total_to_send) {
+            atomic_fetch_add(sdata->bytes_transferred, sent_so_far);
+            log_with_timestamp("[INFO] Sent %zu bytes to syslog. Total transferred: %zu bytes\n",
+                               sent_so_far, atomic_load(sdata->bytes_transferred));
             batch[0] = '\0';
             message_count = 0;
             gettimeofday(&last_sent, NULL);
+        } else {
+            // Partial send or failure
+            char *p = batch;
+            int num_complete = 0;
+            size_t i;
+            for (i = 0; i < sent_so_far && p[i] != '\0'; i++) {
+                if (p[i] == '\n') num_complete++;
+            }
+            message_count -= num_complete;
+            size_t unsent_len = strlen(batch + sent_so_far);
+            memmove(batch, batch + sent_so_far, unsent_len + 1);
         }
     }
     return NULL;
