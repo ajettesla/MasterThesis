@@ -47,7 +47,7 @@
   systemd:
     daemon_reload: yes
   
-- name: Enable and start conntrack_logger service
+- name: stop conntrack_logger service
   systemd:
     name: conntrack_logger
     enabled: yes
