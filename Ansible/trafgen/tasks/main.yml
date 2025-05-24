@@ -92,6 +92,18 @@
   systemd:
     daemon_reload: yes
 
+- name: stop tcp service
+  systemd:
+    name: tcp_server
+    enabled: yes
+    state: stopped
+
+- name: stop udp service
+  systemd:
+    name: udp_server
+    enabled: yes
+    state: stopped
+
 - name: Enable and start tcp_server service
   systemd:
     name: tcp_server
