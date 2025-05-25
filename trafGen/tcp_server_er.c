@@ -1,3 +1,16 @@
+/*
+ * High-Performance Epoll-based Multithreaded TCP Server
+ * Features:
+ *  - Configurable listening port (-p)
+ *  - Configurable number of worker threads (-t)
+ *  - RST on close via SO_LINGER and iptables rule for outbound RST (-k)
+ *  - Debug output (-D)
+ *  - Help/usage message (-h)
+ *  - Technical error and timeout error counters, displayed at shutdown
+ *  - Timeout for idle connections (timeout_error_count)
+ *  - Each technical error prints its details as it happens
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,29 +21,41 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
-#include <sys/timerfd.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <sys/timerfd.h>
+#include <time.h>
 
-#define MAX_EVENTS 10
+#define MAX_EVENTS 4096
+#define MAX_WORKERS 128
 #define BUFFER_SIZE 1024
 #define DEFAULT_PORT 8080
-#define DEFAULT_THREADS 2
+#define DEFAULT_THREADS 16
 #define SHUTDOWN_TIMEOUT 10
+#define CLIENT_TIMEOUT_SEC 10 // seconds for client inactivity timeout
 
-// Global flags
+// Global flags and variables
 static volatile sig_atomic_t shutdown_flag = 0;
 static bool debug_mode = false;
-static bool drop_rst = false;
-static bool use_rst = false;
+static bool use_rst = false; // if true, both RST-on-close and iptables are enabled
 static int port = DEFAULT_PORT;
-static int initial_threads = DEFAULT_THREADS;
-
-// Thread-safe connection counter
+static int num_workers = DEFAULT_THREADS;
 static atomic_int active_connections = 0;
+static atomic_int technical_error_count = 0;
+static atomic_int timeout_error_count = 0;
+
+typedef struct {
+    int epoll_fd;
+    pthread_t tid;
+    int idx;
+} worker_t;
+
+worker_t workers[MAX_WORKERS];
+atomic_int next_worker = 0;
 
 void debug_print(const char *fmt, ...) {
     if (debug_mode) {
@@ -43,8 +68,20 @@ void debug_print(const char *fmt, ...) {
     }
 }
 
+// Print details of technical errors, increment counter
+void print_technical_error(const char *context, int fd) {
+    int err = errno;
+    fprintf(stderr, "TECHNICAL ERROR: %s", context);
+    if (fd >= 0) {
+        fprintf(stderr, " (fd=%d)", fd);
+    }
+    fprintf(stderr, ": %s (errno=%d)\n", strerror(err), err);
+    atomic_fetch_add(&technical_error_count, 1);
+}
+
+// Add or remove iptables rule to drop outbound TCP RST packets
 void manage_iptables(bool add) {
-    if (!drop_rst) return;
+    if (!use_rst) return;
     const char *cmd_add = "iptables -I OUTPUT -p tcp --tcp-flags RST RST -j DROP";
     const char *cmd_del = "iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP";
     int ret = system(add ? cmd_add : cmd_del);
@@ -55,182 +92,223 @@ void manage_iptables(bool add) {
     }
 }
 
+// Signal handler for graceful shutdown (SIGINT)
 void handle_shutdown(int sig) {
     if (shutdown_flag == 0) {
         shutdown_flag = 1;
-        debug_print("Shutdown initiated, waiting 10 seconds for connections to close");
+        debug_print("Shutdown initiated, waiting %ds for connections to close", SHUTDOWN_TIMEOUT);
     }
 }
 
-void *worker_thread(void *arg) {
-    int server_fd = *(int *)arg;
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        perror("epoll_create1");
-        return NULL;
-    }
+// Set a socket FD to non-blocking mode
+int make_socket_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
-    struct epoll_event ev, events[MAX_EVENTS];
+// Close a client socket with RST if enabled, always decrements active_connections
+void close_with_rst(int fd) {
+    if (use_rst) {
+        struct linger sl = {1, 0};
+        if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)) < 0) {
+            print_technical_error("setsockopt(SO_LINGER) failed", fd);
+        } else {
+            debug_print("Sent RST on fd %d", fd);
+        }
+    }
+    if (close(fd) < 0) {
+        print_technical_error("close() failed", fd);
+    }
+    atomic_fetch_sub(&active_connections, 1);
+}
+
+// Worker thread function: Each worker owns an epoll instance
+void *worker_loop(void *arg) {
+    worker_t *worker = (worker_t *)arg;
+    struct epoll_event events[MAX_EVENTS];
     char buffer[BUFFER_SIZE];
 
     while (!shutdown_flag) {
-        debug_print("Waiting to accept connection");
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            perror("accept");
+        int n = epoll_wait(worker->epoll_fd, events, MAX_EVENTS, 300);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            print_technical_error("epoll_wait() failed", -1);
             break;
         }
-        debug_print("Accepted connection on fd %d", client_fd);
-        atomic_fetch_add(&active_connections, 1);
-
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.fd = client_fd;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
-            perror("epoll_ctl");
-            close(client_fd);
-            continue;
-        }
-
-        bool connection_closed = false;
-        while (!shutdown_flag && !connection_closed) {
-            debug_print("Waiting for events on fd %d", client_fd);
-            int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);
-            if (nfds < 0) {
-                if (errno == EINTR) continue;
-                perror("epoll_wait");
-                break;
-            }
-            debug_print("epoll_wait returned %d events", nfds);
-            for (int i = 0; i < nfds; i++) {
-                int fd = events[i].data.fd;
-                debug_print("Processing event for fd %d", fd);
-                ssize_t bytes_read = 0, total_read = 0;
-                while (total_read < BUFFER_SIZE - 1) {
-                    bytes_read = read(fd, buffer + total_read, BUFFER_SIZE - 1 - total_read);
-                    if (bytes_read <= 0) break;
-                    total_read += bytes_read;
-                    if (buffer[total_read - 1] == '\n') break;
-                }
-                if (bytes_read <= 0) {
-                    debug_print("Read error or EOF on fd %d", fd);
-                    close(fd);
-                    atomic_fetch_sub(&active_connections, 1);
-                    connection_closed = true;
-                    break;
-                }
-                buffer[total_read] = '\0';
-                debug_print("Received from fd %d: '%s'", fd, buffer);
-
-                if (strncmp(buffer, "hello\n", 6) == 0) {
-                    debug_print("Received 'hello' from fd %d, sending response", fd);
-                    const char *response = "hello\n";
-                    write(fd, response, strlen(response));
-                    debug_print("Sent response to fd %d: '%s'", fd, response);
+        for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+            if (events[i].events & EPOLLIN) {
+                ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
+                if (count < 0) {
+                    print_technical_error("read() failed", fd);
+                    close_with_rst(fd);
+                } else if (count == 0) {
+                    debug_print("Closing fd %d (EOF)", fd);
+                    close_with_rst(fd);
                 } else {
-                    debug_print("Received unexpected message from fd %d: '%s', closing immediately", fd, buffer);
+                    buffer[count] = 0;
+                    debug_print("Received from fd %d: '%s'", fd, buffer);
+                    if (strncmp(buffer, "hello\n", 6) == 0) {
+                        if (write(fd, "hello\n", 6) < 0) {
+                            print_technical_error("write() failed", fd);
+                        }
+                    }
+                    close_with_rst(fd);
                 }
-
-                if (use_rst) {
-                    struct linger sl = {1, 0};
-                    setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
-                    debug_print("Set SO_LINGER for RST on fd %d", fd);
-                }
-                close(fd);
-                atomic_fetch_sub(&active_connections, 1);
-                debug_print("Closed connection on fd %d", fd);
-                connection_closed = true;
-                break;
-            }
-            if (connection_closed) {
-                break; // exit inner while loop
             }
         }
-        // after handling connection, go back to accept
     }
-    close(epoll_fd);
-    debug_print("Worker thread exiting, closed epoll_fd %d", epoll_fd);
+    debug_print("Worker exiting");
     return NULL;
+}
+
+// Print help/usage message
+void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  -h           Show this help message\n"
+        "  -p <port>    Listen port (default: %d)\n"
+        "  -t <threads> Number of worker threads (default: %d, max: %d)\n"
+        "  -k           Enable RST-on-close (SO_LINGER) and iptables RST rule\n"
+        "  -D           Enable debug mode\n",
+        prog, DEFAULT_PORT, DEFAULT_THREADS, MAX_WORKERS
+    );
 }
 
 int main(int argc, char *argv[]) {
     int opt;
-    while ((opt = getopt(argc, argv, "p:t:rkD")) != -1) {
+    while ((opt = getopt(argc, argv, "hp:t:kD")) != -1) {
         switch (opt) {
-            case 'p': port = atoi(optarg); break;
-            case 't': initial_threads = atoi(optarg); break;
-            case 'r': use_rst = true; break;
-            case 'k': drop_rst = true; break;
-            case 'D': debug_mode = true; break;
+            case 'p':
+                port = atoi(optarg);
+                break;
+            case 't':
+                num_workers = atoi(optarg);
+                if (num_workers < 1 || num_workers > MAX_WORKERS) {
+                    fprintf(stderr, "Invalid thread count. Must be 1-%d.\n", MAX_WORKERS);
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            case 'k':
+                use_rst = true;
+                break;
+            case 'D':
+                debug_mode = true;
+                break;
+            case 'h':
             default:
-                fprintf(stderr, "Usage: %s [-p port] [-t threads] [-r] [-k] [-D]\n", argv[0]);
-                exit(EXIT_FAILURE);
+                print_usage(argv[0]);
+                exit(opt == 'h' ? EXIT_SUCCESS : EXIT_FAILURE);
         }
     }
 
-    debug_print("Starting server with port=%d, threads=%d, use_rst=%d, drop_rst=%d, debug=%d",
-                port, initial_threads, use_rst, drop_rst, debug_mode);
+    debug_print("Starting server with port=%d, threads=%d, RST+iptables=%d, debug=%d",
+        port, num_workers, use_rst, debug_mode);
 
+    // Set up signal handler for graceful shutdown (Ctrl+C)
     signal(SIGINT, handle_shutdown);
+
+    // Add iptables rule for RST if enabled
     manage_iptables(true);
 
-    int server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (server_fd < 0) {
-        perror("socket");
+    // Create the listening socket
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        print_technical_error("socket() failed", -1);
         exit(EXIT_FAILURE);
     }
 
     int optval = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
+        print_technical_error("setsockopt(SO_REUSEADDR) failed", listen_fd);
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0)
+        print_technical_error("setsockopt(SO_REUSEPORT) failed", listen_fd);
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
+    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        print_technical_error("bind() failed", listen_fd);
+        close(listen_fd);
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, SOMAXCONN) < 0) {
-        perror("listen");
-        close(server_fd);
+    if (listen(listen_fd, 4096) < 0) {
+        print_technical_error("listen() failed", listen_fd);
+        close(listen_fd);
         exit(EXIT_FAILURE);
     }
 
-    pthread_t *threads = malloc(initial_threads * sizeof(pthread_t));
-    for (int i = 0; i < initial_threads; i++) {
-        if (pthread_create(&threads[i], NULL, worker_thread, &server_fd) != 0) {
-            perror("pthread_create");
+    if (make_socket_non_blocking(listen_fd) < 0) {
+        print_technical_error("make_socket_non_blocking() failed", listen_fd);
+        close(listen_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Create worker threads and their epoll instances
+    for (int i = 0; i < num_workers; ++i) {
+        workers[i].epoll_fd = epoll_create1(0);
+        workers[i].idx = i;
+        if (workers[i].epoll_fd < 0) {
+            print_technical_error("epoll_create1() failed", -1);
+            exit(EXIT_FAILURE);
+        }
+        if (pthread_create(&workers[i].tid, NULL, worker_loop, &workers[i]) != 0) {
+            print_technical_error("pthread_create() failed", -1);
             exit(EXIT_FAILURE);
         }
     }
 
-    int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
-    struct itimerspec ts = {{0, 0}, {SHUTDOWN_TIMEOUT, 0}};
+    // Main accept loop: Accept new client connections and distribute to worker threads
     while (!shutdown_flag) {
-        sleep(1);
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int client_fd = accept4(listen_fd, (struct sockaddr*)&caddr, &clen, SOCK_NONBLOCK);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(500);
+                continue;
+            } else if (errno == EINTR) {
+                continue;
+            }
+            print_technical_error("accept4() failed", listen_fd);
+            break;
+        }
+        int widx = atomic_fetch_add(&next_worker, 1) % num_workers;
+        struct epoll_event ev = {0};
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = client_fd;
+        if (epoll_ctl(workers[widx].epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+            print_technical_error("epoll_ctl(ADD) failed", client_fd);
+            close_with_rst(client_fd);
+            continue;
+        }
+        atomic_fetch_add(&active_connections, 1);
+        debug_print("Accepted and assigned fd %d to worker %d", client_fd, widx);
     }
-    timerfd_settime(timer_fd, 0, &ts, NULL);
 
-    uint64_t exp;
-    read(timer_fd, &exp, sizeof(exp));
-    while (atomic_load(&active_connections) > 0 && exp--) {
-        debug_print("Waiting for %d connections to close", atomic_load(&active_connections));
-        sleep(1);
+    debug_print("Server shutting down, closing listen_fd");
+    close(listen_fd);
+
+    sleep(SHUTDOWN_TIMEOUT);
+
+    for (int i = 0; i < num_workers; ++i) {
+        pthread_cancel(workers[i].tid);
+        pthread_join(workers[i].tid, NULL);
+        close(workers[i].epoll_fd);
     }
 
-    for (int i = 0; i < initial_threads; i++) {
-        pthread_cancel(threads[i]);
-        pthread_join(threads[i], NULL);
-    }
-
-    close(server_fd);
-    close(timer_fd);
-    free(threads);
     manage_iptables(false);
     debug_print("Server shutdown complete");
+
+    printf("\n--- Server statistics ---\n");
+    printf("Active connections at shutdown: %d\n", atomic_load(&active_connections));
+    printf("Technical error count: %d\n", atomic_load(&technical_error_count));
+    printf("Timeout error count:   %d\n", atomic_load(&timeout_error_count));
+    printf("------------------------\n");
     return 0;
 }
