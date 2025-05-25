@@ -1,12 +1,9 @@
 /**
  * Epoll-based TCP client with unique (source IP, source port) per connection.
- * Does NOT reuse any (IP,port) tuple until all connections are done.
- * Waits once per batch of concurrent connections (-c), for -w ms after batch.
- * Supports -a (IP range), -r (port range), -k (RST+iptables), -n (total), -c (concurrency), -w (batch wait, ms), -D (debug).
- * Retries connect() up to 6 times on failure before giving up.
- *
- * Usage:
- *   ./tcp_client_epoll_no_reuse_retry -s <server IP> -p <server port> -n <total> -c <concurrency> -a <IP range> -r <port range> [-w <ms>] [-k] [-D]
+ * Enhanced: Prints statistics on connection outcomes on exit (Ctrl-C/SIGINT/SIGTERM).
+ * All statistics are tagged with [STAT] in logs for easy identification.
+ * 
+ * Usage and options as in your original code.
  */
 
 #include <stdio.h>
@@ -26,7 +23,9 @@
 #include <sys/epoll.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 
+// Constants for the program's operation
 #define MAX_EVENTS 1024
 #define MAX_MSG 6
 #define CONNECT_TIMEOUT_SEC 3
@@ -34,10 +33,22 @@
 #define CONNECT_RETRIES 6
 #define CONNECT_RETRY_DELAY_MS 100
 
+// Flags for debug mode and RST-close behavior
 static bool debug_mode = false;
 static bool kill_flag = false;
 static FILE *debug_log = NULL;
 
+// Atomic counters for connection outcome statistics
+static atomic_int stat_local_resource_exhausted = 0;     // Local resource (FD) exhaustion
+static atomic_int stat_server_busy = 0;                  // Server busy (ECONNREFUSED or similar)
+static atomic_int stat_handshake_failed = 0;             // TCP handshake never completed
+static atomic_int stat_read_timeout = 0;                 // Read timeout after connect
+static atomic_int stat_connection_timeout = 0;           // Connect timeout (SYN sent, no reply)
+static atomic_int stat_connection_closed = 0;            // Connections closed normally (data exchanged)
+static atomic_int stat_technical_error = 0;              // Other technical errors (bind, epoll, etc.)
+static atomic_int stat_total_connect_attempts = 0;       // For info
+
+// Open the debug log file for writing (line buffered)
 void open_debug_log(const char *filename) {
     debug_log = fopen(filename, "a");
     if (!debug_log) {
@@ -47,6 +58,7 @@ void open_debug_log(const char *filename) {
     setvbuf(debug_log, NULL, _IOLBF, 0); // Line-buffered
 }
 
+// Close the debug log file if open
 void close_debug_log() {
     if (debug_log) {
         fclose(debug_log);
@@ -54,6 +66,7 @@ void close_debug_log() {
     }
 }
 
+// Print a debug message to the debug log if enabled
 void debug_print(const char *fmt, ...) {
     if (debug_mode && debug_log) {
         va_list args;
@@ -64,6 +77,7 @@ void debug_print(const char *fmt, ...) {
     }
 }
 
+// Print a fatal error message to the debug log or stderr
 void fatal_print(const char *fmt, ...) {
     if (debug_log) {
         va_list args;
@@ -80,26 +94,69 @@ void fatal_print(const char *fmt, ...) {
     }
 }
 
+// Print connection outcome statistics to stderr and the log, tagged [STAT]
+void print_stats() {
+    fprintf(stderr,
+        "\n[STAT] ================= Connection Outcome Statistics ================\n"
+        "[STAT] Connections closed normally (successful handshake+data): %d\n"
+        "[STAT] Connections failed: server busy/refused:                  %d\n"
+        "[STAT] Connections failed: handshake never completed (timeout):   %d\n"
+        "[STAT] Connections failed: read timeout after handshake:          %d\n"
+        "[STAT] Connections failed: local resource exhaustion:             %d\n"
+        "[STAT] Connections failed: technical/other errors:                %d\n"
+        "[STAT] Total connect() attempts:                                  %d\n"
+        "[STAT] =================================================================\n",
+        stat_connection_closed, stat_server_busy, stat_handshake_failed,
+        stat_read_timeout, stat_local_resource_exhausted, stat_technical_error, stat_total_connect_attempts
+    );
+    if (debug_log) {
+        fprintf(debug_log,
+            "\n[STAT] ================= Connection Outcome Statistics ================\n"
+            "[STAT] Connections closed normally (successful handshake+data): %d\n"
+            "[STAT] Connections failed: server busy/refused:                  %d\n"
+            "[STAT] Connections failed: handshake never completed (timeout):   %d\n"
+            "[STAT] Connections failed: read timeout after handshake:          %d\n"
+            "[STAT] Connections failed: local resource exhaustion:             %d\n"
+            "[STAT] Connections failed: technical/other errors:                %d\n"
+            "[STAT] Total connect() attempts:                                  %d\n"
+            "[STAT] =================================================================\n",
+            stat_connection_closed, stat_server_busy, stat_handshake_failed,
+            stat_read_timeout, stat_local_resource_exhausted, stat_technical_error, stat_total_connect_attempts
+        );
+        fflush(debug_log);
+    }
+}
+
+// Signal handler for Ctrl-C/SIGINT/SIGTERM: print stats and exit
+void handle_sigint(int signo) {
+    print_stats();
+    if (debug_log) fflush(debug_log);
+    _exit(130); // Exit code 130 for Ctrl-C
+}
+
+// Structure for a (source IP, source port) tuple, and whether it's in use
 struct src_tuple {
     struct in_addr ip;
     int port;
     bool in_use;
 };
 
+// Per-connection state for event-driven handling
 struct conn_state {
-    int fd;
-    int id;
-    enum { CONN_CONNECTING, CONN_SENDING, CONN_READING, CONN_DONE, CONN_ERROR } state;
-    struct sockaddr_in src_addr;
-    struct sockaddr_in dst_addr;
-    int msg_sent;
-    int msg_read;
-    char readbuf[MAX_MSG];
-    time_t start_time;
-    time_t last_evt_time;
-    struct src_tuple *tuple;
+    int fd; // Socket file descriptor
+    int id; // Unique connection ID
+    enum { CONN_CONNECTING, CONN_SENDING, CONN_READING, CONN_DONE, CONN_ERROR } state; // Connection state
+    struct sockaddr_in src_addr; // Source address
+    struct sockaddr_in dst_addr; // Destination (server) address
+    int msg_sent; // Bytes sent
+    int msg_read; // Bytes read
+    char readbuf[MAX_MSG]; // Read buffer
+    time_t start_time; // Start time of connection
+    time_t last_evt_time; // Last event time
+    struct src_tuple *tuple; // Pointer to tuple in use
 };
 
+// Print help/usage message and exit
 void print_help(const char *prog) {
     printf("Usage:\n");
     printf("  %s -s <server IP> -p <server port> -n <total connections> -c <concurrency> -a <client IP range> -r <port range> [options]\n", prog);
@@ -118,12 +175,14 @@ void print_help(const char *prog) {
     exit(0);
 }
 
+// Set the socket to non-blocking mode
 int set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Parse an IP range string (e.g., "192.168.1.1-10" or "192.168.1.1-192.168.1.20") into an array of in_addr
 void parse_ip_range(char *range, struct in_addr **ips, int *num_ips) {
     char *dash = strchr(range, '-');
     if (!dash) {
@@ -167,6 +226,7 @@ void parse_ip_range(char *range, struct in_addr **ips, int *num_ips) {
     debug_print("[DEBUG] Parsed IP range: %s - %s (%d addrs)", start_str, end_str, *num_ips);
 }
 
+// Parse a port range string (e.g., "5000-5100") into an array of ports
 void parse_port_range(char *range, int **ports, int *num_ports) {
     char *dash = strchr(range, '-');
     if (!dash) {
@@ -188,6 +248,7 @@ void parse_port_range(char *range, int **ports, int *num_ports) {
     debug_print("[DEBUG] Parsed port range: %d-%d (%d ports)", start_port, end_port, *num_ports);
 }
 
+// Set SO_LINGER to force RST on close if requested, then close the socket
 void set_rst_and_close(int fd) {
     if (kill_flag) {
         struct linger sl = {1, 0};
@@ -197,8 +258,8 @@ void set_rst_and_close(int fd) {
     close(fd);
 }
 
+// Pick a free (source IP, port) tuple for a new connection, round-robin
 int pick_free_tuple(struct src_tuple *tuples, int total, int *last_used) {
-    // Pick next free tuple, round-robin
     int start = *last_used;
     for (int i = 0; i < total; i++) {
         int idx = (start + i) % total;
@@ -211,11 +272,21 @@ int pick_free_tuple(struct src_tuple *tuples, int total, int *last_used) {
     return -1; // none available
 }
 
+// Mark a tuple as free (no longer in use)
 void release_tuple(struct src_tuple *tuple) {
     tuple->in_use = false;
 }
 
 int main(int argc, char **argv) {
+    // Set up SIGINT/SIGTERM handler so stats print on Ctrl-C or kill
+    struct sigaction sa;
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    // Command line option variables
     char *server_ip = NULL;
     int server_port = 0;
     int total_connections = 0;
@@ -225,6 +296,7 @@ int main(int argc, char **argv) {
     double wait_time_ms = 0;
     char *debug_log_file = NULL;
 
+    // Parse command line options
     int opt;
     while ((opt = getopt(argc, argv, "s:p:n:c:a:r:w:kDhl:")) != -1) {
         switch (opt) {
@@ -239,18 +311,20 @@ int main(int argc, char **argv) {
             case 'D': debug_mode = true; break;
             case 'l': debug_log_file = strdup(optarg); break;
             case 'h': print_help(argv[0]);
-            default:
-                print_help(argv[0]);
+            default:  print_help(argv[0]);
         }
     }
+    // Check required options
     if (!server_ip || !server_port || total_connections <= 0 || max_concurrent <= 0 || !client_ip_range || !client_port_range) {
         print_help(argv[0]);
     }
+    // If no log file given, use default
     if (!debug_log_file) {
         debug_log_file = strdup("./tcp_client_debug.log");
     }
     open_debug_log(debug_log_file);
 
+    // Parse the source IP and port ranges
     struct in_addr *source_ips = NULL;
     int num_source_ips = 0;
     int *source_ports = NULL;
@@ -258,7 +332,7 @@ int main(int argc, char **argv) {
     parse_ip_range(client_ip_range, &source_ips, &num_source_ips);
     parse_port_range(client_port_range, &source_ports, &num_source_ports);
 
-    // Build unique tuples (ip, port)
+    // Build all possible unique (ip, port) tuples
     int tuple_count = num_source_ips * num_source_ports;
     struct src_tuple *tuples = calloc(tuple_count, sizeof(struct src_tuple));
     int idx = 0;
@@ -271,6 +345,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Sanity checks: cannot exceed number of tuples
     if (total_connections > tuple_count) {
         fatal_print("total_connections (-n) cannot exceed unique (ip,port) tuples (%d). Reduce -n or increase IP/port range.", tuple_count);
         exit(1);
@@ -283,7 +358,7 @@ int main(int argc, char **argv) {
     debug_print("[DEBUG] Connecting to server %s:%d, total connections: %d, concurrency: %d, tuples: %d, wait: %.2f ms, kill_flag: %d",
                 server_ip, server_port, total_connections, max_concurrent, tuple_count, wait_time_ms, kill_flag);
 
-    // Add iptables rule if -k is set
+    // Optionally add iptables rule to drop RST packets (for -k)
     if (kill_flag) {
         const char *add_command = "iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP";
         debug_print("[DEBUG] Adding iptables rule to drop RSTs...");
@@ -294,6 +369,7 @@ int main(int argc, char **argv) {
         debug_print("[DEBUG] iptables rule added");
     }
 
+    // Prepare sockaddr_in for server
     struct sockaddr_in srv_addr;
     memset(&srv_addr, 0, sizeof(srv_addr));
     srv_addr.sin_family = AF_INET;
@@ -303,6 +379,7 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    // Create the epoll instance for async event handling
     int epfd = epoll_create1(0);
     if (epfd < 0) {
         perror("epoll_create1");
@@ -310,6 +387,7 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    // Main stats and state variables
     int started = 0, finished = 0, errors = 0;
     int tuple_last_used = 0;
     char write_msg[] = "hello\n";
@@ -318,12 +396,14 @@ int main(int argc, char **argv) {
     int progress = 0;
     struct epoll_event events[MAX_EVENTS];
 
+    // Main connection batch loop
     while (started < total_connections) {
+        // Determine batch size (max concurrent connections or less if fewer remain)
         int batch = (total_connections - started > max_concurrent) ? max_concurrent : (total_connections - started);
         struct conn_state **conns = calloc(batch, sizeof(struct conn_state *));
         int inflight = 0;
 
-        // Start the batch
+        // Start all connections in the batch
         for (int i = 0; i < batch; i++) {
             int t_idx = pick_free_tuple(tuples, tuple_count, &tuple_last_used);
             if (t_idx < 0) {
@@ -340,44 +420,71 @@ int main(int argc, char **argv) {
             int connect_errno = 0;
             int res = -1;
 
+            // Try to establish the connection, with up to CONNECT_RETRIES attempts
             for (retry = 0; retry < CONNECT_RETRIES; ++retry) {
+                atomic_fetch_add(&stat_total_connect_attempts, 1);
                 fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (fd < 0) {
-                    fatal_print("socket() failed: %s", strerror(errno));
+                    // Local resource exhaustion or technical error
+                    if (errno == EMFILE || errno == ENFILE) {
+                        atomic_fetch_add(&stat_local_resource_exhausted, 1);
+                        fatal_print("[STAT] Local resource exhaustion: socket() failed with %s", strerror(errno));
+                    } else {
+                        atomic_fetch_add(&stat_technical_error, 1);
+                        fatal_print("[STAT] Technical error: socket() failed with %s", strerror(errno));
+                    }
                     continue;
                 }
                 if (set_nonblock(fd) < 0) {
-                    fatal_print("set_nonblock failed: %s", strerror(errno));
+                    atomic_fetch_add(&stat_technical_error, 1);
+                    fatal_print("[STAT] Technical error: set_nonblock failed: %s", strerror(errno));
                     close(fd);
                     continue;
                 }
 
+                // Prepare source address for bind()
                 memset(&src_addr, 0, sizeof(src_addr));
                 src_addr.sin_family = AF_INET;
                 src_addr.sin_addr = tuple->ip;
                 src_addr.sin_port = htons(tuple->port);
                 inet_ntop(AF_INET, &src_addr.sin_addr, ipbuf, sizeof(ipbuf));
 
+                // Bind the socket to the source IP:port tuple
                 if (bind(fd, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
-                    debug_print("[DEBUG][Conn %d][Retry %d] Bind failed for %s:%d: %s", started + i, retry+1, ipbuf, tuple->port, strerror(errno));
-                    fatal_print("[ERROR][Conn %d][Retry %d] Bind failed for %s:%d: %s", started + i, retry+1, ipbuf, tuple->port, strerror(errno));
+                    atomic_fetch_add(&stat_technical_error, 1);
+                    fatal_print("[STAT] Technical error: bind() failed for %s:%d: %s", ipbuf, tuple->port, strerror(errno));
                     close(fd);
                     continue;
                 }
 
+                // Try to connect to the server
                 res = connect(fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
                 if (res == 0) {
+                    // Immediate connect success (very rare)
                     connect_success = 1;
                     debug_print("[DEBUG][Conn %d][Retry %d] connect() immediate success src %s:%d -> dst %s:%d", started + i, retry+1, ipbuf, tuple->port, server_ip, server_port);
                     break;
                 } else if (errno == EINPROGRESS) {
+                    // Non-blocking connect in progress
                     connect_success = 1;
                     debug_print("[DEBUG][Conn %d][Retry %d] connect() in progress src %s:%d -> dst %s:%d", started + i, retry+1, ipbuf, tuple->port, server_ip, server_port);
                     break;
                 } else {
+                    // Connect failed: categorize
                     connect_errno = errno;
-                    debug_print("[DEBUG][Conn %d][Retry %d] connect() failed: %s, src %s:%d -> dst %s:%d", started + i, retry+1, strerror(errno), ipbuf, tuple->port, server_ip, server_port);
-                    fatal_print("[ERROR][Conn %d][Retry %d] connect() failed: %s, src %s:%d -> dst %s:%d", started + i, retry+1, strerror(errno), ipbuf, tuple->port, server_ip, server_port);
+                    if (errno == ECONNREFUSED) {
+                        atomic_fetch_add(&stat_server_busy, 1);
+                        fatal_print("[STAT] Server busy/refused: connect() failed: %s, src %s:%d -> dst %s:%d", strerror(errno), ipbuf, tuple->port, server_ip, server_port);
+                    } else if (errno == ENETUNREACH || errno == ETIMEDOUT || errno == EHOSTUNREACH) {
+                        atomic_fetch_add(&stat_handshake_failed, 1);
+                        fatal_print("[STAT] Handshake never completed (network unreachable/timeout): connect() failed: %s, src %s:%d -> dst %s:%d", strerror(errno), ipbuf, tuple->port, server_ip, server_port);
+                    } else if (errno == EMFILE || errno == ENFILE) {
+                        atomic_fetch_add(&stat_local_resource_exhausted, 1);
+                        fatal_print("[STAT] Local resource exhaustion: connect() failed: %s, src %s:%d -> dst %s:%d", strerror(errno), ipbuf, tuple->port, server_ip, server_port);
+                    } else {
+                        atomic_fetch_add(&stat_technical_error, 1);
+                        fatal_print("[STAT] Technical error: connect() failed: %s, src %s:%d -> dst %s:%d", strerror(errno), ipbuf, tuple->port, server_ip, server_port);
+                    }
                     set_rst_and_close(fd);
                     usleep(CONNECT_RETRY_DELAY_MS * 1000);
                     continue;
@@ -389,6 +496,7 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            // Allocate and initialize per-connection state
             struct conn_state *cs = calloc(1, sizeof(struct conn_state));
             cs->fd = fd;
             cs->id = started + i;
@@ -401,39 +509,41 @@ int main(int argc, char **argv) {
             cs->last_evt_time = cs->start_time;
             cs->tuple = tuple;
 
+            // Register the socket with epoll for async events
             struct epoll_event ev;
             memset(&ev, 0, sizeof(ev));
             ev.data.ptr = cs;
             ev.events = (cs->state == CONN_CONNECTING) ? EPOLLOUT : EPOLLOUT;
             if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+                atomic_fetch_add(&stat_technical_error, 1);
                 perror("epoll_ctl ADD");
-                fatal_print("[ERROR][Conn %d] epoll_ctl ADD failed: %s", cs->id, strerror(errno));
+                fatal_print("[STAT] Technical error: epoll_ctl ADD failed: %s", strerror(errno));
                 set_rst_and_close(fd); release_tuple(tuple); free(cs); continue;
             }
             conns[inflight] = cs;
             inflight++;
         }
 
-        // Event loop for this batch
+        // Event loop for the current batch of connections
         int batch_finished = 0;
         while (batch_finished < inflight) {
             int n = epoll_wait(epfd, events, MAX_EVENTS, 500);
             time_t now = time(NULL);
 
-            // Scan for timeouts (connect, read)
+            // Check for timeouts (connect and read)
             for (int i = 0; i < inflight; ++i) {
                 struct conn_state *cs = conns[i];
                 if (!cs) continue;
                 if (cs->state == CONN_CONNECTING && (now - cs->start_time) > CONNECT_TIMEOUT_SEC) {
+                    atomic_fetch_add(&stat_handshake_failed, 1);
                     debug_print("[DEBUG][Conn %d] connect() timeout", cs->id);
-                    fatal_print("[TIMEOUT][Conn %d] connect() timeout src %s:%d -> dst %s:%d", cs->id,
-                        inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
+                    fatal_print("[STAT] Handshake never completed (connect timeout) src %s:%d -> dst %s:%d", inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
                         inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
                     set_rst_and_close(cs->fd); cs->state = CONN_ERROR; release_tuple(cs->tuple); errors++; free(cs); conns[i] = NULL; batch_finished++;
                 } else if (cs->state == CONN_READING && (now - cs->last_evt_time) > REPLY_TIMEOUT_SEC) {
+                    atomic_fetch_add(&stat_read_timeout, 1);
                     debug_print("[DEBUG][Conn %d] read() timeout after %d bytes", cs->id, cs->msg_read);
-                    fatal_print("[TIMEOUT][Conn %d] read() timeout after %d bytes src %s:%d -> dst %s:%d",
-                        cs->id, cs->msg_read, inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
+                    fatal_print("[STAT] Read timeout after handshake: src %s:%d -> dst %s:%d", inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
                         inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
                     set_rst_and_close(cs->fd); cs->state = CONN_ERROR; release_tuple(cs->tuple); errors++; free(cs); conns[i] = NULL; batch_finished++;
                 }
@@ -441,8 +551,9 @@ int main(int argc, char **argv) {
 
             if (n < 0) {
                 if (errno == EINTR) continue;
+                atomic_fetch_add(&stat_technical_error, 1);
                 perror("epoll_wait");
-                fatal_print("epoll_wait failed: %s", strerror(errno));
+                fatal_print("[STAT] Technical error: epoll_wait failed: %s", strerror(errno));
                 break;
             }
             for (int i = 0; i < n; ++i) {
@@ -452,14 +563,31 @@ int main(int argc, char **argv) {
                 for (int k = 0; k < inflight; ++k) if (conns[k] == cs) { idx2 = k; break; }
                 if (idx2 == -1) continue;
 
+                // Handle epoll event for connection in each state
                 if (cs->state == CONN_CONNECTING) {
                     int err = 0; socklen_t len = sizeof(err);
                     if (getsockopt(cs->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err) {
-                        debug_print("[DEBUG][Conn %d] connect() failed: %s", cs->id, strerror(err ? err : errno));
-                        fatal_print("[ERROR][Conn %d] connect() failed: %s src %s:%d -> dst %s:%d", cs->id,
-                            strerror(err ? err : errno),
-                            inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
-                            inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
+                        if (err == ECONNREFUSED) {
+                            atomic_fetch_add(&stat_server_busy, 1);
+                            fatal_print("[STAT] Server busy/refused: getsockopt/conn failed: %s src %s:%d -> dst %s:%d", strerror(err ? err : errno),
+                                inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
+                                inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
+                        } else if (err == ENETUNREACH || err == ETIMEDOUT || err == EHOSTUNREACH) {
+                            atomic_fetch_add(&stat_handshake_failed, 1);
+                            fatal_print("[STAT] Handshake never completed (getsockopt/timeout): %s src %s:%d -> dst %s:%d", strerror(err ? err : errno),
+                                inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
+                                inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
+                        } else if (err == EMFILE || err == ENFILE) {
+                            atomic_fetch_add(&stat_local_resource_exhausted, 1);
+                            fatal_print("[STAT] Local resource exhaustion: getsockopt/conn failed: %s src %s:%d -> dst %s:%d", strerror(err ? err : errno),
+                                inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
+                                inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
+                        } else {
+                            atomic_fetch_add(&stat_technical_error, 1);
+                            fatal_print("[STAT] Technical error: getsockopt/conn failed: %s src %s:%d -> dst %s:%d", strerror(err ? err : errno),
+                                inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
+                                inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
+                        }
                         set_rst_and_close(cs->fd); cs->state = CONN_ERROR; release_tuple(cs->tuple); errors++; free(cs); conns[idx2] = NULL; batch_finished++; continue;
                     }
                     debug_print("[DEBUG][Conn %d] connect() complete", cs->id);
@@ -472,8 +600,9 @@ int main(int argc, char **argv) {
                     ssize_t wr = send(cs->fd, write_msg + cs->msg_sent, MAX_MSG - cs->msg_sent, 0);
                     if (wr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
                     else if (wr < 0) {
+                        atomic_fetch_add(&stat_technical_error, 1);
                         debug_print("[DEBUG][Conn %d] send() error: %s", cs->id, strerror(errno));
-                        fatal_print("[ERROR][Conn %d] send() error: %s src %s:%d -> dst %s:%d", cs->id,
+                        fatal_print("[STAT] Technical error: send() error: %s src %s:%d -> dst %s:%d", cs->id,
                             strerror(errno),
                             inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
                             inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
@@ -491,8 +620,9 @@ int main(int argc, char **argv) {
                     ssize_t rd = recv(cs->fd, cs->readbuf + cs->msg_read, MAX_MSG - cs->msg_read, 0);
                     if (rd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
                     else if (rd <= 0) {
+                        atomic_fetch_add(&stat_technical_error, 1);
                         debug_print("[DEBUG][Conn %d] recv() error or closed: %s", cs->id, strerror(errno));
-                        fatal_print("[ERROR][Conn %d] recv() error or closed: %s src %s:%d -> dst %s:%d", cs->id,
+                        fatal_print("[STAT] Technical error: recv() error or closed: %s src %s:%d -> dst %s:%d", cs->id,
                             strerror(errno),
                             inet_ntoa(cs->src_addr.sin_addr), ntohs(cs->src_addr.sin_port),
                             inet_ntoa(cs->dst_addr.sin_addr), ntohs(cs->dst_addr.sin_port));
@@ -501,7 +631,8 @@ int main(int argc, char **argv) {
                     cs->msg_read += rd;
                     cs->last_evt_time = time(NULL);
                     if (cs->msg_read == MAX_MSG) {
-                        debug_print("[DEBUG][Conn %d] read %d bytes: '%.*s'", cs->id, cs->msg_read, cs->msg_read, cs->readbuf);
+                        atomic_fetch_add(&stat_connection_closed, 1);
+                        debug_print("[STAT][Conn %d] Connection closed normally (success)", cs->id);
                         cs->state = CONN_DONE;
                         set_rst_and_close(cs->fd); release_tuple(cs->tuple); finished++;
                         free(cs); conns[idx2] = NULL; batch_finished++;
@@ -516,6 +647,7 @@ int main(int argc, char **argv) {
         }
         free(conns);
 
+        // Optional wait after each batch
         if (wait_time_ms > 0 && started + batch < total_connections) {
             debug_print("[DEBUG] Sleeping %.2f ms after batch", wait_time_ms);
             usleep((useconds_t)(wait_time_ms * 1000));
@@ -525,6 +657,10 @@ int main(int argc, char **argv) {
     printf("Completed %d connections (%d errors)\n", total_connections, errors);
     debug_print("[SUMMARY] Completed %d connections (%d errors)", total_connections, errors);
 
+    // Print summary statistics at normal program exit
+    print_stats();
+
+    // Remove iptables rule if it was added
     if (kill_flag) {
         const char *del_command = "iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP";
         debug_print("[DEBUG] Removing iptables rule...");
@@ -532,6 +668,7 @@ int main(int argc, char **argv) {
         debug_print("[DEBUG] iptables rule removed");
     }
 
+    // Free all dynamically allocated memory
     free(tuples);
     free(source_ips);
     free(source_ports);
