@@ -1,14 +1,9 @@
 /*
  * High-Performance Epoll-based Multithreaded TCP Server
  * Features:
- *  - Configurable listening port (-p)
- *  - Configurable number of worker threads (-t)
- *  - RST on close via SO_LINGER and iptables rule for outbound RST (-k)
- *  - Debug output (-D)
- *  - Help/usage message (-h)
- *  - Technical error and timeout error counters, displayed at shutdown
- *  - Timeout for idle connections (timeout_error_count)
- *  - Each technical error prints its details as it happens
+ *  - Immediate, clean shutdown on Ctrl+C (SIGINT)
+ *  - Status message every 30s to stdout
+ *  - Other features unchanged from before
  */
 
 #include <stdio.h>
@@ -29,6 +24,8 @@
 #include <getopt.h>
 #include <sys/timerfd.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/eventfd.h>
 
 #define MAX_EVENTS 4096
 #define MAX_WORKERS 128
@@ -36,7 +33,6 @@
 #define DEFAULT_PORT 8080
 #define DEFAULT_THREADS 16
 #define SHUTDOWN_TIMEOUT 10
-#define CLIENT_TIMEOUT_SEC 10 // seconds for client inactivity timeout
 
 // Global flags and variables
 static volatile sig_atomic_t shutdown_flag = 0;
@@ -47,11 +43,13 @@ static int num_workers = DEFAULT_THREADS;
 static atomic_int active_connections = 0;
 static atomic_int technical_error_count = 0;
 static atomic_int timeout_error_count = 0;
+static atomic_int total_connections_handled = 0;
 
 typedef struct {
     int epoll_fd;
     pthread_t tid;
     int idx;
+    int shutdown_pipe[2];
 } worker_t;
 
 worker_t workers[MAX_WORKERS];
@@ -94,10 +92,9 @@ void manage_iptables(bool add) {
 
 // Signal handler for graceful shutdown (SIGINT)
 void handle_shutdown(int sig) {
-    if (shutdown_flag == 0) {
-        shutdown_flag = 1;
-        debug_print("Shutdown initiated, waiting %ds for connections to close", SHUTDOWN_TIMEOUT);
-    }
+    (void)sig;
+    shutdown_flag = 1;
+    debug_print("Shutdown initiated, signaling all threads.");
 }
 
 // Set a socket FD to non-blocking mode
@@ -123,14 +120,14 @@ void close_with_rst(int fd) {
     atomic_fetch_sub(&active_connections, 1);
 }
 
-// Worker thread function: Each worker owns an epoll instance
+// Worker thread function: Each worker owns an epoll instance and a shutdown pipe
 void *worker_loop(void *arg) {
     worker_t *worker = (worker_t *)arg;
     struct epoll_event events[MAX_EVENTS];
     char buffer[BUFFER_SIZE];
 
     while (!shutdown_flag) {
-        int n = epoll_wait(worker->epoll_fd, events, MAX_EVENTS, 300);
+        int n = epoll_wait(worker->epoll_fd, events, MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -139,6 +136,13 @@ void *worker_loop(void *arg) {
         }
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
+            if (fd == worker->shutdown_pipe[0]) {
+                // Drain the pipe
+                char buf[16];
+                read(worker->shutdown_pipe[0], buf, sizeof(buf));
+                debug_print("Worker %d received shutdown signal.", worker->idx);
+                break;
+            }
             if (events[i].events & EPOLLIN) {
                 ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
                 if (count < 0) {
@@ -159,8 +163,29 @@ void *worker_loop(void *arg) {
                 }
             }
         }
+        if (shutdown_flag) {
+            break;
+        }
     }
-    debug_print("Worker exiting");
+    debug_print("Worker %d exiting", worker->idx);
+    return NULL;
+}
+
+// Status thread: print connection stats every 30 seconds, but exit promptly on shutdown
+void *status_thread_func(void *arg) {
+    (void)arg;
+    int elapsed = 0;
+    while (!shutdown_flag) {
+        sleep(1);
+        elapsed++;
+        if (shutdown_flag) break;
+        if (elapsed >= 30) {
+            int total = atomic_load(&total_connections_handled);
+            printf("[STATUS] %d connections handled so far. Server is running happily!\n", total);
+            fflush(stdout);
+            elapsed = 0;
+        }
+    }
     return NULL;
 }
 
@@ -208,7 +233,10 @@ int main(int argc, char *argv[]) {
         port, num_workers, use_rst, debug_mode);
 
     // Set up signal handler for graceful shutdown (Ctrl+C)
-    signal(SIGINT, handle_shutdown);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_shutdown;
+    sigaction(SIGINT, &sa, NULL);
 
     // Add iptables rule for RST if enabled
     manage_iptables(true);
@@ -249,7 +277,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Create worker threads and their epoll instances
+    // Create worker threads and their epoll instances, with shutdown pipe
     for (int i = 0; i < num_workers; ++i) {
         workers[i].epoll_fd = epoll_create1(0);
         workers[i].idx = i;
@@ -257,11 +285,29 @@ int main(int argc, char *argv[]) {
             print_technical_error("epoll_create1() failed", -1);
             exit(EXIT_FAILURE);
         }
+        if (pipe(workers[i].shutdown_pipe) != 0) {
+            print_technical_error("pipe() failed for shutdown pipe", -1);
+            exit(EXIT_FAILURE);
+        }
+        // Set read end non-blocking (not strictly needed, but good practice)
+        make_socket_non_blocking(workers[i].shutdown_pipe[0]);
+        // Add shutdown pipe read end to epoll
+        struct epoll_event ev = {0};
+        ev.events = EPOLLIN;
+        ev.data.fd = workers[i].shutdown_pipe[0];
+        if (epoll_ctl(workers[i].epoll_fd, EPOLL_CTL_ADD, workers[i].shutdown_pipe[0], &ev) < 0) {
+            print_technical_error("epoll_ctl(ADD shutdown pipe) failed", workers[i].shutdown_pipe[0]);
+            exit(EXIT_FAILURE);
+        }
         if (pthread_create(&workers[i].tid, NULL, worker_loop, &workers[i]) != 0) {
             print_technical_error("pthread_create() failed", -1);
             exit(EXIT_FAILURE);
         }
     }
+
+    // Start status reporting thread
+    pthread_t status_tid;
+    pthread_create(&status_tid, NULL, status_thread_func, NULL);
 
     // Main accept loop: Accept new client connections and distribute to worker threads
     while (!shutdown_flag) {
@@ -288,19 +334,29 @@ int main(int argc, char *argv[]) {
             continue;
         }
         atomic_fetch_add(&active_connections, 1);
+        atomic_fetch_add(&total_connections_handled, 1);
         debug_print("Accepted and assigned fd %d to worker %d", client_fd, widx);
     }
 
     debug_print("Server shutting down, closing listen_fd");
     close(listen_fd);
 
-    sleep(SHUTDOWN_TIMEOUT);
-
+    // Signal all workers to wake up immediately via shutdown pipe
     for (int i = 0; i < num_workers; ++i) {
-        pthread_cancel(workers[i].tid);
+        // Write at least 1 byte to wake them up
+        write(workers[i].shutdown_pipe[1], "x", 1);
+    }
+
+    // Wait for all worker threads to finish
+    for (int i = 0; i < num_workers; ++i) {
         pthread_join(workers[i].tid, NULL);
         close(workers[i].epoll_fd);
+        close(workers[i].shutdown_pipe[0]);
+        close(workers[i].shutdown_pipe[1]);
     }
+
+    // Join the status reporting thread
+    pthread_join(status_tid, NULL);
 
     manage_iptables(false);
     debug_print("Server shutdown complete");
@@ -309,6 +365,7 @@ int main(int argc, char *argv[]) {
     printf("Active connections at shutdown: %d\n", atomic_load(&active_connections));
     printf("Technical error count: %d\n", atomic_load(&technical_error_count));
     printf("Timeout error count:   %d\n", atomic_load(&timeout_error_count));
+    printf("Total connections handled: %d\n", atomic_load(&total_connections_handled));
     printf("------------------------\n");
     return 0;
 }
