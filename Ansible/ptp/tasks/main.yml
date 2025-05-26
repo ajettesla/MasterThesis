@@ -9,6 +9,12 @@
     state: directory
     mode: '0755'
 
+- name: Stop chrony service if it exists
+  systemd:
+    name: chrony
+    state: stopped
+  when: "'chrony.service' in ansible_facts.services"
+
 - name: Deploy PTP4L config file (master)
   template:
     src: ptp4l-master.conf.j2
