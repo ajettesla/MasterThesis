@@ -1,0 +1,33 @@
+---
+- name: Gather service facts
+  service_facts:
+
+- name: Stop and disable ntp service if it exists
+  systemd:
+    name: ntp
+    state: stopped
+    enabled: no
+  when: "'ntp.service' in ansible_facts.services"
+
+- name: Stop ptp4l service if it exists
+  systemd:
+    name: ptp4l
+    state: stopped
+  when: "'ptp4l.service' in ansible_facts.services"
+
+- name: Install chrony package
+  apt:
+    name: chrony
+    state: present
+
+- name: Copy chrony.conf template
+  template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+  notify: restart chrony
+
+- name: Start and enable chrony service
+  systemd:
+    name: chrony
+    state: started
+    enabled: yes

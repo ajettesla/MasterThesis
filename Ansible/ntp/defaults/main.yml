@@ -1,0 +1,6 @@
+---
+chrony_servers:
+  - sthlm1.ntp.se
+  - sthlm2.ntp.se
+  - gbg1.ntp.se
+  - malmo1.ntp.se
