@@ -39,7 +39,7 @@ if $msg contains "conntrack_logger ---" then {
     stop
 }
 
-if $msg contains "ptp4l" then {
+if $msg contains "ptpd" then {
     action(type="omfile" file="/var/log/ptp.log")
     stop
 }
