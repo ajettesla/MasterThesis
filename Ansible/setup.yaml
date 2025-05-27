@@ -14,5 +14,5 @@
   roles:
     - connectionTracking
     - keepalived
-    - ntp
+    - ptp
 

@@ -1,0 +1,3 @@
+# Forward ptpd logs to remote syslog server
+if $programname == 'ptpd2' then @@{{ ptpd_syslog_server }}:514
+& stop

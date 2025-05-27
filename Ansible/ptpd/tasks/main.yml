@@ -1,0 +1,48 @@
+---
+- name: Install ptpd and rsyslog if not present
+  apt:
+    name:
+      - ptpd
+      - rsyslog
+    state: present
+    update_cache: yes
+
+- name: Stop ptp4l.service if running
+  systemd:
+    name: ptp4l.service
+    state: stopped
+    enabled: no
+  ignore_errors: yes
+
+- name: Stop chrony.service if running
+  systemd:
+    name: chrony.service
+    state: stopped
+    enabled: no
+  ignore_errors: yes
+
+- name: Deploy ptpd2 systemd service file
+  template:
+    src: ptpd2.service.j2
+    dest: /etc/systemd/system/ptpd2.service
+    mode: '0644'
+
+- name: Reload systemd daemon
+  command: systemctl daemon-reload
+
+- name: Enable and start ptpd2 service
+  systemd:
+    name: ptpd2.service
+    state: started
+    enabled: yes
+
+- name: Configure rsyslog to forward ptpd logs to remote server
+  template:
+    src: rsyslog_ptpd.conf.j2
+    dest: /etc/rsyslog.d/30-ptpd.conf
+    mode: '0644'
+
+- name: Restart rsyslog to apply new config
+  systemd:
+    name: rsyslog
+    state: restarted

@@ -1,0 +1,11 @@
+[Unit]
+Description=PTPd2 service for PTP slave on {{ ptpd_interface }}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptpd -i {{ ptpd_interface }} -s -d {{ ptpd_domain }} -E -C -V
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

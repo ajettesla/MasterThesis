@@ -1,3 +1,8 @@
+# tasks/main.yml
+---
+- name: Gather service facts
+  service_facts:
+
 - name: Ensure linuxptp is installed
   package:
     name: linuxptp
@@ -72,6 +77,3 @@
     name: systemd-journald
     state: restarted
   when: ptp4l_mode == "slave"
-
-
-
