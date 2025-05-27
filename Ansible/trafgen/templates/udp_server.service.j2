@@ -3,6 +3,7 @@ Description=UDP Server
 After=network.target
 
 [Service]
+LimitNOFILE=2000000
 ExecStartPre=/bin/sh -c 'echo "" > {{ log_dir }}/udp.log'
 ExecStart={{ repo_dest }}/trafGen/udp_server -p {{ udp_server_port }}
 StandardOutput=file:{{ log_dir }}/udp.log
