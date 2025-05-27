@@ -232,7 +232,7 @@ void *acceptor_loop(void *arg) {
         int client_fd = accept4(listen_fd, (struct sockaddr*)&caddr, &clen, SOCK_NONBLOCK);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(500); // No pending connections, sleep briefly
+               // usleep(500); // No pending connections, sleep briefly
                 continue;
             } else if (errno == EINTR) {
                 continue; // interrupted by signal
