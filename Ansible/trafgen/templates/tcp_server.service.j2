@@ -3,6 +3,7 @@ Description=TCP Server
 After=network.target
 
 [Service]
+LimitNOFILE=2000000
 ExecStartPre=/bin/sh -c 'echo "" > {{ log_dir }}/tcp.log'
 ExecStart=sudo {{ repo_dest }}/trafGen/tcp_server_er -p {{ tcp_server_port }} -k -a 4 -w 4
 StandardOutput=file:{{ log_dir }}/tcp.log
