@@ -10,11 +10,11 @@ Reuse the prot and ip  -R
 debug -D
 reset the socket instead of fin -k 
 
-./tcp_server_er  -p 5000 -t 1 -r -k -D
+./tcp_server_er -p 8000 -k -a 4 -w 4
 
 
 -p port number 
--t intial threads
--r reset instead of fin
--k iptables appply 
+-a acceptors threads
+-w worker threads
+-k iptables appply and rst the connectionon 
 -D debug.
