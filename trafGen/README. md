@@ -1,4 +1,4 @@
-./tcp_client_er -s 192.168.10.10 -p 5000 -n 1000 -c 2 -w 1 -a 192.168.50.10-20 -r 50000-65000 -k -R -D
+./tcp_client_er -s 172.16.1.1 -p 2000 -n 250000 -c 5000 -w 1 -a 172.16.1.10-22  -k -r 10000-65000
 
 server ip is -s 
 port is -p 
@@ -6,9 +6,10 @@ no of connection -n
 concurrency -c 
 client ip range -a
 client port range -r 
-Reuse the prot and ip  -R
 debug -D
-reset the socket instead of fin -k 
+reset the socket instead of fin -k  and add iptables to drop the rst packet.
+-w wait 
+
 
 ./tcp_server_er -p 8000 -k -a 4 -w 4
 
