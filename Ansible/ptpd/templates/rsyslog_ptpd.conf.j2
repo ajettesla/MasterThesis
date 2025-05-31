@@ -1,5 +1,5 @@
 # Forward ptp4l logs to remote syslog server
-$template CustomFormat,"<%pri%>%timestamp% {{ device_name }} %syslogtag%%msg%\n"
+$template CustomFormat,"<%pri%>%timestamp% {{ ansible_hostname }} %syslogtag%%msg%\n"
 
 {% if syslog_transport == 'tcp' %}
 if $programname == 'ptpd' then @@{{ syslog_server_ip }}:{{ syslog_server_port }};CustomFormat
