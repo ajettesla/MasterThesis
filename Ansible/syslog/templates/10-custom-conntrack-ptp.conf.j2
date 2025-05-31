@@ -1,0 +1,15 @@
+# Enable TCP listener
+module(load="imtcp")
+input(type="imtcp" port="514")
+
+# Match logs from ptpd
+if ($programname == "ptpd") then {
+    action(type="omfile" file="/var/log/ptp.log")
+    stop
+}
+
+if ($syslogtag contains "conntrack_logger") then {
+    action(type="omfile" file="/var/log/conntrack.log")
+    stop
+}
+
