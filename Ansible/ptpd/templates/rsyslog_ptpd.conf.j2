@@ -1,7 +1,9 @@
 # Forward ptp4l logs to remote syslog server
+$template CustomFormat,"<%pri%>%timestamp% {{ device_name }} %syslogtag%%msg%\n"
+
 {% if syslog_transport == 'tcp' %}
-if $programname == 'ptpd' then @@{{ syslog_server_ip }}:{{ syslog_server_port }}
+if $programname == 'ptpd' then @@{{ syslog_server_ip }}:{{ syslog_server_port }};CustomFormat
 {% else %}
-if $programname == 'ptpd' then @{{ syslog_server_ip }}:{{ syslog_server_port }}
+if $programname == 'ptpd' then @{{ syslog_server_ip }}:{{ syslog_server_port }};CustomFormat
 {% endif %}
 & stop
