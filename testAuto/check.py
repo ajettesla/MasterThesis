@@ -5,6 +5,8 @@ import threading
 import time
 import os
 import re
+import sys
+import signal
 
 print_lock = threading.Lock()
 
@@ -102,6 +104,12 @@ def check_and_start_service(client, service, hostname, verbose=True):
         with print_lock:
             print(f"{RED}[{hostname}] Failed to start {service}: {output}{RESET}")
 
+# Handle Ctrl-C for immediate exit during countdown
+def signal_handler(sig, frame):
+    print("\nCtrl-C received. Exiting now!")
+    sys.exit(1)
+
+
 def monitor_log_file(
     hostname: str,
     filepath: str,
@@ -113,7 +121,7 @@ def monitor_log_file(
     """
     Monitor a remote log file for appearance of all keywords in `keyword_expr` (across any lines).
     Stop on first match (all keywords seen) or timeout.
-    Returns matched line (last seen) or None.
+    If no match after 1 minute, print a countdown every second for 10s before exit.
     All output is prefixed with the device name.
     """
     with print_lock:
@@ -135,40 +143,77 @@ def monitor_log_file(
     matched_line = None
     start_time = time.time()
     progress_reported = set()
-    while time.time() - start_time < timeout:
-        elapsed = int(time.time() - start_time)
-        line = stdout.readline()
-        if not line:
-            time.sleep(0.1)
-            continue
-        line = line.strip()
-        for kw in keywords:
-            if kw in line:
-                seen.add(kw)
-        if print_output:
-            with print_lock:
-                print(f"[{hostname}] LOG: {line}")
-        if seen == keywords:
-            matched_line = line
+    countdown_started = False
+    countdown_remaining = 10  # seconds
+
+    try:
+        while time.time() - start_time < timeout:
+            elapsed = int(time.time() - start_time)
+            # After 60 seconds and no match, start countdown
+            if not countdown_started and elapsed >= 60 and seen != keywords:
+                countdown_started = True
+                countdown_start_time = time.time()
+                # Debugging: Confirm countdown start
+                with print_lock:
+                    print(f"{YELLOW}[{hostname}] Starting countdown at elapsed = {elapsed} seconds{RESET}")
+
+            if countdown_started and countdown_remaining > 0 and seen != keywords:
+                # Debugging: Before printing countdown message
+                with print_lock:
+                    print(f"{YELLOW}[{hostname}] Countdown: {countdown_remaining} seconds remaining{RESET}")
+                with print_lock:
+                    print(f"{RED}[{hostname}] No match found, closing in {countdown_remaining} seconds. Press Ctrl-C to stop now!{RESET}")
+                time.sleep(1)
+                countdown_remaining -= 1
+                # Debugging: After sleep, show updated countdown
+                with print_lock:
+                    print(f"{YELLOW}[{hostname}] After sleep, countdown_remaining = {countdown_remaining}{RESET}")
+                if countdown_remaining == 0:
+                    with print_lock:
+                        print(f"{RED}[{hostname}] No match found, closing program now!{RESET}")
+                    os._exit(1)
+                continue
+
+            line = stdout.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+            line = line.strip()
+            for kw in keywords:
+                if kw in line and kw not in seen:
+                    seen.add(kw)
+                    # Debugging: Report new keywords
+                    with print_lock:
+                        print(f"{GREEN}[{hostname}] New keyword '{kw}' seen, current seen: {seen}{RESET}")
             if print_output:
                 with print_lock:
-                    print(f"{BLUE}[{hostname}] All keywords {keywords} found in {filepath}.{RESET}")
-            break
-        # Progress print every 5 seconds
-        step = elapsed // 5
-        if step not in progress_reported:
-            progress_reported.add(step)
+                    print(f"[{hostname}] LOG: {line}")
+            if seen == keywords:
+                matched_line = line
+                if print_output:
+                    with print_lock:
+                        print(f"{BLUE}[{hostname}] All keywords {keywords} found in {filepath}.{RESET}")
+                break
+            # Progress print every 5 seconds
+            step = elapsed // 5
+            if step not in progress_reported:
+                progress_reported.add(step)
+                # Debugging: Include seen keywords in progress
+                with print_lock:
+                    print(f"{YELLOW}[{hostname}] Progress: {elapsed}/{timeout} s, seen keywords: {seen}{RESET}")
+
+        if seen != keywords and print_output:
             with print_lock:
-                print(f"{YELLOW}[{hostname}] monitor_log_file progress: {elapsed}/{timeout} seconds elapsed{RESET}")
+                print(f"{RED}[{hostname}] match not found before timeout.{RESET}")
+            # Debugging: Specify missing keywords
+            with print_lock:
+                print(f"{RED}[{hostname}] Not all keywords {keywords} found in {filepath} within {timeout} seconds. Missing: {keywords - seen}{RESET}")
 
-    if seen != keywords and print_output:
+    finally:
+        stdout.channel.close()
+        client.close()
         with print_lock:
-            print(f"{RED}[{hostname}] Not all keywords {keywords} found in {filepath} within {timeout} seconds.{RESET}")
-
-    stdout.channel.close()
-    client.close()
-    with print_lock:
-        print(f"{BLUE}[{hostname}] monitor_log_file thread finished{RESET}")
+            print(f"{BLUE}[{hostname}] monitor_log_file thread finished{RESET}")
     return matched_line
 
 def build_and_run_client(
@@ -287,7 +332,7 @@ def main():
         "connt1": ["ptpd2.service", "conntrack_logger.service"],
         "connt2": ["ptpd2.service", "conntrack_logger.service"],
     }
-
+    signal.signal(signal.SIGINT, signal_handler)
     threads = []
     for host, services in service_map.items():
         def check_services(hostname, services):
