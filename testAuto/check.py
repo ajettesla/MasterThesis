@@ -108,7 +108,8 @@ def check_and_start_service(client, service, hostname, verbose=True):
 def signal_handler(sig, frame):
     print("\nCtrl-C received. Exiting now!")
     sys.exit(1)
-
+    
+import socket
 
 def monitor_log_file(
     hostname: str,
@@ -121,16 +122,18 @@ def monitor_log_file(
     """
     Monitor a remote log file for appearance of all keywords in `keyword_expr` (across any lines).
     Stop on first match (all keywords seen) or timeout.
-    If no match after 1 minute, print a countdown every second for 10s before exit.
+    Print remaining time every 10 seconds.
     All output is prefixed with the device name.
     """
     with print_lock:
-        print(f"{BLUE}[{hostname}] monitor_log_file thread started (watching {filepath}){RESET}")
+        print(f"{BLUE}[{hostname}] Starting monitor_log_file thread (watching {filepath}){RESET}")
 
     client = connect_to_host(hostname)
 
     # Truncate log file if requested
     if truncate_file:
+        with print_lock:
+            print(f"{YELLOW}[{hostname}] Truncating {filepath}{RESET}")
         run_command_with_timeout(client, f"sudo truncate -s 0 {filepath}", 5, hostname=hostname)
 
     # Parse keywords from the expression
@@ -138,51 +141,54 @@ def monitor_log_file(
     seen = set()
 
     command = f"timeout {timeout}s sudo tail -F {filepath}"
+    with print_lock:
+        print(f"{YELLOW}[{hostname}] Executing command: {command}{RESET}")
     stdin, stdout, stderr = client.exec_command(command)
+
+    # Set a timeout on the channel to prevent indefinite blocking
+    stdout.channel.settimeout(1.0)  # 1-second timeout for read operations
 
     matched_line = None
     start_time = time.time()
     progress_reported = set()
-    countdown_started = False
-    countdown_remaining = 10  # seconds
 
     try:
         while time.time() - start_time < timeout:
             elapsed = int(time.time() - start_time)
-            # After 60 seconds and no match, start countdown
-            if not countdown_started and elapsed >= 60 and seen != keywords:
-                countdown_started = True
-                countdown_start_time = time.time()
-                # Debugging: Confirm countdown start
-                with print_lock:
-                    print(f"{YELLOW}[{hostname}] Starting countdown at elapsed = {elapsed} seconds{RESET}")
+            # Debug: Print loop iteration status
+            with print_lock:
+                print(f"{YELLOW}[{hostname}] Loop iteration, elapsed = {elapsed}s, seen = {seen}, keywords = {keywords}{RESET}")
 
-            if countdown_started and countdown_remaining > 0 and seen != keywords:
-                # Debugging: Before printing countdown message
+            # Print remaining time every 10 seconds
+            step = elapsed // 10
+            if step not in progress_reported:
+                progress_reported.add(step)
+                remaining = timeout - elapsed
                 with print_lock:
-                    print(f"{YELLOW}[{hostname}] Countdown: {countdown_remaining} seconds remaining{RESET}")
+                    print(f"{YELLOW}[{hostname}] {remaining} seconds remaining{RESET}")
+
+            # Check if channel is still open
+            if stdout.channel.closed or stdout.channel.exit_status_ready():
                 with print_lock:
-                    print(f"{RED}[{hostname}] No match found, closing in {countdown_remaining} seconds. Press Ctrl-C to stop now!{RESET}")
-                time.sleep(1)
-                countdown_remaining -= 1
-                # Debugging: After sleep, show updated countdown
-                with print_lock:
-                    print(f"{YELLOW}[{hostname}] After sleep, countdown_remaining = {countdown_remaining}{RESET}")
-                if countdown_remaining == 0:
-                    with print_lock:
-                        print(f"{RED}[{hostname}] No match found, closing program now!{RESET}")
-                    os._exit(1)
+                    print(f"{RED}[{hostname}] tail -F command terminated early at elapsed = {elapsed}s{RESET}")
+                break
+
+            try:
+                line = stdout.readline()
+            except socket.timeout:
+                # If readline times out, continue to the next iteration
                 continue
 
-            line = stdout.readline()
             if not line:
                 time.sleep(0.1)
+                # Debug: Check if no line was read
+                with print_lock:
+                    print(f"{YELLOW}[{hostname}] No new line read, sleeping for 0.1s{RESET}")
                 continue
             line = line.strip()
             for kw in keywords:
                 if kw in line and kw not in seen:
                     seen.add(kw)
-                    # Debugging: Report new keywords
                     with print_lock:
                         print(f"{GREEN}[{hostname}] New keyword '{kw}' seen, current seen: {seen}{RESET}")
             if print_output:
@@ -193,29 +199,28 @@ def monitor_log_file(
                 if print_output:
                     with print_lock:
                         print(f"{BLUE}[{hostname}] All keywords {keywords} found in {filepath}.{RESET}")
+                        print(f"{GREEN}*****************************************************************************************************************************{RESET}")
+                        print(f"{GREEN}******************************************************************************************************************************{RESET}")
+                        print(f"{GREEN}Matched line: {line}{RESET}")
+                        print(f"{GREEN}******************************************************************************************************************************{RESET}")
+                        print(f"{GREEN}******************************************************************************************************************************{RESET}")
                 break
-            # Progress print every 5 seconds
-            step = elapsed // 5
-            if step not in progress_reported:
-                progress_reported.add(step)
-                # Debugging: Include seen keywords in progress
-                with print_lock:
-                    print(f"{YELLOW}[{hostname}] Progress: {elapsed}/{timeout} s, seen keywords: {seen}{RESET}")
 
         if seen != keywords and print_output:
             with print_lock:
-                print(f"{RED}[{hostname}] match not found before timeout.{RESET}")
-            # Debugging: Specify missing keywords
-            with print_lock:
+                print(f"{RED}[{hostname}] Match not found before timeout.{RESET}")
                 print(f"{RED}[{hostname}] Not all keywords {keywords} found in {filepath} within {timeout} seconds. Missing: {keywords - seen}{RESET}")
 
+    except Exception as e:
+        with print_lock:
+            print(f"{RED}[{hostname}] Exception in monitor_log_file: {e}{RESET}")
     finally:
         stdout.channel.close()
         client.close()
         with print_lock:
-            print(f"{BLUE}[{hostname}] monitor_log_file thread finished{RESET}")
+            print(f"{BLUE}[{hostname}] monitor_log_file thread finished (filepath: {filepath}){RESET}")
     return matched_line
-
+ 
 def build_and_run_client(
     hostname: str,
     command: str,
