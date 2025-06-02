@@ -120,10 +120,10 @@ cd "$BASE_DIR" || exit 1
 ### --- Start Monitor Scripts ---
 echo "Starting monitor scripts with virtual environment..."
 
-"$VENV_PY" cm_monitor.py -i "$INTERVAL" -p "$PROGRAM" -l "$LABEL" > "$CM_LOG" 2>&1 &
+"$VENV_PY" cm_monitor.py -i "$INTERVAL" -p "$PROGRAM" -l "$CM_LOG" > "$LABEL" 2>&1 &
 echo $! >> "$PID_FILE"
 
-"$VENV_PY" n_monitor.py -i "$INTERVAL" --iface "$IFACE" -l "$LABEL" > "$NM_LOG" 2>&1 &
+"$VENV_PY" n_monitor.py -i "$INTERVAL" --iface "$IFACE" -l "$NM_LOG" > "$LABEL" 2>&1 &
 echo $! >> "$PID_FILE"
 
 sleep 5
