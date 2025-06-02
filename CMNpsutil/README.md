@@ -1,4 +1,4 @@
-Here is a clearer and more professional rephrasing of your text:
+
 
 ---
 
