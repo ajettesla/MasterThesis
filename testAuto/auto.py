@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import signal
+import socket
 
 print_lock = threading.Lock()
 
@@ -61,9 +62,6 @@ def connect_to_host(hostname):
     return client
 
 def run_command_with_timeout(client, command, timeout, hostname="unknown"):
-    """
-    Run a command on a remote host with a timeout.
-    """
     try:
         stdin, stdout, stderr = client.exec_command(command)
         start = time.time()
@@ -83,10 +81,6 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
         return False, str(e)
 
 def check_and_start_service(client, service, hostname, verbose=True):
-    """
-    Check if a service is running, start it if not.
-    All output is prefixed with the device name.
-    """
     success, output = run_command_with_timeout(client, f"systemctl is-active {service}", 5, hostname=hostname)
     if success and "active" in output:
         if verbose:
@@ -104,12 +98,9 @@ def check_and_start_service(client, service, hostname, verbose=True):
         with print_lock:
             print(f"{RED}[{hostname}] Failed to start {service}: {output}{RESET}")
 
-# Handle Ctrl-C for immediate exit during countdown
 def signal_handler(sig, frame):
     print("\nCtrl-C received. Exiting now!")
     sys.exit(1)
-    
-import socket
 
 def monitor_log_file(
     hostname: str,
@@ -118,25 +109,18 @@ def monitor_log_file(
     keyword_expr: str,
     truncate_file: bool = False,
     print_output: bool = True,
+    result_dict: dict = None,
 ):
-    """
-    Monitor a remote log file for appearance of all keywords in `keyword_expr` (across any lines).
-    Stop on first match (all keywords seen) or timeout.
-    Print remaining time every 10 seconds.
-    All output is prefixed with the device name.
-    """
     with print_lock:
         print(f"{BLUE}[{hostname}] Starting monitor_log_file thread (watching {filepath}){RESET}")
 
     client = connect_to_host(hostname)
 
-    # Truncate log file if requested
     if truncate_file:
         with print_lock:
             print(f"{YELLOW}[{hostname}] Truncating {filepath}{RESET}")
         run_command_with_timeout(client, f"sudo truncate -s 0 {filepath}", 5, hostname=hostname)
 
-    # Parse keywords from the expression
     keywords = set(re.findall(r"'(.*?)'", keyword_expr))
     seen = set()
 
@@ -145,21 +129,14 @@ def monitor_log_file(
         print(f"{YELLOW}[{hostname}] Executing command: {command}{RESET}")
     stdin, stdout, stderr = client.exec_command(command)
 
-    # Set a timeout on the channel to prevent indefinite blocking
-    stdout.channel.settimeout(1.0)  # 1-second timeout for read operations
+    stdout.channel.settimeout(1.0)
 
-    matched_line = None
     start_time = time.time()
     progress_reported = set()
 
     try:
         while time.time() - start_time < timeout:
             elapsed = int(time.time() - start_time)
-            # Debug: Print loop iteration status
-            with print_lock:
-                print(f"{YELLOW}[{hostname}] Loop iteration, elapsed = {elapsed}s, seen = {seen}, keywords = {keywords}{RESET}")
-
-            # Print remaining time every 10 seconds
             step = elapsed // 10
             if step not in progress_reported:
                 progress_reported.add(step)
@@ -167,49 +144,25 @@ def monitor_log_file(
                 with print_lock:
                     print(f"{YELLOW}[{hostname}] {remaining} seconds remaining{RESET}")
 
-            # Check if channel is still open
-            if stdout.channel.closed or stdout.channel.exit_status_ready():
-                with print_lock:
-                    print(f"{RED}[{hostname}] tail -F command terminated early at elapsed = {elapsed}s{RESET}")
-                break
-
             try:
                 line = stdout.readline()
             except socket.timeout:
-                # If readline times out, continue to the next iteration
                 continue
 
             if not line:
                 time.sleep(0.1)
-                # Debug: Check if no line was read
-                with print_lock:
-                    print(f"{YELLOW}[{hostname}] No new line read, sleeping for 0.1s{RESET}")
                 continue
             line = line.strip()
             for kw in keywords:
                 if kw in line and kw not in seen:
                     seen.add(kw)
-                    with print_lock:
-                        print(f"{GREEN}[{hostname}] New keyword '{kw}' seen, current seen: {seen}{RESET}")
             if print_output:
                 with print_lock:
                     print(f"[{hostname}] LOG: {line}")
-            if seen == keywords:
-                matched_line = line
-                if print_output:
-                    with print_lock:
-                        print(f"{BLUE}[{hostname}] All keywords {keywords} found in {filepath}.{RESET}")
-                        print(f"{GREEN}*****************************************************************************************************************************{RESET}")
-                        print(f"{GREEN}******************************************************************************************************************************{RESET}")
-                        print(f"{GREEN}Matched line: {line}{RESET}")
-                        print(f"{GREEN}******************************************************************************************************************************{RESET}")
-                        print(f"{GREEN}******************************************************************************************************************************{RESET}")
-                break
 
-        if seen != keywords and print_output:
+        if print_output:
             with print_lock:
-                print(f"{RED}[{hostname}] Match not found before timeout.{RESET}")
-                print(f"{RED}[{hostname}] Not all keywords {keywords} found in {filepath} within {timeout} seconds. Missing: {keywords - seen}{RESET}")
+                print(f"{BLUE}[{hostname}] Monitoring finished for {filepath}.{RESET}")
 
     except Exception as e:
         with print_lock:
@@ -219,8 +172,9 @@ def monitor_log_file(
         client.close()
         with print_lock:
             print(f"{BLUE}[{hostname}] monitor_log_file thread finished (filepath: {filepath}){RESET}")
-    return matched_line
- 
+        if result_dict is not None:
+            result_dict[threading.current_thread().name] = len(seen)
+
 def build_and_run_client(
     hostname: str,
     command: str,
@@ -230,12 +184,6 @@ def build_and_run_client(
     program_name: str = None,
     working_dir: str = "/opt/MasterThesis/trafGen",
 ):
-    """
-    Run a client command on a remote host, monitor for stuckness, and print output.
-    - Only kill the process if it is still running and stuck.
-    - If the process finishes naturally, print its output and exit.
-    - All output is prefixed with the device name.
-    """
     with print_lock:
         print(f"{BLUE}[{hostname}] build_and_run_client thread started (running '{command}') {RESET}")
 
@@ -254,25 +202,22 @@ def build_and_run_client(
 
     start_time = time.time()
     progress_reported = set()
-    while time.time() - start_time < 2 * 60:  # 20 minutes
+    while time.time() - start_time < 2 * 60:
         if not pid:
             break
 
-        # Check if process is running
         ps_status, ps_output = run_command_with_timeout(client, f"ps -p {pid}", 5, hostname=hostname)
         is_running = ps_output and (re.search(rf"\b{pid}\b", ps_output) is not None)
 
         if not is_running:
             with print_lock:
                 print(f"{GREEN}[{hostname}] {program} completed successfully.{RESET}")
-            # Print log output
             success, final_out = run_command_with_timeout(client, f"cat {log_file}", 5, hostname=hostname)
             if success:
                 with print_lock:
                     print(f"{YELLOW}[{hostname}] Final output from {program}:{RESET}\n{final_out}")
             break
 
-        # Check for stuckness
         if check_stuck:
             out_status, out = run_command_with_timeout(client, f"tail -n 5 {log_file}", 5, hostname=hostname)
             if out_status:
@@ -292,7 +237,6 @@ def build_and_run_client(
                     last_lines = lines
                     same_count = 0
 
-        # Progress print every 10 seconds
         elapsed = int(time.time() - start_time)
         step = elapsed // 10
         if step not in progress_reported:
@@ -307,9 +251,6 @@ def build_and_run_client(
         print(f"{BLUE}[{hostname}] build_and_run_client thread finished{RESET}")
 
 def flush_conntrack_on_hosts(hosts):
-    """
-    Flush conntrack table on the given hosts in parallel.
-    """
     def flush_conntrack(host):
         with print_lock:
             print(f"{BLUE}[{host}] Flushing conntrack table...{RESET}")
@@ -329,7 +270,9 @@ def flush_conntrack_on_hosts(hosts):
     with print_lock:
         print(f"{GREEN}All conntrack tables flushed.{RESET}")
 
-def main():
+def check():
+    log_results = {}
+
     # Phase 1: Check and start services
     service_map = {
         "convsrc5": ["tcp_server.service", "udp_server.service"],
@@ -359,11 +302,11 @@ def main():
             print(f"{YELLOW}Joining thread: {t.name}{RESET}")
         t.join()
 
-    # === New Phase: Flush conntrack on required hosts ===
+    # Phase 2: Flush conntrack on required hosts
     conntrack_hosts = ["connt1", "connt2"]
     flush_conntrack_on_hosts(conntrack_hosts)
 
-    # === Wait 5 seconds before proceeding ===
+    # Wait 5 seconds before proceeding
     with print_lock:
         print(f"{YELLOW}Waiting 5 seconds after conntrack flush...{RESET}")
     time.sleep(5)
@@ -378,7 +321,8 @@ def main():
                 timeout=30,
                 keyword_expr="'connt1' AND 'connt2'",
                 truncate_file=True,
-                print_output=True
+                print_output=True,
+                result_dict=log_results
             ),
             name="Monitor-conntrack"
         ),
@@ -390,7 +334,8 @@ def main():
                 timeout=30,
                 keyword_expr="'connt1' AND 'connt2'",
                 truncate_file=True,
-                print_output=True
+                print_output=True,
+                result_dict=log_results
             ),
             name="Monitor-ptp"
         )
@@ -444,13 +389,33 @@ def main():
             print(f"{YELLOW}Joining thread: {ct.name}{RESET}")
         ct.join()
 
+    # Join the log monitoring threads and collect results
+    matches_found = 0
     for lt in log_threads:
         with print_lock:
             print(f"{YELLOW}Joining thread: {lt.name}{RESET}")
         lt.join()
+        matches_found += log_results.get(lt.name, 0)
 
     with print_lock:
-        print(f"\n{GREEN}All processes complete.{RESET}")
+        print(f"\n{GREEN}All processes complete. Matches found: {matches_found}{RESET}")
+
+    return matches_found
+
+def main(experimentation_name):
+    matches = check()
+    if matches >= 2:
+        print(f"{GREEN}Starting experimentation: {experimentation_name}{RESET}")
+        # Example experimentation logic (customize as needed)
+        print(f"{YELLOW}Running experiment '{experimentation_name}'...{RESET}")
+        time.sleep(2)  # Simulate some experimentation work
+        print(f"{GREEN}Experiment '{experimentation_name}' completed.{RESET}")
+    else:
+        print(f"{RED}Not enough matches found to start experimentation. Required: 2, Found: {matches}{RESET}")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 2:
+        print("Usage: python script.py <experimentation_name>")
+        sys.exit(1)
+    experimentation_name = sys.argv[1]
+    main(experimentation_name)
