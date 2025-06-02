@@ -1,4 +1,4 @@
-Here's a clearer and more polished version of your paragraph:
+
 
 ---
 
