@@ -404,18 +404,90 @@ def check():
 
 def main(experimentation_name):
     matches = check()
-    if matches >= 2:
-        print(f"{GREEN}Starting experimentation: {experimentation_name}{RESET}")
-        # Example experimentation logic (customize as needed)
-        print(f"{YELLOW}Running experiment '{experimentation_name}'...{RESET}")
-        time.sleep(2)  # Simulate some experimentation work
-        print(f"{GREEN}Experiment '{experimentation_name}' completed.{RESET}")
-    else:
+    if matches < 4:
         print(f"{RED}Not enough matches found to start experimentation. Required: 2, Found: {matches}{RESET}")
+        return
+
+    print(f"{GREEN}Starting experimentation: {experimentation_name}{RESET}")
+
+    # Pre-experimentation phase
+    log_pids = {}  # Store PIDs of logging processes
+
+    def cleanup_logging_scripts():
+        """Terminate all running logging scripts."""
+        for host, pid in log_pids.items():
+            with print_lock:
+                print(f"{YELLOW}[{host}] Terminating logging script with PID: {pid}{RESET}")
+            client = connect_to_host(host)
+            status, output = run_command_with_timeout(client, f"sudo kill {pid}", 5, hostname=host)
+            if status:
+                with print_lock:
+                    print(f"{GREEN}[{host}] Successfully terminated PID {pid}{RESET}")
+            else:
+                with print_lock:
+                    print(f"{RED}[{host}] Failed to terminate PID {pid}: {output}{RESET}")
+            client.close()
+
+    # Define logging scripts
+    log_configs = [
+        (
+            "convsrc2",
+            f"sudo /opt/MasterThesis/conntrackAnalysis/conntrackAnalysis.py -o /var/log/exp/{experimentation_name}_ca.csv -l /var/log/conntrack.log -a connt1 -b connt2 -d",
+            "conntrackAnalysis",
+            "~"  # Home directory
+        ),
+        (
+            "connt1",
+            f"sudo /opt/MasterThesis/CMNpsutil/start.sh -i -l /var/log/exp/{experimentation_name} -p conntrackd --iface enp3s0",
+            "start",
+            "~"  # Home directory
+        ),
+    ]
+
+    # Start logging scripts
+    for host, cmd, program_name, working_dir in log_configs:
+        with print_lock:
+            print(f"{YELLOW}[{host}] Starting logging script: {cmd}{RESET}")
+
+        client = connect_to_host(host)
+        log_file = f"/tmp/{program_name}.log"
+        pid_file = f"/tmp/{program_name}.pid"
+        full_cmd = f"cd {working_dir} && nohup {cmd} > {log_file} 2>&1 & echo $! > {pid_file}"
+
+        status, output = run_command_with_timeout(client, full_cmd, 10, hostname=host)
+        if not status:
+            with print_lock:
+                print(f"{RED}[{host}] Failed to start logging script '{cmd}': {output}{RESET}")
+                print(f"{RED}Pre-experimentation phase failed for '{experimentation_name}'.{RESET}")
+            cleanup_logging_scripts()
+            client.close()
+            return
+
+        status, pid = run_command_with_timeout(client, f"cat {pid_file}", 5, hostname=host)
+        if status:
+            log_pids[host] = pid.strip()
+            with print_lock:
+                print(f"{GREEN}[{host}] Logging script '{program_name}' started successfully, PID: {pid.strip()}{RESET}")
+        else:
+            with print_lock:
+                print(f"{RED}[{host}] Failed to get PID for logging script '{program_name}': {output}{RESET}")
+                print(f"{RED}Pre-experimentation phase failed for '{experimentation_name}'.{RESET}")
+            cleanup_logging_scripts()
+            client.close()
+            return
+
+        client.close()
+
+    print(f"{GREEN}Pre-experimentation phase completed successfully for '{experimentation_name}'.{RESET}")
+
+    # Placeholder for experimentation and post-experimentation phases
+    print(f"{YELLOW}Proceeding to experimentation phase...{RESET}")
+    # Add experimentation logic here
+        
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: auto.py <experimentation_name>")
+        print("Usage: python script.py <experimentation_name>")
         sys.exit(1)
     experimentation_name = sys.argv[1]
     main(experimentation_name)
