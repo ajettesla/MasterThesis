@@ -25,7 +25,7 @@ fi
 
 ### --- Configuration ---
 PID_FILE="pids.txt"
-BASE_DIR="/opt/Master/Thesis/CMNpsutil"
+BASE_DIR="/opt/MasterThesis/CMNpsutil"
 
 CM_LOG=""
 NM_LOG=""
