@@ -415,7 +415,7 @@ def main(experimentation_name):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python script.py <experimentation_name>")
+        print("Usage: auto.py <experimentation_name>")
         sys.exit(1)
     experimentation_name = sys.argv[1]
     main(experimentation_name)
