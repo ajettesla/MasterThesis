@@ -1,21 +1,74 @@
-./tcp_client_er -s 172.16.1.1 -p 2000 -n 250000 -c 5000 -w 1 -a 172.16.1.10-22  -k -r 10000-65000
 
-server ip is -s 
-port is -p 
-no of connection -n 
-concurrency -c 
-client ip range -a
-client port range -r 
-debug -D
-reset the socket instead of fin -k  and add iptables to drop the rst packet.
--w wait 
+---
 
+# High-Performance TCP/UDP Client-Server Suite
 
-./tcp_server_er -p 8000 -k -a 4 -w 4
+This project includes multiple TCP and UDP server/client programs designed for high-performance network testing. The primary programs used in the experimental setup are:
 
+* `tcp_server_er.c`
+* `tcp_client_er.c`
+* `udp_server.c`
+* `udp_client_sub.c`
 
--p port number 
--a acceptors threads
--w worker threads
--k iptables appply and rst the connectionon 
--D debug.
+These implementations were specifically optimized to meet experimental requirements involving high connection loads and efficient data handling.
+
+---
+
+## Purpose of RST Packet Dropping with iptables
+
+During the experiments, we apply `iptables` rules to **drop outgoing RST packets** on both the client and server sides. This is done to ensure that TCP connections remain in the **ESTABLISHED** state for a long duration, which is essential for reliable testing of connection tracking behavior.
+
+### Why Drop RST Packets?
+
+* When a TCP socket is closed normally, it sends a FIN or RST packet.
+* In our setup, if connections are closed too quickly (especially when the connection rate is higher than the rate at which connection tracking data is exported), the connection may vanish from the conntrack table before it can be logged.
+* By dropping RST packets via `iptables`, we artificially keep connections alive, allowing more consistent and stable data collection.
+
+---
+
+## Implementation Details
+
+* The TCP and UDP programs are built using **epoll** and **multi-threading** to handle a large number of concurrent connections efficiently.
+* The **client programs** support specifying **IP and port ranges**, which are divided among threads for load balancing.
+* The **server programs** separate the acceptor and worker threads for better scalability.
+
+---
+
+## Usage Examples
+
+### TCP Client
+
+```bash
+./tcp_client_er -s 172.16.1.1 -p 2000 -n 250000 -c 5000 -w 1 -a 172.16.1.10-22 -r 10000-65000 -k
+```
+
+**Options:**
+
+* `-s`: Server IP address
+* `-p`: Server port
+* `-n`: Total number of connections to establish
+* `-c`: Number of concurrent connections
+* `-w`: Number of worker threads
+* `-a`: Range of client IPs (e.g., 172.16.1.10–172.16.1.22)
+* `-r`: Range of client ports (e.g., 10000–65000)
+* `-k`: Apply `iptables` rules to drop RST packets
+* `-D`: Enable debug mode
+
+---
+
+### TCP Server
+
+```bash
+./tcp_server_er -p 8000 -a 4 -w 4 -k
+```
+
+**Options:**
+
+* `-p`: Port to listen on
+* `-a`: Number of acceptor threads
+* `-w`: Number of worker threads
+* `-k`: Apply `iptables` rules and reset sockets with RST
+* `-D`: Enable debug mode
+
+---
+
