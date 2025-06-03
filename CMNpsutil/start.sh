@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e  # Exit on any error
+set -euo pipefail
 
 ### --- Virtual Environment Setup ---
 VENV_DIR="./venv"
@@ -8,7 +8,6 @@ VENV_PY="$VENV_DIR/bin/python"
 REQUIREMENTS_FILE="requirements.txt"
 
 echo "Checking virtual environment..."
-
 if [ ! -x "$VENV_PY" ]; then
     echo "Virtual environment not found. Creating..."
     python3 -m venv "$VENV_DIR"
@@ -24,14 +23,12 @@ else
 fi
 
 ### --- Configuration ---
-PID_FILE="pids.txt"
 BASE_DIR="/opt/MasterThesis/CMNpsutil/"
 
+CM_PID_FILE=""
+NM_PID_FILE=""
 CM_LOG=""
 NM_LOG=""
-
-CM_PREV_LINES=0
-NM_PREV_LINES=0
 
 INTERVAL=""
 LABEL=""
@@ -39,7 +36,7 @@ IFACE=""
 PROGRAM=""
 KILL_ONLY=false
 
-### --- Usage ---
+### --- Usage Help ---
 usage() {
     echo "Usage: $0 [options]"
     echo "Options:"
@@ -51,59 +48,70 @@ usage() {
     exit 1
 }
 
-### --- Stop Running Programs ---
+### --- Stop Programs Safely ---
 stop_programs() {
-    if [[ -f $PID_FILE ]]; then
-        echo "Stopping running programs..."
-        while read pid; do
-            kill -9 "$pid" 2>/dev/null || true
-        done < "$PID_FILE"
-        rm -f "$PID_FILE"
-        echo "Programs stopped."
-    else
-        echo "No PID file found. Nothing to stop."
+    echo "Stopping running programs..."
+
+    killed_any=false
+
+    for PID_FILE in "/tmp/${PROGRAM}_cm.pid" "/tmp/${PROGRAM}_nm.pid"; do
+        if [[ -f "$PID_FILE" ]]; then
+            PID=$(cat "$PID_FILE")
+            if kill -0 "$PID" 2>/dev/null; then
+                kill "$PID"
+                echo "✅ Stopped process with PID $PID from $PID_FILE"
+                killed_any=true
+            else
+                echo "⚠️  No active process found for PID in $PID_FILE"
+            fi
+            rm -f "$PID_FILE"
+        else
+            echo "⚠️  PID file $PID_FILE not found"
+        fi
+    done
+
+    if ! $killed_any; then
+        echo "Attempting fallback cleanup via pgrep..."
+
+        PGREP_CM=$(pgrep -f "cm_monitor.py.*-p $PROGRAM") || true
+        PGREP_NM=$(pgrep -f "n_monitor.py.*--iface $IFACE") || true
+
+        if [[ -n "$PGREP_CM" ]]; then
+            echo "$PGREP_CM" | xargs -r kill
+            echo "✅ Killed leftover cm_monitor.py processes"
+        else
+            echo "⚠️  No matching cm_monitor.py process found"
+        fi
+
+        if [[ -n "$PGREP_NM" ]]; then
+            echo "$PGREP_NM" | xargs -r kill
+            echo "✅ Killed leftover n_monitor.py processes"
+        else
+            echo "⚠️  No matching n_monitor.py process found"
+        fi
     fi
+
+    echo "Shutdown complete."
     exit 0
 }
 
 ### --- Parse CLI Arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -i)
-            INTERVAL="$2"
-            shift 2
-            ;;
-        -l)
-            LABEL="$2"
-            shift 2
-            ;;
-        -p)
-            PROGRAM="$2"
-            shift 2
-            ;;
-        --iface)
-            IFACE="$2"
-            shift 2
-            ;;
-        -k)
-            KILL_ONLY=true
-            shift
-            ;;
-        *)
-            usage
-            ;;
+        -i) INTERVAL="$2"; shift 2 ;;
+        -l) LABEL="$2"; shift 2 ;;
+        -p) PROGRAM="$2"; shift 2 ;;
+        --iface) IFACE="$2"; shift 2 ;;
+        -k) KILL_ONLY=true; shift ;;
+        *) usage ;;
     esac
 done
 
+[[ -z "$INTERVAL" || -z "$LABEL" || -z "$IFACE" || -z "$PROGRAM" ]] && usage
+
 $KILL_ONLY && stop_programs
 
-# Check for required input
-if [[ -z "$INTERVAL" || -z "$LABEL" || -z "$IFACE" || -z "$PROGRAM" ]]; then
-    echo "Missing required argument(s)."
-    usage
-fi
-
-### --- Setup Log Paths ---
+### --- Setup Log & PID Paths ---
 if [[ "$LABEL" == /* ]]; then
     LOG_DIR=$(dirname "$LABEL")
     LOG_PREFIX=$(basename "$LABEL")
@@ -111,33 +119,45 @@ if [[ "$LABEL" == /* ]]; then
     CM_LOG="$LABEL""_cm_monitor.csv"
     NM_LOG="$LABEL""_n_monitor.csv"
 else
-    CM_LOG="${LABEL}_cm_monitor.log"
-    NM_LOG="${LABEL}_n_monitor.log"
+    CM_LOG="/tmp/${PROGRAM}_cm_monitor.log"
+    NM_LOG="/tmp/${PROGRAM}_n_monitor.log"
 fi
+
+CM_PID_FILE="/tmp/${PROGRAM}_cm.pid"
+NM_PID_FILE="/tmp/${PROGRAM}_nm.pid"
 
 cd "$BASE_DIR" || exit 1
 
+### --- Signal Handling ---
+cleanup_on_exit() {
+    echo ""
+    echo "⚠️  Caught termination signal. Cleaning up..."
+    stop_programs
+}
+
+trap cleanup_on_exit SIGINT SIGTERM SIGQUIT
+
 ### --- Start Monitor Scripts ---
-echo "Starting monitor scripts with virtual environment..."
+echo "Starting monitor scripts..."
 
-"$VENV_PY" cm_monitor.py -i "$INTERVAL" -p "$PROGRAM" -l "$CM_LOG" > "$LABEL" 2>&1 &
-echo $! >> "$PID_FILE"
+"$VENV_PY" cm_monitor.py -i "$INTERVAL" -p "$PROGRAM" -l "$CM_LOG" >> "$CM_LOG" 2>&1 &
+echo $! > "$CM_PID_FILE"
 
-"$VENV_PY" n_monitor.py -i "$INTERVAL" --iface "$IFACE" -l "$NM_LOG" > "$LABEL" 2>&1 &
-echo $! >> "$PID_FILE"
+"$VENV_PY" n_monitor.py -i "$INTERVAL" --iface "$IFACE" -l "$NM_LOG" >> "$NM_LOG" 2>&1 &
+echo $! > "$NM_PID_FILE"
 
 sleep 5
 
-CM_PREV_LINES=$(wc -l < "$CM_LOG")
-NM_PREV_LINES=$(wc -l < "$NM_LOG")
+CM_PREV_LINES=$(wc -l < "$CM_LOG" || echo 0)
+NM_PREV_LINES=$(wc -l < "$NM_LOG" || echo 0)
 
-### --- Periodic Monitoring Loop ---
+### --- Monitor Loop ---
 while true; do
     sleep 60
     echo "====== STATUS @ $(date) ======"
 
-    CM_CURRENT_LINES=$(wc -l < "$CM_LOG")
-    NM_CURRENT_LINES=$(wc -l < "$NM_LOG")
+    CM_CURRENT_LINES=$(wc -l < "$CM_LOG" || echo 0)
+    NM_CURRENT_LINES=$(wc -l < "$NM_LOG" || echo 0)
 
     if (( CM_CURRENT_LINES > CM_PREV_LINES )); then
         echo "✅ CM Monitor active: +$((CM_CURRENT_LINES - CM_PREV_LINES)) new lines"
@@ -152,10 +172,10 @@ while true; do
     fi
 
     echo "---- Last 5 lines of CM Monitor ----"
-    tail -n 5 "$CM_LOG"
+    tail -n 5 "$CM_LOG" || echo "No CM log data"
     echo ""
     echo "---- Last 5 lines of Network Monitor ----"
-    tail -n 5 "$NM_LOG"
+    tail -n 5 "$NM_LOG" || echo "No NM log data"
     echo "====================================="
 
     CM_PREV_LINES=$CM_CURRENT_LINES
