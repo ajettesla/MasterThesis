@@ -102,6 +102,7 @@ def signal_handler(sig, frame):
     print("\nCtrl-C received. Exiting now!")
     sys.exit(1)
 
+
 def monitor_log_file(
     hostname: str,
     filepath: str,
@@ -124,13 +125,39 @@ def monitor_log_file(
     keywords = set(re.findall(r"'(.*?)'", keyword_expr))
     seen = set()
 
+    # Step 1: Check existing log content using `cat`
+    with print_lock:
+        print(f"{YELLOW}[{hostname}] Checking existing file content with cat{RESET}")
+    stdin, stdout, stderr = client.exec_command(f"sudo cat {filepath}")
+    file_content = stdout.read().decode('utf-8', errors='ignore')
+
+    for line in file_content.splitlines():
+        line = line.strip()
+        for kw in keywords:
+            if kw in line:
+                seen.add(kw)
+                with print_lock:
+                    print(f"{GREEN}[{hostname}] Matched keyword in existing content: '{kw}'{RESET}")
+        if print_output and line:
+            with print_lock:
+                print(f"[{hostname}] LOG (cat): {line}")
+
+    # If all matched already, no need to tail
+    if seen == keywords:
+        with print_lock:
+            print(f"{GREEN}[{hostname}] All keywords matched in existing content! Skipping tail.{RESET}")
+        if result_dict is not None:
+            result_dict[threading.current_thread().name] = len(seen)
+        client.close()
+        return
+
+    # Step 2: Start tail -F for live monitoring
     command = f"timeout {timeout}s sudo tail -F {filepath}"
     with print_lock:
         print(f"{YELLOW}[{hostname}] Executing command: {command}{RESET}")
     stdin, stdout, stderr = client.exec_command(command)
 
     stdout.channel.settimeout(1.0)
-
     start_time = time.time()
     progress_reported = set()
 
@@ -153,12 +180,21 @@ def monitor_log_file(
                 time.sleep(0.1)
                 continue
             line = line.strip()
+
             for kw in keywords:
                 if kw in line and kw not in seen:
                     seen.add(kw)
+                    with print_lock:
+                        print(f"{GREEN}[{hostname}] Matched keyword: '{kw}'{RESET}")
+
             if print_output:
                 with print_lock:
                     print(f"[{hostname}] LOG: {line}")
+
+            if seen == keywords:
+                with print_lock:
+                    print(f"{GREEN}[{hostname}] All keywords matched! Exiting early.{RESET}")
+                break
 
         if print_output:
             with print_lock:
@@ -270,6 +306,34 @@ def flush_conntrack_on_hosts(hosts):
     with print_lock:
         print(f"{GREEN}All conntrack tables flushed.{RESET}")
 
+def run_command_with_timeout_verbose(client, command, timeout, hostname="unknown"):
+    try:
+        stdin, stdout, stderr = client.exec_command(command)
+        start = time.time()
+        while not stdout.channel.exit_status_ready():
+            if time.time() - start > timeout:
+                stdout.channel.close()
+                with print_lock:
+                    print(f"{RED}[{hostname}] Timeout exceeded while running: {command}{RESET}")
+                return False, "", f"Timeout exceeded while running: {command}"
+            time.sleep(0.5)
+
+        out = stdout.read().decode().strip()
+        err = stderr.read().decode().strip()
+
+        if out:
+            print(f"{YELLOW}[{hostname}] STDOUT:\n{out}{RESET}")
+        if err:
+            print(f"{RED}[{hostname}] STDERR:\n{err}{RESET}")
+
+        return True, out, err
+
+    except Exception as e:
+        with print_lock:
+            print(f"{RED}[{hostname}] Exception during command: {command}\n{e}{RESET}")
+        return False, "", str(e)
+
+
 def check():
     log_results = {}
 
@@ -318,7 +382,7 @@ def check():
             kwargs=dict(
                 hostname="convsrc2",
                 filepath="/var/log/conntrack.log",
-                timeout=30,
+                timeout=60,
                 keyword_expr="'connt1' AND 'connt2'",
                 truncate_file=True,
                 print_output=True,
@@ -331,7 +395,7 @@ def check():
             kwargs=dict(
                 hostname="convsrc2",
                 filepath="/var/log/ptp.log",
-                timeout=30,
+                timeout=60,
                 keyword_expr="'connt1' AND 'connt2'",
                 truncate_file=True,
                 print_output=True,
@@ -403,74 +467,143 @@ def check():
     return matches_found
 
 def main(experimentation_name):
+    # ----------------------------
+    # pre experimentation Phase
+    # ----------------------------
     matches = check()
     if matches < 4:
-        print(f"{RED}Not enough matches found to start experimentation. Required: 2, Found: {matches}{RESET}")
+        print(f"{RED}Not enough matches found to start experimentation. Required: 4, Found: {matches}{RESET}")
         return
 
     print(f"{GREEN}Starting experimentation: {experimentation_name}{RESET}")
 
-    # Pre-experimentation phase
-    log_pids = {}  # Store PIDs of logging processes
+    CAlog = f"/tmp/CA.log"
 
-    def cleanup_logging_scripts():
-        """Terminate all running logging scripts."""
-        for host, pid in log_pids.items():
-            with print_lock:
-                print(f"{YELLOW}[{host}] Terminating logging script with PID: {pid}{RESET}")
-            client = connect_to_host(host)
-            status, output = run_command_with_timeout(client, f"sudo kill {pid}", 5, hostname=host)
-            if status:
-                with print_lock:
-                    print(f"{GREEN}[{host}] Successfully terminated PID {pid}{RESET}")
-            else:
-                with print_lock:
-                    print(f"{RED}[{host}] Failed to terminate PID {pid}: {output}{RESET}")
-            client.close()
-
-    # Define logging scripts
     log_configs = [
         (
-            "convsrc2",
-            f"sudo /opt/MasterThesis/conntrackAnalysis/conntrackAnalysis.py -o /var/log/exp/{experimentation_name}_ca.csv -l /var/log/conntrack.log -a connt1 -b connt2 -d",
-            "conntrackAnalysis",
-            "~"  # Home directory
+            "connt1",
+            f"sudo ./start.sh -i 1 -l /var/log/exp/{experimentation_name} -p conntrackd --iface enp3s0 -d",
+            "start.sh",
+            "/opt/MasterThesis/CMNpsutil/"
         ),
         (
-            "connt1",
-            f"sudo /opt/MasterThesis/CMNpsutil/start.sh -i -l /var/log/exp/{experimentation_name} -p conntrackd --iface enp3s0",
-            "start",
-            "~"  # Home directory
+            "convsrc2",
+            f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o /var/log/exp/{experimentation_name}_ca.csv -d -D -L {CAlog}",
+            "conntrackAnalysis.py",
+            "/opt/MasterThesis/connectiontrackingAnalysis/"
         ),
     ]
 
+    def pre_kill_conflicting_processes(client, host, programs):
+        for prog in programs:
+            check_cmd = f"pgrep -f {prog}"
+            status, output = run_command_with_timeout(client, check_cmd, 5, hostname=host)
+            if status and output.strip():
+                pids = output.strip().splitlines()
+                with print_lock:
+                    print(f"{YELLOW}[{host}] Found running '{prog}' with PIDs: {', '.join(pids)}. Killing...{RESET}")
+                for pid in pids:
+                    kill_cmd = f"sudo kill -9 {pid}"
+                    run_command_with_timeout(client, kill_cmd, 5, hostname=host)
+                time.sleep(1)
+            else:
+                with print_lock:
+                    print(f"{GREEN}[{host}] No '{prog}' processes running.{RESET}")
+
+    def cleanup_logging_scripts():
+        for host, _, program_file, working_dir in log_configs:
+            with print_lock:
+                print(f"{YELLOW}[{host}] Attempting to stop {program_file} using -k...{RESET}")
+
+            client = connect_to_host(host)
+            kill_cmd = f"cd {working_dir} && sudo ./{program_file} -k"
+            status, output = run_command_with_timeout(client, kill_cmd, 5, hostname=host)
+
+            if status:
+                with print_lock:
+                    print(f"{GREEN}[{host}] Sent kill command to {program_file}{RESET}")
+            else:
+                with print_lock:
+                    print(f"{RED}[{host}] Failed to send kill command.{RESET}")
+                    print(f"{RED}[{host}] Output:\n{output.strip()}{RESET}")
+
+            # Check if still running
+            check_cmd = f"ps aux | grep {program_file} | grep -v grep"
+            status, output = run_command_with_timeout(client, check_cmd, 5, hostname=host)
+            if output.strip() == "":
+                with print_lock:
+                    print(f"{GREEN}[{host}] {program_file} is confirmed stopped.{RESET}")
+            else:
+                with print_lock:
+                    print(f"{RED}[{host}] {program_file} still running. Attempting SIGINT...{RESET}")
+                run_command_with_timeout(client, f"pkill -2 -f {program_file}", 5, hostname=host)
+                time.sleep(2)
+                status, output = run_command_with_timeout(client, check_cmd, 5, hostname=host)
+                if output.strip() == "":
+                    with print_lock:
+                        print(f"{GREEN}[{host}] {program_file} terminated with SIGINT.{RESET}")
+                else:
+                    with print_lock:
+                        print(f"{RED}[{host}] Force killing {program_file}...{RESET}")
+                    run_command_with_timeout(client, f"pkill -9 -f {program_file}", 5, hostname=host)
+
+            client.close()
+
     # Start logging scripts
-    for host, cmd, program_name, working_dir in log_configs:
+    for host, cmd, program_file, working_dir in log_configs:
         with print_lock:
             print(f"{YELLOW}[{host}] Starting logging script: {cmd}{RESET}")
 
         client = connect_to_host(host)
-        log_file = f"/tmp/{program_name}.log"
-        pid_file = f"/tmp/{program_name}.pid"
-        full_cmd = f"cd {working_dir} && nohup {cmd} > {log_file} 2>&1 & echo $! > {pid_file}"
 
+        # Step 0: Kill previous conflicting processes
+        programs_to_kill = ["start.sh", "cm_monitor.py", "n_monitor.py"]
+        if program_file == "conntrackAnalysis.py":
+            programs_to_kill = ["conntrackAnalysis.py"]
+
+        pre_kill_conflicting_processes(client, host, programs_to_kill)
+
+        # Step 1: Run the command
+        full_cmd = f"cd {working_dir} && {cmd}"
         status, output = run_command_with_timeout(client, full_cmd, 10, hostname=host)
+
         if not status:
             with print_lock:
-                print(f"{RED}[{host}] Failed to start logging script '{cmd}': {output}{RESET}")
+                print(f"{RED}[{host}] Failed to start logging script '{cmd}'.{RESET}")
+                print(f"{RED}[{host}] STDOUT/STDERR:\n{output.strip()}{RESET}")
+                print(f"{RED}Pre-experimentation phase failed for '{experimentation_name}'.{RESET}")
+            cleanup_logging_scripts()
+            client.close()
+            return
+        else:
+            with print_lock:
+                print(f"{GREEN}[{host}] Command executed. Output:\n{output.strip()}{RESET}")
+
+        time.sleep(2)
+
+        # Step 2: Look for PID using pgrep
+        search_cmd = f"pgrep -f {program_file}"
+        status, output = run_command_with_timeout(client, search_cmd, 5, hostname=host)
+        if not status or not output.strip().isdigit():
+            with print_lock:
+                print(f"{RED}[{host}] Could not detect PID for '{program_file}'.{RESET}")
+                print(f"{RED}[{host}] Output:\n{output.strip()}{RESET}")
                 print(f"{RED}Pre-experimentation phase failed for '{experimentation_name}'.{RESET}")
             cleanup_logging_scripts()
             client.close()
             return
 
-        status, pid = run_command_with_timeout(client, f"cat {pid_file}", 5, hostname=host)
-        if status:
-            log_pids[host] = pid.strip()
+        pid = output.strip()
+        with print_lock:
+            print(f"{GREEN}[{host}] Logging script '{program_file}' is running with PID: {pid}{RESET}")
+
+        # Confirm PID is running
+        confirm_cmd = f"ps -p {pid} -o pid="
+        status, ps_output = run_command_with_timeout(client, confirm_cmd, 5, hostname=host)
+        if not status or ps_output.strip() != pid:
             with print_lock:
-                print(f"{GREEN}[{host}] Logging script '{program_name}' started successfully, PID: {pid.strip()}{RESET}")
-        else:
-            with print_lock:
-                print(f"{RED}[{host}] Failed to get PID for logging script '{program_name}': {output}{RESET}")
+                print(f"{RED}[{host}] Process with PID {pid} is not running.{RESET}")
+                print(f"{RED}[{host}] ps output:\n{ps_output.strip()}{RESET}")
                 print(f"{RED}Pre-experimentation phase failed for '{experimentation_name}'.{RESET}")
             cleanup_logging_scripts()
             client.close()
@@ -479,11 +612,22 @@ def main(experimentation_name):
         client.close()
 
     print(f"{GREEN}Pre-experimentation phase completed successfully for '{experimentation_name}'.{RESET}")
+    # ----------------------------
+    # experimentation Phase
+    # ----------------------------
 
-    # Placeholder for experimentation and post-experimentation phases
-    print(f"{YELLOW}Proceeding to experimentation phase...{RESET}")
-    # Add experimentation logic here
-        
+
+    run_experimentation(repeats=5) 
+
+
+    # ----------------------------
+    # Post-experimentation Phase
+    # ----------------------------
+    print(f"{YELLOW}Post-experimentation phase starting...{RESET}")
+    cleanup_logging_scripts()
+    print(f"{GREEN}Post-experimentation cleanup complete for '{experimentation_name}'.{RESET}")
+
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -491,3 +635,12 @@ if __name__ == "__main__":
         sys.exit(1)
     experimentation_name = sys.argv[1]
     main(experimentation_name)
+    
+    
+    
+    
+    
+    
+    
+    
+    #ok
