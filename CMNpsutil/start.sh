@@ -24,7 +24,6 @@ fi
 
 ### --- Configuration ---
 BASE_DIR="/opt/MasterThesis/CMNpsutil/"
-
 CM_PID_FILE=""
 NM_PID_FILE=""
 CM_LOG=""
@@ -48,50 +47,42 @@ usage() {
     exit 1
 }
 
-### --- Stop Programs Safely ---
+### --- Stop All Programs ---
 stop_programs() {
-    echo "Stopping running programs..."
+    echo "🔴 Stopping monitoring programs..."
 
-    killed_any=false
-
-    for PID_FILE in "/tmp/${PROGRAM}_cm.pid" "/tmp/${PROGRAM}_nm.pid"; do
-        if [[ -f "$PID_FILE" ]]; then
-            PID=$(cat "$PID_FILE")
-            if kill -0 "$PID" 2>/dev/null; then
-                kill "$PID"
-                echo "✅ Stopped process with PID $PID from $PID_FILE"
-                killed_any=true
-            else
-                echo "⚠️  No active process found for PID in $PID_FILE"
-            fi
-            rm -f "$PID_FILE"
-        else
-            echo "⚠️  PID file $PID_FILE not found"
-        fi
-    done
-
-    if ! $killed_any; then
-        echo "Attempting fallback cleanup via pgrep..."
-
-        PGREP_CM=$(pgrep -f "cm_monitor.py.*-p $PROGRAM") || true
-        PGREP_NM=$(pgrep -f "n_monitor.py.*--iface $IFACE") || true
-
-        if [[ -n "$PGREP_CM" ]]; then
-            echo "$PGREP_CM" | xargs -r kill
-            echo "✅ Killed leftover cm_monitor.py processes"
-        else
-            echo "⚠️  No matching cm_monitor.py process found"
-        fi
-
-        if [[ -n "$PGREP_NM" ]]; then
-            echo "$PGREP_NM" | xargs -r kill
-            echo "✅ Killed leftover n_monitor.py processes"
-        else
-            echo "⚠️  No matching n_monitor.py process found"
-        fi
+    # Kill cm_monitor.py
+    CM_MATCHES=$(pgrep -f "cm_monitor.py" || true)
+    if [[ -n "$CM_MATCHES" ]]; then
+        echo "$CM_MATCHES" | xargs -r kill
+        echo "✅ Killed cm_monitor.py processes"
+    else
+        echo "⚠️  No cm_monitor.py processes found"
     fi
 
-    echo "Shutdown complete."
+    # Kill n_monitor.py
+    NM_MATCHES=$(pgrep -f "n_monitor.py" || true)
+    if [[ -n "$NM_MATCHES" ]]; then
+        echo "$NM_MATCHES" | xargs -r kill
+        echo "✅ Killed n_monitor.py processes"
+    else
+        echo "⚠️  No n_monitor.py processes found"
+    fi
+
+    # Kill all start.sh processes except self
+    SELF_PID=$$
+    START_MATCHES=$(pgrep -f "[s]tart.sh" | grep -v "$SELF_PID" || true)
+    if [[ -n "$START_MATCHES" ]]; then
+        echo "$START_MATCHES" | xargs -r kill
+        echo "✅ Killed other start.sh processes"
+    else
+        echo "⚠️  No other start.sh scripts found"
+    fi
+
+    # Remove stale PID files
+    rm -f /tmp/*_cm.pid /tmp/*_nm.pid
+
+    echo "🧹 Cleanup complete."
     exit 0
 }
 
@@ -107,9 +98,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$INTERVAL" || -z "$LABEL" || -z "$IFACE" || -z "$PROGRAM" ]] && usage
-
 $KILL_ONLY && stop_programs
+
+[[ -z "$INTERVAL" || -z "$LABEL" || -z "$IFACE" || -z "$PROGRAM" ]] && usage
 
 ### --- Setup Log & PID Paths ---
 if [[ "$LABEL" == /* ]]; then
@@ -134,16 +125,15 @@ cleanup_on_exit() {
     echo "⚠️  Caught termination signal. Cleaning up..."
     stop_programs
 }
-
 trap cleanup_on_exit SIGINT SIGTERM SIGQUIT
 
 ### --- Start Monitor Scripts ---
-echo "Starting monitor scripts..."
+echo "🚀 Starting monitor scripts..."
 
-"$VENV_PY" cm_monitor.py -i "$INTERVAL" -p "$PROGRAM" -l "$CM_LOG" >> "$CM_LOG" 2>&1 &
+"$VENV_PY" cm_monitor.py -i "$INTERVAL" -p "$PROGRAM" -l "$CM_LOG" > "$CM_LOG" 2>&1 &
 echo $! > "$CM_PID_FILE"
 
-"$VENV_PY" n_monitor.py -i "$INTERVAL" --iface "$IFACE" -l "$NM_LOG" >> "$NM_LOG" 2>&1 &
+"$VENV_PY" n_monitor.py -i "$INTERVAL" --iface "$IFACE" -l "$NM_LOG" > "$NM_LOG" 2>&1 &
 echo $! > "$NM_PID_FILE"
 
 sleep 5
