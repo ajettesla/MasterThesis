@@ -466,6 +466,121 @@ def check():
 
     return matches_found
 
+def monitor_file_growth(hostname, filepath, stop_event, check_interval=10, label=None):
+    label = label or filepath
+    prev_line_count = None
+
+    client = connect_to_host(hostname)
+
+    while not stop_event.is_set():
+        status, output = run_command_with_timeout(client, f"wc -l {filepath}", 5, hostname=hostname)
+        if status:
+            try:
+                current_count = int(output.strip().split()[0])
+                if prev_line_count is not None and current_count <= prev_line_count:
+                    print(f"{RED}[{label}] Log is NOT growing! ({prev_line_count} → {current_count}){RESET}")
+                else:
+                    print(f"{GREEN}[{label}] Log growing: {prev_line_count} → {current_count}{RESET}")
+                prev_line_count = current_count
+            except Exception as e:
+                print(f"{RED}[{label}] Failed to parse wc output: {output.strip()} - {e}{RESET}")
+        else:
+            print(f"{RED}[{label}] Failed to check log file on {hostname}.{RESET}")
+
+        time.sleep(check_interval)
+
+    client.close()
+
+
+
+def run_experimentation(repeats, experimentation_name):
+    for i in range(repeats):
+        print(f"{GREEN}=== Starting Experimentation Iteration {i+1}/{repeats} ==={RESET}")
+
+        # Step 1: Flush conntrack on target hosts
+        conntrack_hosts = ["connt1", "connt2"]
+        flush_conntrack_on_hosts(conntrack_hosts)
+
+        # Step 2: Define log files to monitor during the client run
+        log_files_to_monitor = {
+            "convsrc2": [f"/var/log/exp/{experimentation_name}_ca.csv"],
+            "connt1": [
+                f"/var/log/exp/{experimentation_name}_conntrackd_n_monitor.csv",
+                f"/var/log/exp/{experimentation_name}_conntrackd_cm_monitor.csv"
+            ]
+        }
+
+        # Step 3: Start log monitoring threads
+        stop_event = threading.Event()
+        monitor_threads = []
+        for host, files in log_files_to_monitor.items():
+            for fpath in files:
+                t = threading.Thread(
+                    target=monitor_file_growth,
+                    kwargs={
+                        "hostname": host,
+                        "filepath": fpath,
+                        "stop_event": stop_event,
+                        "check_interval": 10,
+                        "label": f"{host}:{os.path.basename(fpath)}"
+                    },
+                    name=f"Monitor-{host}-{os.path.basename(fpath)}"
+                )
+                monitor_threads.append(t)
+                t.start()
+
+        # Step 4: Run client threads
+        client_threads = [
+            threading.Thread(
+                target=build_and_run_client,
+                kwargs=dict(
+                    hostname="convsrc1",
+                    command="sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n 250000 -c 250 -w 1 -a 172.16.1.10-22 -k -r 10000-65000"
+                ),
+                name="Client-tcp-convsrc1"
+            ),
+            threading.Thread(
+                target=build_and_run_client,
+                kwargs=dict(
+                    hostname="convsrc1",
+                    command="./udp_client_sub -s 172.16.1.1 -p 3000 -n 250000 -c 250 -a 172.16.1.10-22 -r 10000-65000"
+                ),
+                name="Client-udp-convsrc1"
+            ),
+            threading.Thread(
+                target=build_and_run_client,
+                kwargs=dict(
+                    hostname="convsrc2",
+                    command="./udp_client_sub -s 172.16.1.1 -p 3000 -n 250000 -c 250 -a 172.16.1.26-39 -r 10000-65000"
+                ),
+                name="Client-udp-convsrc2"
+            ),
+            threading.Thread(
+                target=build_and_run_client,
+                kwargs=dict(
+                    hostname="convsrc2",
+                    command="sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n 250000 -c 250 -w 1 -a 172.16.1.26-39 -k -r 10000-65000"
+                ),
+                name="Client-tcp-convsrc2"
+            )
+        ]
+
+        for ct in client_threads:
+            ct.start()
+
+        for ct in client_threads:
+            ct.join()
+
+        print(f"{GREEN}All client threads completed. Stopping monitoring...{RESET}")
+
+        # Step 5: Stop log monitoring and join monitor threads
+        stop_event.set()
+        for mt in monitor_threads:
+            mt.join()
+
+        print(f"{GREEN}=== Completed Experimentation Iteration {i+1}/{repeats} ===\n{RESET}")
+
+
 def main(experimentation_name):
     # ----------------------------
     # pre experimentation Phase
@@ -616,8 +731,11 @@ def main(experimentation_name):
     # experimentation Phase
     # ----------------------------
 
+    
 
-    run_experimentation(repeats=5) 
+
+    run_experimentation(repeats=5, experimentation_name=experimentation_name)
+
 
 
     # ----------------------------
