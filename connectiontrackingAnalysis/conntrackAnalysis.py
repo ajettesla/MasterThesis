@@ -2,11 +2,13 @@
 import argparse
 import csv
 import datetime
-from collections import defaultdict
-import time
+import logging
 import os
+import signal
+import sys
 import threading
-from threading import Lock
+import time
+from collections import defaultdict
 
 def parse_line(line):
     """
@@ -22,7 +24,6 @@ def parse_line(line):
         ip = parts[1]
         device = parts[2]
         program = parts[3]
-        # Ignore parts[4], [5], [6] as they are placeholders ("-")
         payload_str = parts[7]
         payload_fields = payload_str.split(',')
         if len(payload_fields) != 10:
@@ -56,13 +57,7 @@ def parse_line(line):
 
 def process_entry(entry, device_a, device_b, dict_a, dict_b, writer, totals, lock, debug_mode):
     """
-    Process a single log entry:
-    - Check if it belongs to device_a or device_b.
-    - If from device_a or device_b, check for matches in the other device.
-    - If a match is found, calculate timestamp_nano difference and write to CSV.
-    - If debug_mode is enabled, print match details.
-    - Remove matched entries from both devices' dictionaries.
-    - If no match is found, add the entry to the appropriate dictionary.
+    Process a single log entry, checking for matches and writing results.
     """
     D = entry['device']
     if D not in [device_a, device_b]:
@@ -85,85 +80,163 @@ def process_entry(entry, device_a, device_b, dict_a, dict_b, writer, totals, loc
             writer.writerow([diff_nano, entry['proto_num'], entry['state_num'], debug_str])
             with lock:
                 totals[1] += 1
-            if debug_mode:
-                print(f"Match found: {D} ({entry['payload']}) -> {other_D} ({other_entry['payload']}) (matched)")
+            logging.debug(f"Match found: {D} ({entry['payload']}) -> {other_D} ({other_entry['payload']}) (matched)")
             other_dict[K].remove(other_entry)
             matched = True
     if not matched:
         self_dict[K].append(entry)
 
-def periodic_print(lock, totals):
+def periodic_print(lock, totals, stop_event):
     """
-    Periodically print total lines read and total matches found.
+    Periodically log total lines read and matches found until stopped.
     """
-    while True:
+    while not stop_event.is_set():
         time.sleep(5)
         with lock:
             lines = totals[0]
             matches = totals[1]
-        print(f"Total lines read: {lines}")
-        print(f"Total matches found: {matches}")
+        logging.info(f"Total lines read: {lines}")
+        logging.info(f"Total matches found: {matches}")
 
 def main():
     """
-    Main function to handle command-line arguments, initialize data structures,
-    and continuously process log files with periodic reporting.
+    Process conntrack logs, with options for daemon mode, killing the program, and debug output.
     """
     parser = argparse.ArgumentParser(description="Process conntrack logs for matching entries.")
-    parser.add_argument('-a', required=True, help="Name of device A")
-    parser.add_argument('-b', required=True, help="Name of device B")
-    parser.add_argument('-l', required=True, help="Path to log file")
-    parser.add_argument('-o', required=True, help="Path to output CSV file")
+    parser.add_argument('-a', help="Name of device A")
+    parser.add_argument('-b', help="Name of device B")
+    parser.add_argument('-l', help="Path to log file")
+    parser.add_argument('-o', help="Path to output CSV file")
     parser.add_argument('-d', action='store_true', help="Enable debug mode")
+    parser.add_argument('-k', action='store_true', help="Kill the running instance")
+    parser.add_argument('-D', action='store_true', help="Run in daemon mode")
+    parser.add_argument('-L', help="Log file path (default: ~/.conntrack_processor.log)")
     args = parser.parse_args()
-    
+
+    pid_file = '/tmp/conntrack_processor.pid'
+
+    if args.k:
+        if os.path.exists(pid_file):
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+                print(f"Sent SIGTERM to process {pid}")
+            except ProcessLookupError:
+                print(f"No process with PID {pid}")
+            os.remove(pid_file)
+        else:
+            print("No running instance found")
+        sys.exit(0)
+    else:
+        if os.path.exists(pid_file):
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            try:
+                os.kill(pid, 0)
+                print(f"Instance already running with PID {pid}")
+                sys.exit(1)
+            except ProcessLookupError:
+                # Remove stale PID file
+                os.remove(pid_file)
+
+        if args.D:
+            if args.L:
+                log_file = args.L
+            else:
+                log_file = os.path.expanduser('~/.conntrack_processor.log')
+            # Daemonize
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+            # Child process
+            os.setsid()
+            os.chdir('/')
+            # Second fork
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)
+            # Grandchild process
+            # Redirect stdin
+            with open('/dev/null', 'r') as devnull:
+                os.dup2(devnull.fileno(), sys.stdin.fileno())
+            # Redirect stdout and stderr to log_file
+            try:
+                log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                os.dup2(log_fd, sys.stdout.fileno())
+                os.dup2(log_fd, sys.stderr.fileno())
+                os.close(log_fd)
+            except OSError as e:
+                sys.exit(1)
+            # Write PID file
+            with open(pid_file, 'w') as f:
+                f.write(str(os.getpid()))
+            # Set up logging
+            logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+        else:
+            # Not daemon mode
+            logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(message)s')
+
+        if args.d:
+            logging.getLogger().setLevel(logging.DEBUG)
+
+        if not args.D and not all([args.a, args.b, args.l, args.o]):
+            parser.error("Options -a, -b, -l, -o are required when not in daemon mode or when -k is not provided")
+
+        logging.info("Starting conntrack processor")
+
     device_a = args.a
     device_b = args.b
     log_file = args.l
     output_file = args.o
     debug_mode = args.d
-    
-    # Check if output file exists; if not, create it and write headers
+
     if not os.path.exists(output_file):
         with open(output_file, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['timedifference', 'protocol_num', 'state_num', 'debug_info'])
-    
-    # Open output file for appending
+
     csvfile = open(output_file, 'a', newline='')
     writer = csv.writer(csvfile)
-    
-    # Initialize dictionaries for storing unmatched entries
+
     dict_a = defaultdict(list)
     dict_b = defaultdict(list)
-    
-    # Initialize counters and timer for periodic reporting
-    lock = Lock()
-    totals = [0, 0]  # [total_lines_read, total_matches_found]
+    lock = threading.Lock()
+    totals = [0, 0]
     last_flush_time = time.time()
-    
-    # Start periodic print thread
-    print_thread = threading.Thread(target=periodic_print, args=(lock, totals), daemon=True)
+
+    stop_event = threading.Event()
+
+    def signal_handler(signum, frame):
+        logging.info(f"Received signal {signum}, shutting down")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    print_thread = threading.Thread(target=periodic_print, args=(lock, totals, stop_event), daemon=True)
     print_thread.start()
-    
-    # Open log file for reading
+
     with open(log_file, 'r') as f:
-        while True:
+        while not stop_event.is_set():
             line = f.readline()
             if line:
+                logging.debug(f"Read line: {line.strip()}")
                 with lock:
-                    totals[0] += 1  # Increment total lines read
+                    totals[0] += 1
                 entry = parse_line(line)
                 if entry:
                     process_entry(entry, device_a, device_b, dict_a, dict_b, writer, totals, lock, debug_mode)
             else:
-                time.sleep(0.1)  # Sleep briefly if no new lines
-            
-            # Periodic CSV flush every 5 seconds
+                time.sleep(0.1)
+
             current_time = time.time()
             if current_time - last_flush_time >= 5:
                 csvfile.flush()
                 last_flush_time = current_time
+
+    logging.info("Exiting")
+    os.remove(pid_file)
 
 if __name__ == '__main__':
     main()
