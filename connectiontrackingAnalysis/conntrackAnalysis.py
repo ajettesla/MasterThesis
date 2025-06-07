@@ -191,6 +191,11 @@ def main():
     output_file = args.o
     debug_mode = args.d
 
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
     if not os.path.exists(output_file):
         with open(output_file, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
