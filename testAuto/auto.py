@@ -36,6 +36,7 @@ monitoring_stop_events = []
 original_stdout = None
 original_stderr = None
 log_file = None
+debug_mode = False  # Add global debug flag
 
 def signal_handler(signum, frame):
     """Handle Ctrl+C (SIGINT) and perform cleanup"""
@@ -51,34 +52,45 @@ def signal_handler(signum, frame):
     if current_experiment_name and current_concurrency and current_iteration:
         cleanup_logging_scripts(current_experiment_name, current_concurrency, current_iteration)
     
-    # Close log file
-    if log_file:
+    # Close log file if it was redirected
+    if log_file and debug_mode:
         log_file.close()
+        # Restore original stdout/stderr
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
     
-    # Print FAILURE to terminal
-    if original_stdout:
-        original_stdout.write("FAILURE\n")
-        original_stdout.flush()
+    # Print FAILURE to appropriate output
+    output_stream = original_stdout if debug_mode else sys.stdout
+    output_stream.write("FAILURE\n")
+    output_stream.flush()
     
     sys.exit(130)
 
-def setup_logging(experiment_name):
-    """Redirect all stdout/stderr to log file"""
-    global original_stdout, original_stderr, log_file
+def setup_logging(experiment_name, debug):
+    """Conditionally redirect stdout/stderr to log file based on debug flag"""
+    global original_stdout, original_stderr, log_file, debug_mode
     
-    # Save original stdout/stderr
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
+    debug_mode = debug
     
-    # Create log file
-    log_path = f"/tmp/{experiment_name}_auto.log"
-    log_file = open(log_path, 'w', buffering=1)
-    
-    # Redirect stdout and stderr to log file
-    sys.stdout = log_file
-    sys.stderr = log_file
-    
-    return log_path
+    if debug:
+        # Save original stdout/stderr
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        
+        # Create log file
+        log_path = f"/tmp/{experiment_name}_auto.log"
+        log_file = open(log_path, 'w', buffering=1)
+        
+        # Redirect stdout and stderr to log file
+        sys.stdout = log_file
+        sys.stderr = log_file
+        
+        return log_path
+    else:
+        # In normal mode, keep stdout/stderr as they are
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        return None
 
 def check_function():
     print(colored("[check] Step: Service Restart/Check/Flush", BOLD))
@@ -445,11 +457,12 @@ def main():
     parser.add_argument("-n", "--name", required=True, help="Experiment name")
     parser.add_argument("-i", "--iterations", required=True, type=int, help="Number of iterations")
     parser.add_argument("-c", "--concurrency", required=True, help="Concurrency values (comma-separated)")
-    parser.add_argument("-d", "--debug", action="store_true", help="Debug mode (currently unused)")
+    parser.add_argument("-d", "--debug", action="store_true", help="Debug mode - redirect output to log file")
     args = parser.parse_args()
 
     experiment_name = args.name
     iterations = args.iterations
+    debug = args.debug
     
     # Parse concurrency values
     try:
@@ -458,8 +471,8 @@ def main():
         print("ERROR: Invalid concurrency values")
         sys.exit(1)
     
-    # Setup logging - redirect stdout/stderr to log file
-    log_path = setup_logging(experiment_name)
+    # Setup logging - conditionally redirect stdout/stderr based on debug flag
+    log_path = setup_logging(experiment_name, debug)
     
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
@@ -469,6 +482,9 @@ def main():
         print(f"[MAIN] Experiment: {experiment_name}")
         print(f"[MAIN] Iterations: {iterations}")
         print(f"[MAIN] Concurrency values: {concurrency_values}")
+        print(f"[MAIN] Debug mode: {'ON' if debug else 'OFF'}")
+        if log_path:
+            print(f"[MAIN] Log file: {log_path}")
         print(f"[MAIN] Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print("=" * 80)
         
@@ -517,26 +533,33 @@ def main():
             client.close()
         
         print(f"\nAll {total_experiments} experiments completed successfully!")
-        print(f"Log file: {log_path}")
+        if log_path:
+            print(f"Log file: {log_path}")
         
-        # Close log file
-        if log_file:
+        # Close log file and restore stdout/stderr if in debug mode
+        if log_file and debug:
             log_file.close()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
         
-        # Print SUCCESS to terminal
-        original_stdout.write("SUCCESS\n")
-        original_stdout.flush()
+        # Print SUCCESS to appropriate output
+        output_stream = original_stdout if debug else sys.stdout
+        output_stream.write("SUCCESS\n")
+        output_stream.flush()
         
     except Exception as e:
         print(f"ERROR: {str(e)}")
         
-        # Close log file
-        if log_file:
+        # Close log file and restore stdout/stderr if in debug mode
+        if log_file and debug:
             log_file.close()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
         
-        # Print FAILURE to terminal
-        original_stdout.write("FAILURE\n")
-        original_stdout.flush()
+        # Print FAILURE to appropriate output
+        output_stream = original_stdout if debug else sys.stdout
+        output_stream.write("FAILURE\n")
+        output_stream.flush()
         sys.exit(1)
 
 if __name__ == "__main__":
