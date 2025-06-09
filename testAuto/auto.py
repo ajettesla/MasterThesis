@@ -667,7 +667,7 @@ def check_function():
     print(colored("[check] Step: Truncate Logs", BOLD))
     convsrc2_tag = "[convsrc2 localhost]"
     ssh_convsrc2 = ssh_connector.connect("convsrc2")
-    for logfile in ["/var/log/conntrack.log", "/var/log/ptp.log"]:
+    for logfile in ["/var/log/conntrack.log"]:
         cmd_truncate = f"sudo truncate -s 0 {logfile}"
         if ssh_convsrc2 is None:
             ok, _, err = run_command_locally(cmd_truncate, convsrc2_tag)
