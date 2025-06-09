@@ -71,7 +71,7 @@ def setup_logging(experiment_name):
     original_stderr = sys.stderr
     
     # Create log file
-    log_path = f"/tmp/{experiment_name}_auto.py"
+    log_path = f"/tmp/{experiment_name}_auto.log"
     log_file = open(log_path, 'w', buffering=1)
     
     # Redirect stdout and stderr to log file
