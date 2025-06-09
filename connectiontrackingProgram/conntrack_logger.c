@@ -33,8 +33,8 @@
 #include <blake3.h>
 
 // ----------- IMPROVED CONFIGURABLE CONSTANTS -----------------
-#define DEFAULT_EVENT_QUEUE_SIZE 65536    // Increased from 20480 to handle bursts better
-#define DEFAULT_SYSLOG_QUEUE_SIZE 32768   // Separate sizing for syslog queue
+#define DEFAULT_EVENT_QUEUE_SIZE 200000    // Increased from 20480 to handle bursts better
+#define DEFAULT_SYSLOG_QUEUE_SIZE 200000   // Separate sizing for syslog queue
 #define MIN_BATCH_SIZE 50                 // Increased from 10 for better efficiency
 #define MAX_BATCH_SIZE 500                // Maximum batch size to prevent oversized sends
 #define ADAPTIVE_BATCH_SIZE 1             // Enable adaptive batching
