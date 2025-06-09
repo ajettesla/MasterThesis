@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import re
 import shlex
@@ -7,6 +9,8 @@ import subprocess
 import socket
 import paramiko
 import select
+import signal
+import sys
 from datetime import datetime
 
 # ---- Colors ----
@@ -29,6 +33,515 @@ def get_current_hostname():
     except:
         return socket.gethostname()
 
+# ---- Command Execution Functions ----
+def run_command_locally(cmd: str, hosttag="[localhost]"):
+    print(f"{CYAN}{hosttag} Executing:{RESET} {cmd}")
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return (result.returncode == 0, result.stdout, result.stderr)
+
+def run_command_remotely(client, cmd: str, hosttag):
+    print(f"{MAGENTA}{hosttag} Executing:{RESET} {cmd}")
+    stdin, stdout, stderr = client.exec_command(cmd)
+    exit_code = stdout.channel.recv_exit_status()
+    out = stdout.read().decode()
+    err = stderr.read().decode()
+    return (exit_code == 0, out, err)
+
+def run_command_with_timeout(client, command, timeout, hostname="unknown"):
+    if client is None:
+        # Local execution
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+            return (result.returncode == 0, result.stdout)
+        except subprocess.TimeoutExpired:
+            return (False, f"Timeout exceeded ({timeout}s)")
+        except Exception as e:
+            return (False, str(e))
+    else:
+        # Remote execution
+        try:
+            stdin, stdout, stderr = client.exec_command(command)
+            start = time.time()
+            while not stdout.channel.exit_status_ready():
+                if time.time() - start > timeout:
+                    stdout.channel.close()
+                    print(f"{RED}[{hostname}] Timeout exceeded while running: {command}{RESET}")
+                    return False, f"Timeout exceeded while running: {command}"
+                time.sleep(0.5)
+            out = stdout.read().decode()
+            err = stderr.read().decode()
+            return True, out if out else err
+        except Exception as e:
+            print(f"{RED}[{hostname}] Exception during command: {command}\n{e}{RESET}")
+            return False, str(e)
+
+# ---- Process Management Functions ----
+def pre_kill_conflicting_processes(client, host, programs):
+    """Kill conflicting processes with force"""
+    for prog in programs:
+        check_cmd = f"pgrep -f {prog}"
+        if client is None:
+            status, output, _ = run_command_locally(check_cmd, f"[{host} localhost]")
+        else:
+            status, output = run_command_with_timeout(client, check_cmd, 5, hostname=host)
+        
+        if status and output.strip():
+            pids = output.strip().splitlines()
+            print(f"{YELLOW}[{host}] Found running '{prog}' with PIDs: {', '.join(pids)}. Killing...{RESET}")
+            for pid in pids:
+                kill_cmd = f"sudo kill -9 {pid}"
+                if client is None:
+                    run_command_locally(kill_cmd, f"[{host} localhost]")
+                else:
+                    run_command_with_timeout(client, kill_cmd, 5, hostname=host)
+            time.sleep(1)
+        else:
+            print(f"{GREEN}[{host}] No '{prog}' processes running.{RESET}")
+
+def force_kill_all_monitoring_processes():
+    """Force kill all monitoring processes across all hosts"""
+    print(f"{MAGENTA}[cleanup] Force killing all monitoring processes...{RESET}")
+    
+    ssh_connector = SSHConnector()
+    
+    # Define all monitoring processes to kill on each host
+    monitoring_processes = {
+        "connt1": ["start.sh", "cm_monitor.py", "n_monitor.py"],
+        "connt2": ["start.sh", "cm_monitor.py", "n_monitor.py"],
+        "convsrc2": ["conntrackAnalysis.py"],
+        "convsrc1": [],
+        "convsrc8": [],
+        "convsrc5": [],
+    }
+    
+    for host, processes in monitoring_processes.items():
+        if not processes:
+            continue
+            
+        print(f"{YELLOW}[cleanup] [{host}] Force killing monitoring processes...{RESET}")
+        client = ssh_connector.connect(host)
+        tag = f"[{host} ssh]" if client else f"[{host} localhost]"
+        
+        for process in processes:
+            # First try SIGTERM
+            kill_cmd = f"sudo pkill -f {process}"
+            if client is None:
+                status, output, _ = run_command_locally(kill_cmd, tag)
+            else:
+                status, output = run_command_with_timeout(client, kill_cmd, 3, hostname=host)
+            
+            time.sleep(1)
+            
+            # Then force kill with SIGKILL
+            force_kill_cmd = f"sudo pkill -9 -f {process}"
+            if client is None:
+                status, output, _ = run_command_locally(force_kill_cmd, tag)
+            else:
+                status, output = run_command_with_timeout(client, force_kill_cmd, 3, hostname=host)
+            
+            print(f"{GREEN}[cleanup] [{host}] Force killed {process}{RESET}")
+        
+        if client:
+            client.close()
+    
+    print(f"{GREEN}[cleanup] Force kill completed for all monitoring processes.{RESET}")
+
+# ---- Cleanup Functions ----
+def cleanup_logging_scripts(experiment_name, concurrency, iteration):
+    print(f"{MAGENTA}[cleanup] Starting comprehensive cleanup for {experiment_name}{concurrency}/{iteration}...{RESET}")
+    
+    CAlog = f"/tmp/CA.log"
+    log_configs = [
+        (
+            "connt1",
+            f"sudo ./start.sh -i {iteration} -l /var/log/exp/{experiment_name}{concurrency}/{iteration} -p conntrackd --iface enp3s0 -d",
+            "start.sh",
+            "/opt/MasterThesis/CMNpsutil/"
+        ),
+        (
+            "convsrc2",
+            f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o /var/log/exp/{experiment_name}{concurrency}/{iteration}_ca.csv -d -D -L {CAlog}",
+            "conntrackAnalysis.py",
+            "/opt/MasterThesis/connectiontrackingAnalysis/"
+        ),
+    ]
+    
+    ssh_connector = SSHConnector()
+    
+    for host, _, program_file, working_dir in log_configs:
+        print(f"{YELLOW}[cleanup] [{host}] Attempting graceful shutdown of {program_file}...{RESET}")
+
+        client = ssh_connector.connect(host)
+        tag = f"[{host} ssh]" if client else f"[{host} localhost]"
+        
+        kill_cmd = f"cd {working_dir} && sudo ./{program_file} -k"
+        if client is None:
+            status, output, _ = run_command_locally(kill_cmd, tag)
+        else:
+            status, output = run_command_with_timeout(client, kill_cmd, 5, hostname=host)
+
+        if status:
+            print(f"{GREEN}[cleanup] [{host}] Sent graceful shutdown to {program_file}{RESET}")
+        else:
+            print(f"{RED}[cleanup] [{host}] Failed to send graceful shutdown.{RESET}")
+            print(f"{RED}[cleanup] [{host}] Output: {output.strip()}{RESET}")
+
+        if client:
+            client.close()
+
+    # Wait 5 seconds for graceful shutdown
+    print(f"{YELLOW}[cleanup] Waiting 5 seconds for graceful shutdown...{RESET}")
+    time.sleep(5)
+
+    # Now force kill all monitoring processes on all hosts
+    force_kill_all_monitoring_processes()
+
+# ---- Signal Handling ----
+def create_signal_handler(monitoring_threads, monitoring_stop_events, current_experiment_name=None, current_concurrency=None, current_iteration=None):
+    """Create a signal handler with proper context"""
+    def signal_handler(signum, frame):
+        """Handle Ctrl+C (SIGINT) and perform cleanup"""
+        print(f"\n{YELLOW}[SIGNAL] Received signal {signum}. Performing cleanup...{RESET}")
+        
+        # Stop all monitoring threads
+        print(f"{YELLOW}[SIGNAL] Stopping monitoring threads...{RESET}")
+        for stop_event in monitoring_stop_events:
+            stop_event.set()
+        
+        for thread in monitoring_threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+        
+        # Cleanup logging scripts if experiment was running
+        if current_experiment_name and current_concurrency and current_iteration:
+            print(f"{YELLOW}[SIGNAL] Cleaning up experiment {current_experiment_name}{current_concurrency}/{current_iteration}...{RESET}")
+            cleanup_logging_scripts(current_experiment_name, current_concurrency, current_iteration)
+        
+        print(f"{GREEN}[SIGNAL] Cleanup completed. Exiting...{RESET}")
+        sys.exit(0)
+    
+    return signal_handler
+
+# ---- Service Management Functions ----
+def verify_critical_processes_running(experiment_name, concurrency, iteration):
+    """Verify that all critical processes are running - exit if any are missing"""
+    print(colored("[verify] Checking that all critical processes are running...", BOLD))
+    
+    ssh_connector = SSHConnector()
+    critical_services = {
+        "connt1": ["conntrackd"],
+      # "connt2": ["conntrackd"],
+    }
+    critical_processes = {
+        "connt1": ["start.sh", "cm_monitor.py", "n_monitor.py"],
+        "convsrc2": ["conntrackAnalysis.py"]
+    }
+    
+    all_running = True
+    failed_items = []
+    
+    # Check systemctl services
+    for host, services in critical_services.items():
+        client = ssh_connector.connect(host)
+        tag = f"[{host} ssh]" if client else f"[{host} localhost]"
+        
+        for service in services:
+            check_cmd = f"sudo systemctl is-active {service}"
+            if client is None:
+                status, output, stderr = run_command_locally(check_cmd, tag)
+            else:
+                status, output, stderr = run_command_remotely(client, check_cmd, tag)
+            
+            if not status or "active" not in output.strip():
+                print(f"{RED}[{host}] CRITICAL: Service '{service}' is NOT active! Status: {output.strip()}{RESET}")
+                failed_items.append(f"{host}:{service} (service)")
+                all_running = False
+            else:
+                print(f"{GREEN}[{host}] Service '{service}' is active.{RESET}")
+        
+        if client:
+            client.close()
+    
+    # Check processes
+    for host, processes in critical_processes.items():
+        client = ssh_connector.connect(host)
+        tag = f"[{host} ssh]" if client else f"[{host} localhost]"
+        
+        for process in processes:
+            check_cmd = f"pgrep -f {process}"
+            if client is None:
+                status, output, stderr = run_command_locally(check_cmd, tag)
+            else:
+                status, output = run_command_with_timeout(client, check_cmd, 5, hostname=host)
+                stderr = ""
+            
+            if not status or not output.strip():
+                print(f"{RED}[{host}] CRITICAL: Process '{process}' is NOT running!{RESET}")
+                if stderr:
+                    print(f"{RED}[{host}] STDERR: {stderr}{RESET}")
+                failed_items.append(f"{host}:{process} (process)")
+                all_running = False
+            else:
+                pids = output.strip().splitlines()
+                print(f"{GREEN}[{host}] Process '{process}' is running with PID(s): {', '.join(pids)}{RESET}")
+        
+        if client:
+            client.close()
+    
+    if not all_running:
+        print(f"{RED}[verify] FATAL ERROR: The following critical items are not running:{RESET}")
+        for failed in failed_items:
+            print(f"{RED}  - {failed}{RESET}")
+        print(f"{RED}[verify] Unable to continue experimentation. Exiting program.{RESET}")
+        sys.exit(1)
+    
+    print(colored("[verify] All critical services and processes are running successfully.", GREEN))
+    return True
+
+# ---- Client Thread Management ----
+def build_and_run_client(hostname, command):
+    runner = RemoteProgramRunner(
+        hostname=hostname,
+        command=command,
+        working_dir="/opt/MasterThesis/trafGen",
+        max_duration=120,
+        cleanup=True,
+        verbose=True,
+        timeout=60,
+    )
+    result = runner.run()
+    return result
+
+def get_client_threads(concurrency_n, concurrency_c, tcp_timeout_t):
+    client_threads = [
+        threading.Thread(
+            target=build_and_run_client,
+            kwargs=dict(
+                hostname="convsrc1",
+                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -w 1 -a 172.16.1.10-22 -k -r 10000-65000 -t {tcp_timeout_t}"
+            ),
+            name="Client-tcp-convsrc1"
+        ),
+        threading.Thread(
+            target=build_and_run_client,
+            kwargs=dict(
+                hostname="convsrc1",
+                command=f"./udp_client_sub -s 172.16.1.1 -p 3000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.10-22 -r 10000-65000"
+            ),
+            name="Client-udp-convsrc1"
+        ),
+        threading.Thread(
+            target=build_and_run_client,
+            kwargs=dict(
+                hostname="convsrc2",
+                command=f"./udp_client_sub -s 172.16.1.1 -p 3000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.26-39 -r 10000-65000"
+            ),
+            name="Client-udp-convsrc2"
+        ),
+        threading.Thread(
+            target=build_and_run_client,
+            kwargs=dict(
+                hostname="convsrc2",
+                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -w 1 -a 172.16.1.26-39 -k -r 10000-65000 -t {tcp_timeout_t}"
+            ),
+            name="Client-tcp-convsrc2"
+        )
+    ]
+    return client_threads
+
+# ---- Progress Display Functions ----
+def periodic_progress_display(stop_event, interval_seconds):
+    """Display progress every N seconds"""
+    print(f"{MAGENTA}[progress] Starting periodic progress display (every {interval_seconds/60:.1f} minutes){RESET}")
+    
+    # Show initial status
+    time.sleep(10)  # Wait 10 seconds before first display
+    progress_tracker.force_display_progress()
+    
+    while not stop_event.is_set():
+        # Wait for the interval or until stopped
+        if stop_event.wait(interval_seconds):
+            break  # Stop event was set
+        
+        # Display progress
+        progress_tracker.force_display_progress()
+    
+    print(f"{MAGENTA}[progress] Periodic progress display stopped{RESET}")
+
+# ---- Remote Log Monitoring ----
+def monitor_remote_log_file(filepath, host, keyword_expr="", timeout=None, print_output=True, result_dict=None, stop_event=None):
+    """Monitor log files on remote hosts using wc -l for line counting"""
+    current_host = get_current_hostname()
+    
+    if host == current_host or host == "localhost" or host == "convsrc2":
+        # Monitor locally using the existing function
+        monitor_log_file_watchdog(
+            filepath=filepath,
+            keyword_expr=keyword_expr,
+            timeout=timeout,
+            print_output=print_output,
+            result_dict=result_dict,
+            stop_event=stop_event
+        )
+    else:
+        # Monitor remotely using SSH and wc -l
+        ssh_connector = SSHConnector()
+        client = ssh_connector.connect(host)
+        tag = f"[{host} ssh]" if client else f"[{host} localhost]"
+        
+        print(f"{BLUE}[{current_host} local check] Starting remote monitoring of {os.path.basename(filepath)} on {host} using wc -l{RESET}")
+        
+        keywords = set(re.findall(r"'(.*?)'", keyword_expr))
+        match_mode = bool(keywords)
+        seen_keywords = set()
+        
+        # Initialize tracking variables
+        previous_line_count = 0
+        current_line_count = 0
+        previous_file_size = 0
+        current_file_size = 0
+        total_lines_grown = 0
+        
+        start_time = time.time()
+        last_progress_time = time.time()
+        progress_interval = 30  # Update progress every 30 seconds
+        
+        def get_remote_file_stats():
+            """Get line count and file size from remote host"""
+            try:
+                # Get line count using wc -l
+                wc_cmd = f"wc -l {filepath} 2>/dev/null | awk '{{print $1}}' || echo 0"
+                if client is None:
+                    return 0, 0
+                
+                stdin, stdout, stderr = client.exec_command(wc_cmd)
+                line_output = stdout.read().decode().strip()
+                try:
+                    line_count = int(line_output)
+                except:
+                    line_count = 0
+                
+                # Get file size using stat
+                size_cmd = f"stat -c %s {filepath} 2>/dev/null || echo 0"
+                stdin, stdout, stderr = client.exec_command(size_cmd)
+                size_output = stdout.read().decode().strip()
+                try:
+                    file_size = int(size_output)
+                except:
+                    file_size = 0
+                
+                return line_count, file_size
+            except Exception as e:
+                print(f"{RED}[{current_host} local check] Error getting stats for {filepath} on {host}: {e}{RESET}")
+                return 0, 0
+        
+        def update_progress_display(force_display=False):
+            """Update progress tracker with current stats"""
+            nonlocal last_progress_time
+            current_time = time.time()
+            
+            if force_display or (current_time - last_progress_time >= progress_interval):
+                progress_tracker.update_file_progress(
+                    f"{host}:{os.path.basename(filepath)}",
+                    previous_file_size,
+                    current_file_size,
+                    total_lines_grown,
+                    current_file_size,
+                    update_display=True
+                )
+                last_progress_time = current_time
+        
+        try:
+            if client is None:
+                print(f"{RED}[{current_host} local check] No SSH client for remote host {host}{RESET}")
+                return
+            
+            # Get initial file stats
+            current_line_count, current_file_size = get_remote_file_stats()
+            previous_line_count = current_line_count
+            previous_file_size = current_file_size
+            
+            print(f"{CYAN}[{current_host} local check] Initial stats for {os.path.basename(filepath)} on {host}: {current_line_count} lines, {current_file_size} bytes{RESET}")
+            
+            # Initial progress update
+            update_progress_display(force_display=True)
+            
+            check_interval = 5  # Check every 5 seconds
+            last_check_time = time.time()
+            
+            while not stop_event.is_set():
+                current_time = time.time()
+                
+                # Check file stats every 5 seconds
+                if current_time - last_check_time >= check_interval:
+                    # Get current stats
+                    new_line_count, new_file_size = get_remote_file_stats()
+                    
+                    # Calculate growth
+                    lines_grown = new_line_count - current_line_count
+                    bytes_grown = new_file_size - current_file_size
+                    
+                    if lines_grown > 0 or bytes_grown > 0:
+                        print(f"{GREEN}[{current_host} local check] {host}:{os.path.basename(filepath)} - Lines: +{lines_grown} (total: {new_line_count}), Size: +{bytes_grown}B (total: {new_file_size}B){RESET}")
+                        
+                        # Update totals
+                        total_lines_grown += lines_grown
+                        previous_file_size = current_file_size
+                        current_line_count = new_line_count
+                        current_file_size = new_file_size
+                        
+                        # Handle keyword matching if needed
+                        if match_mode and lines_grown > 0:
+                            # Get the new lines for keyword matching
+                            tail_cmd = f"tail -n {lines_grown} {filepath} 2>/dev/null || echo ''"
+                            stdin, stdout, stderr = client.exec_command(tail_cmd)
+                            new_lines = stdout.read().decode().strip()
+                            
+                            for line in new_lines.splitlines():
+                                line = line.strip()
+                                if line:
+                                    for kw in keywords:
+                                        if kw in line and kw not in seen_keywords:
+                                            seen_keywords.add(kw)
+                                            print(f"{GREEN}[{current_host} local check] MATCH found keyword '{kw}' in {host}:{os.path.basename(filepath)}{RESET}")
+                            
+                            if seen_keywords == keywords:
+                                print(f"{GREEN}[{current_host} local check] All keywords matched on {host}. Stopping monitor.{RESET}")
+                                if result_dict is not None:
+                                    result_dict[f"remote-{host}-{threading.current_thread().name}"] = len(seen_keywords)
+                                stop_event.set()
+                                break
+                    
+                    last_check_time = current_time
+                
+                # Update progress display periodically
+                update_progress_display()
+                
+                # Check timeout
+                if timeout:
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout:
+                        print(f"{RED}[{current_host} local check] Timeout reached for remote monitoring of {filepath} on {host}{RESET}")
+                        break
+                
+                time.sleep(1)  # Sleep for 1 second between checks
+        
+        except Exception as e:
+            print(f"{RED}[{current_host} local check] Error monitoring remote file {filepath} on {host}: {e}{RESET}")
+        
+        finally:
+            if client:
+                client.close()
+            
+            print(f"{CYAN}[{current_host} local check] Remote monitoring finished for {os.path.basename(filepath)} on {host}. Total lines grown: {total_lines_grown}{RESET}")
+            
+            if result_dict is not None:
+                if match_mode:
+                    result_dict[f"remote-{host}-{threading.current_thread().name}"] = len(seen_keywords)
+                else:
+                    result_dict[f"remote-{host}-{threading.current_thread().name}"] = total_lines_grown
+
+# ---- Existing Classes ----
 class LogMonitorHandler(threading.Thread): 
     def __init__(self, filepath, keywords, print_output, stop_event, result_dict, progress_callback=None):
         super().__init__()
@@ -254,14 +767,14 @@ class ProgressTracker:
         elapsed = time.time() - self.start_time
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        print(f"\n{BOLD}{MAGENTA}╔════════════════════════════════════════════════════════════════════════╗{RESET}")
+        print(f"\n{BOLD}{MAGENTA}╔═════════════════════════════════════════════════════════════════════════╗{RESET}")
         print(f"{BOLD}{MAGENTA}║                    COMPREHENSIVE LOG GROWTH REPORT                    ║{RESET}")
         print(f"{BOLD}{MAGENTA}║ Time: {current_time} | Elapsed: {elapsed/60:.1f} minutes{' '*(35-len(current_time))}║{RESET}")
-        print(f"{BOLD}{MAGENTA}╠════════════════════════════════════════════════════════════════════════╣{RESET}")
+        print(f"{BOLD}{MAGENTA}╠═════════════════════════════════════════════════════════════════════════╣{RESET}")
         
         if not self.file_stats:
             print(f"{MAGENTA}║{RESET} {RED}No log files being monitored!{RESET}")
-            print(f"{BOLD}{MAGENTA}╚════════════════════════════════════════════════════════════════════════╝{RESET}\n")
+            print(f"{BOLD}{MAGENTA}╚═════════════════════════════════════════════════════════════════════════╝{RESET}")
             return
         
         total_size = 0
@@ -323,9 +836,9 @@ class ProgressTracker:
             # Display file info
             filename_display = filename[:25] + "..." if len(filename) > 28 else filename
             
-            print(f"{MAGENTA}║{RESET} {CYAN}{filename_display:30}{RESET} │ {BOLD}{size_str:>8}{RESET} │ {growth_color}{growth_str:>10}{RESET} │ Lines: {BLUE}{line_count:>6}{RESET} │ {YELLOW}{rate_str:>10}{RESET} {MAGENTA}║{RESET}")
+            print(f"{MAGENTA}║{RESET} {CYAN}{filename_display:30}{RESET} │ {BOLD}{size_str:>8}{RESET} │ {growth_color}{growth_str:>10}{RESET} │ Lines: {BLUE}{line_count:>6}{RESET} │ {YELLOW}{update_status:>8}{RESET} ║")
         
-        print(f"{BOLD}{MAGENTA}╠════════════════════════════════════════════════════════════════════════╣{RESET}")
+        print(f"{BOLD}{MAGENTA}╠═════════════════════════════════════════════════════════════════════════╣{RESET}")
         
         # Summary
         total_size_str = f"{total_size/(1024*1024):.1f}MB" if total_size > 1024*1024 else f"{total_size/1024:.1f}KB"
@@ -333,8 +846,8 @@ class ProgressTracker:
         avg_rate = (total_size / 1024) / elapsed if elapsed > 0 else 0
         avg_rate_str = f"{avg_rate:.1f}KB/s" if avg_rate >= 1 else f"{avg_rate*1000:.0f}B/s"
         
-        print(f"{MAGENTA}║{RESET} {BOLD}TOTAL:{' '*24}{RESET} │ {BOLD}{GREEN}{total_size_str:>8}{RESET} │ {BOLD}{GREEN}{total_growth_str:>10}{RESET} │ Lines: {BOLD}{BLUE}{total_lines:>6}{RESET} │ {BOLD}{YELLOW}{avg_rate_str:>10}{RESET} {MAGENTA}║{RESET}")
-        print(f"{BOLD}{MAGENTA}╚════════════════════════════════════════════════════════════════════════╝{RESET}\n")
+        print(f"{MAGENTA}║{RESET} {BOLD}TOTAL:{' '*24}{RESET} │ {BOLD}{GREEN}{total_size_str:>8}{RESET} │ {BOLD}{GREEN}{total_growth_str:>10}{RESET} │ Lines: {BOLD}{BLUE}{total_lines:>6}{RESET} │ {BOLD}{CYAN}{avg_rate_str:>8}{RESET} ║")
+        print(f"{BOLD}{MAGENTA}╚═════════════════════════════════════════════════════════════════════════╝{RESET}")
 
 # Global progress tracker
 progress_tracker = ProgressTracker()
