@@ -303,7 +303,7 @@ def pre_experimentation(experiment_name, concurrency, iteration):
     CAlog = f"/tmp/CA.log"
     log_configs = [
         ("connt1", f"sudo ./start.sh -i {iteration} -l /var/log/exp/{experiment_name}{concurrency}/{iteration} -p conntrackd --iface enp3s0 -d", "start.sh", "/opt/MasterThesis/CMNpsutil/", True),
-        ("convsrc2", f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o /var/log/exp/{experiment_name}{concurrency}/{iteration}_ca.csv -d -D -L {CAlog}", "conntrackAnalysis.py", "/opt/MasterThesis/connectiontrackingAnalysis/", False),
+        ("convsrc2", f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o /var/log/exp/{experiment_name}{concurrency}/{iteration}_ca.csv -d -D -L {CAlog}", "conntrackAnalysis.py", "/opt/MasterThesis/connectiontrackingAnalysis/", True),
     ]
     
     print("[pre-exp] Setting up logging scripts")
