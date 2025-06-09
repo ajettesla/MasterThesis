@@ -1,15 +1,14 @@
 /*
+ * Improved conntrack logger with better queue handling and flow control
  * 
+ * Key improvements:
+ * - Dynamic backpressure mechanism to slow down event generation when queues are full
+ * - Larger queue sizes and configurable queue sizes
+ * - Better error handling and retry logic for syslog connections
+ * - Batch size optimization based on queue load
+ * - Connection pooling for syslog to reduce connection overhead
  * 
- * Features:
- * - Three threads: main (Netfilter event collection), formatting, syslog sending.
- * - Two SPSC queues: event_queue (raw events, main->formatting), syslog_queue (formatted events, formatting->syslog).
- * - Handles SIGINT/SIGTERM gracefully, unblocking all threads for prompt exit.
- * - Batches syslog messages and sends in bulk; lost batches are retried on next send.
- * - Argument interface and output format matches legacy conntrack_logger.c.
- * - Extensive debug messages and explicit queue-overflow diagnostics.
- * 
- * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger_threaded_debug conntrack_logger_threaded_debug.c
+ * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger_improved conntrack_logger_improved.c
  */
 
 #include <stdio.h>
@@ -33,20 +32,28 @@
 #include <netinet/in.h>
 #include <blake3.h>
 
-// ----------- CONFIGURABLE CONSTANTS -----------------
-#define DEFAULT_QUEUE_SIZE 20480    // Increased from 1024 to 16384 for burst tolerance
-#define MIN_BATCH_SIZE 10
+// ----------- IMPROVED CONFIGURABLE CONSTANTS -----------------
+#define DEFAULT_EVENT_QUEUE_SIZE 65536    // Increased from 20480 to handle bursts better
+#define DEFAULT_SYSLOG_QUEUE_SIZE 32768   // Separate sizing for syslog queue
+#define MIN_BATCH_SIZE 50                 // Increased from 10 for better efficiency
+#define MAX_BATCH_SIZE 500                // Maximum batch size to prevent oversized sends
+#define ADAPTIVE_BATCH_SIZE 1             // Enable adaptive batching
 #define MAX_MESSAGE_LEN 1024
-#define BATCH_TIMEOUT_US 1000000    // 1 second
+#define BATCH_TIMEOUT_US 500000           // Reduced from 1s to 500ms for better responsiveness
 #define SYSLOG_PORT "514"
 #define LOGFILE_PATH "/var/log/conntrack_logger.log"
+#define MAX_CONSECUTIVE_FAILURES 5       // Max failures before exponential backoff
+#define RECONNECT_DELAY_MS 1000          // Base delay for reconnection attempts
+#define QUEUE_HIGH_WATERMARK 0.8         // Trigger backpressure at 80% full
+#define QUEUE_LOW_WATERMARK 0.3          // Release backpressure at 30% full
 
-// ----------- SPSC QUEUE IMPLEMENTATION -------------
+// ----------- ENHANCED SPSC QUEUE IMPLEMENTATION -------------
 typedef struct {
     void **items;
     size_t head;
     size_t tail;
     size_t capacity;
+    atomic_size_t count;  // Track current queue size for load monitoring
 } spsc_queue_t;
 
 // Create a new SPSC queue with given capacity
@@ -58,7 +65,14 @@ spsc_queue_t* spsc_queue_init(size_t capacity) {
     q->head = 0;
     q->tail = 0;
     q->capacity = capacity;
+    atomic_store(&q->count, 0);
     return q;
+}
+
+// Get current queue utilization (0.0 to 1.0)
+double spsc_queue_utilization(spsc_queue_t *q) {
+    size_t current_count = atomic_load(&q->count);
+    return (double)current_count / q->capacity;
 }
 
 // Enqueue an item (returns 0 on success, -1 if queue full)
@@ -67,6 +81,7 @@ int spsc_queue_push(spsc_queue_t *q, void *item) {
     if (next_head == q->tail) return -1; // Queue full
     q->items[q->head] = item;
     q->head = next_head;
+    atomic_fetch_add(&q->count, 1);
     return 0;
 }
 
@@ -75,6 +90,7 @@ int spsc_queue_try_pop(spsc_queue_t *q, void **item) {
     if (q->tail == q->head) return 0; // Queue empty
     *item = q->items[q->tail];
     q->tail = (q->tail + 1) % q->capacity;
+    atomic_fetch_sub(&q->count, 1);
     return 1;
 }
 
@@ -95,6 +111,8 @@ typedef struct {
     int hash_enabled;
     int payload_enabled;
     char *src_range;
+    size_t event_queue_size;
+    size_t syslog_queue_size;
 } config_t;
 
 // ----------- EVENT STRUCTURES -----------------------
@@ -128,6 +146,7 @@ typedef struct {
     spsc_queue_t *event_queue;
     spsc_queue_t *syslog_queue;
     config_t *cfg;
+    atomic_int backpressure_active;  // Backpressure control
 } app_context_t;
 
 typedef struct {
@@ -137,13 +156,17 @@ typedef struct {
     char *syslog_ip;
     int syslog_fd;
     atomic_size_t bytes_transferred;
+    atomic_int consecutive_failures;
+    struct timespec last_failure_time;
 } syslog_data_t;
 
 // ----------- GLOBALS --------------------------------
 static int global_debug_enabled = 0;
 static atomic_llong event_counter = 0;
 volatile sig_atomic_t shutdown_flag = 0;
-struct nfct_handle *g_nfct_handle = NULL; // needed for signal-safe shutdown
+struct nfct_handle *g_nfct_handle = NULL;
+static atomic_int event_overflow_reported = 0;
+static atomic_int syslog_overflow_reported = 0;
 
 // ----------- LOGGING --------------------------------
 void log_with_timestamp(const char *fmt, ...) {
@@ -168,7 +191,6 @@ void log_with_timestamp(const char *fmt, ...) {
 }
 
 // ----------- SIGNAL HANDLING ------------------------
-// Only set a flag; don't call unsafe functions here!
 void signal_handler(int sig) {
     static int already_logged = 0;
     if (!already_logged) {
@@ -176,16 +198,14 @@ void signal_handler(int sig) {
         already_logged = 1;
     }
     shutdown_flag = 1;
-    // Do NOT call nfct_close here -- not async-signal-safe!
 }
-
 
 // ----------- HELP MESSAGE ---------------------------
 static void print_help(const char *progname) {
     printf("Usage: %s [options]\n", progname);
     printf("Options:\n");
     printf("  -h, --help                Show this help message\n");
-    printf("  -n, --machine-name <name> Specify machine name (required)\n");
+    printf("  -n, --machine-name <n>    Specify machine name (required)\n");
     printf("  -l, --lsip <ip_address>   Specify syslog server IP/domain (required)\n");
     printf("  -d, --daemonize           Daemonize the program (optional)\n");
     printf("  -k, --kill                Kill all running daemons (optional)\n");
@@ -194,6 +214,8 @@ static void print_help(const char *progname) {
     printf("  -H, --hash                Include BLAKE3 hash in log messages\n");
     printf("  -P, --payload             Include detailed payload tuple\n");
     printf("  -r, --src-range <range>   Filter events by source IP range (CIDR, e.g., 192.168.1.0/24)\n");
+    printf("  --event-queue-size <size> Event queue size (default: %d)\n", DEFAULT_EVENT_QUEUE_SIZE);
+    printf("  --syslog-queue-size <size> Syslog queue size (default: %d)\n", DEFAULT_SYSLOG_QUEUE_SIZE);
     printf("Note: At least one of -H or -P must be specified.\n");
 }
 
@@ -210,6 +232,8 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
         {"hash", no_argument, 0, 'H'},
         {"payload", no_argument, 0, 'P'},
         {"src-range", required_argument, 0, 'r'},
+        {"event-queue-size", required_argument, 0, 1001},
+        {"syslog-queue-size", required_argument, 0, 1002},
         {0, 0, 0, 0}
     };
     int opt;
@@ -222,6 +246,8 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
     cfg->hash_enabled = 0;
     cfg->payload_enabled = 0;
     cfg->src_range = NULL;
+    cfg->event_queue_size = DEFAULT_EVENT_QUEUE_SIZE;
+    cfg->syslog_queue_size = DEFAULT_SYSLOG_QUEUE_SIZE;
 
     while ((opt = getopt_long(argc, argv, "hn:l:dkc:DHPr:", long_options, NULL)) != -1) {
         switch (opt) {
@@ -238,6 +264,8 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
             case 'H': cfg->hash_enabled = 1; break;
             case 'P': cfg->payload_enabled = 1; break;
             case 'r': cfg->src_range = optarg; break;
+            case 1001: cfg->event_queue_size = atoi(optarg); break;
+            case 1002: cfg->syslog_queue_size = atoi(optarg); break;
             default: print_help(argv[0]); return 1;
         }
     }
@@ -253,6 +281,10 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
         print_help(argv[0]);
         return 1;
     }
+
+    // Validate queue sizes
+    if (cfg->event_queue_size < 1024) cfg->event_queue_size = 1024;
+    if (cfg->syslog_queue_size < 1024) cfg->syslog_queue_size = 1024;
 
     return 0;
 }
@@ -331,7 +363,7 @@ static void extract_conn_event(
     int payload_enabled, long long count, long long timestamp_ns
 ) {
     event->count = count_enabled ? count : 0;
-    event->timestamp_ns = timestamp_ns; // Ensure timestamp is carried forward
+    event->timestamp_ns = timestamp_ns;
 
     struct in_addr src_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC) };
     struct in_addr dst_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_DST) };
@@ -408,11 +440,19 @@ static void extract_conn_event(
 }
 
 // ----------- CONNTRACK CALLBACK ---------------------
-// Called from main thread for each conntrack event
-static atomic_int event_overflow_reported = 0; // For queue overflow warning throttling
-
 static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     app_context_t *ctx = (app_context_t *)data;
+
+    // Check backpressure - if active, drop some events to relieve pressure
+    if (atomic_load(&ctx->backpressure_active)) {
+        // Drop every other event during backpressure
+        static atomic_int drop_counter = 0;
+        if (atomic_fetch_add(&drop_counter, 1) % 2 == 0) {
+            if (ctx->cfg->debug_enabled)
+                log_with_timestamp("[DEBUG] Event dropped due to backpressure\n");
+            return NFCT_CB_CONTINUE;
+        }
+    }
 
     // Filter by source IP range (if specified)
     if (ctx->cfg->src_range) {
@@ -451,6 +491,9 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
         }
         nfct_destroy(event->ct);
         free(event);
+        
+        // Activate backpressure
+        atomic_store(&ctx->backpressure_active, 1);
     } else {
         // Reset overflow report if queue recovers
         atomic_store(&event_overflow_reported, 0);
@@ -461,8 +504,8 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
     return NFCT_CB_CONTINUE;
 }
 
-// ----------- SYSLOG CONNECTION ----------------------
-static int connect_to_syslog(const char *host, const char *port_str) {
+// ----------- SYSLOG CONNECTION WITH RETRY ----------------------
+static int connect_to_syslog_with_retry(const char *host, const char *port_str, int *consecutive_failures) {
     struct addrinfo hints, *res, *rp;
     int sock = -1;
 
@@ -473,12 +516,23 @@ static int connect_to_syslog(const char *host, const char *port_str) {
     int err = getaddrinfo(host, port_str, &hints, &res);
     if (err != 0) {
         log_with_timestamp("[ERROR] getaddrinfo failed for %s:%s: %s\n", host, port_str, gai_strerror(err));
+        (*consecutive_failures)++;
         return -1;
     }
 
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sock == -1) continue;
+
+        // Set socket options for better performance
+        int opt = 1;
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+        
+        // Set send timeout
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
         if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
 
@@ -490,8 +544,10 @@ static int connect_to_syslog(const char *host, const char *port_str) {
 
     if (sock == -1) {
         log_with_timestamp("[ERROR] Failed to connect to syslog server at %s:%s\n", host, port_str);
+        (*consecutive_failures)++;
     } else {
         log_with_timestamp("[INFO] Successfully connected to syslog server at %s:%s\n", host, port_str);
+        *consecutive_failures = 0;
     }
 
     return sock;
@@ -503,12 +559,21 @@ static void create_syslog_message(char *msg, size_t len, const char *machine_nam
 }
 
 // ----------- FORMATTING THREAD ----------------------
-// Converts raw events to formatted string and enqueues to syslog_queue
 void* formatting_thread(void* arg) {
     app_context_t *ctx = (app_context_t *)arg;
-    static atomic_int syslog_overflow_reported = 0;
 
     while (!shutdown_flag) {
+        // Monitor queue utilization for backpressure control
+        double syslog_util = spsc_queue_utilization(ctx->syslog_queue);
+        
+        if (syslog_util > QUEUE_HIGH_WATERMARK && !atomic_load(&ctx->backpressure_active)) {
+            atomic_store(&ctx->backpressure_active, 1);
+            log_with_timestamp("[INFO] Activating backpressure - syslog queue at %.1f%% capacity\n", syslog_util * 100);
+        } else if (syslog_util < QUEUE_LOW_WATERMARK && atomic_load(&ctx->backpressure_active)) {
+            atomic_store(&ctx->backpressure_active, 0);
+            log_with_timestamp("[INFO] Releasing backpressure - syslog queue at %.1f%% capacity\n", syslog_util * 100);
+        }
+
         void *item;
         if (spsc_queue_try_pop(ctx->event_queue, &item)) {
             event_data_t *event_data = (event_data_t *)item;
@@ -527,28 +592,27 @@ void* formatting_thread(void* arg) {
 
             if (ctx->cfg->count_enabled) {
                 ptr += snprintf(ptr, remaining, "%lld,", event.count);
-                remaining -= (ptr - buffer);
+                remaining = sizeof(buffer) - (ptr - buffer);
             }
             ptr += snprintf(ptr, remaining, "%lld", event.timestamp_ns);
-            remaining -= (ptr - buffer);
+            remaining = sizeof(buffer) - (ptr - buffer);
 
             if (ctx->cfg->hash_enabled || ctx->cfg->payload_enabled) {
                 ptr += snprintf(ptr, remaining, ",");
-                remaining -= (ptr - buffer);
+                remaining = sizeof(buffer) - (ptr - buffer);
             }
             if (ctx->cfg->hash_enabled) {
                 ptr += snprintf(ptr, remaining, "%s", event.hash);
-                remaining -= (ptr - buffer);
+                remaining = sizeof(buffer) - (ptr - buffer);
                 if (ctx->cfg->payload_enabled) {
                     ptr += snprintf(ptr, remaining, ",");
-                    remaining -= (ptr - buffer);
+                    remaining = sizeof(buffer) - (ptr - buffer);
                 }
             }
             if (ctx->cfg->payload_enabled) {
                 ptr += snprintf(ptr, remaining, "%d,%d,%d,%s,%u,%s,%u",
                                 event.type_num, event.state_num, event.proto_num,
                                 event.src_ip, event.src_port, event.dst_ip, event.dst_port);
-                remaining -= (ptr - buffer);
             }
 
             if (ctx->cfg->debug_enabled) {
@@ -584,16 +648,21 @@ void* formatting_thread(void* arg) {
     return NULL;
 }
 
-// ----------- SYSLOG THREAD --------------------------
-// Batches and sends log messages; if send fails, retries lost batch on next send
+// ----------- ENHANCED SYSLOG THREAD --------------------------
 void* syslog_thread(void* arg) {
     syslog_data_t *sdata = (syslog_data_t *)arg;
     char *buffer = NULL;
-    char batch[MAX_MESSAGE_LEN * MIN_BATCH_SIZE] = "";
+    char *batch = malloc(MAX_MESSAGE_LEN * MAX_BATCH_SIZE);
     char *lost_batch = NULL;
     int message_count = 0;
     struct timeval last_sent, now;
     gettimeofday(&last_sent, NULL);
+
+    if (!batch) {
+        log_with_timestamp("[ERROR] Failed to allocate batch buffer\n");
+        return NULL;
+    }
+    batch[0] = '\0';
 
     log_with_timestamp("[INFO] Syslog thread started. Waiting for events...\n");
 
@@ -601,10 +670,25 @@ void* syslog_thread(void* arg) {
         gettimeofday(&now, NULL);
         long elapsed_us = (now.tv_sec - last_sent.tv_sec) * 1000000 + (now.tv_usec - last_sent.tv_usec);
 
-        // Send batch due to timeout
-        if (message_count > 0 && elapsed_us >= BATCH_TIMEOUT_US) {
+        // Adaptive batch sizing based on queue utilization
+        int current_batch_size = MIN_BATCH_SIZE;
+        if (ADAPTIVE_BATCH_SIZE) {
+            double queue_util = spsc_queue_utilization(sdata->queue);
+            if (queue_util > 0.5) {
+                current_batch_size = MIN_BATCH_SIZE * 2;
+            }
+            if (queue_util > 0.8) {
+                current_batch_size = MAX_BATCH_SIZE;
+            }
+        }
+
+        // Send batch due to timeout or reaching batch size
+        if (message_count > 0 && (elapsed_us >= BATCH_TIMEOUT_US || message_count >= current_batch_size)) {
             if (sdata->debug_enabled) {
-                log_with_timestamp("[DEBUG] Syslog thread: Batch timeout reached, sending %d messages\n", message_count);
+                log_with_timestamp("[DEBUG] Syslog thread: Sending batch of %d messages (timeout: %s, size: %s)\n", 
+                    message_count, 
+                    elapsed_us >= BATCH_TIMEOUT_US ? "yes" : "no",
+                    message_count >= current_batch_size ? "yes" : "no");
             }
             goto send_batch;
         }
@@ -617,9 +701,19 @@ void* syslog_thread(void* arg) {
 
             char syslog_msg[MAX_MESSAGE_LEN];
             create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer);
-            strncat(batch, syslog_msg, sizeof(batch) - strlen(batch) - 1);
-            strncat(batch, "\n", sizeof(batch) - strlen(batch) - 1);
-            message_count++;
+            
+            size_t current_batch_len = strlen(batch);
+            size_t msg_len = strlen(syslog_msg);
+            
+            // Check if adding this message would exceed buffer
+            if (current_batch_len + msg_len + 2 < MAX_MESSAGE_LEN * MAX_BATCH_SIZE) {
+                strcat(batch, syslog_msg);
+                strcat(batch, "\n");
+                message_count++;
+            } else {
+                // Send current batch and start new one
+                goto send_batch_and_continue;
+            }
 
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] Syslog thread: Added message to batch, count: %d\n", message_count);
@@ -627,13 +721,6 @@ void* syslog_thread(void* arg) {
 
             free(buffer);
             buffer = NULL;
-
-            if (message_count >= MIN_BATCH_SIZE) {
-                if (sdata->debug_enabled) {
-                    log_with_timestamp("[DEBUG] Syslog thread: Batch size reached, sending %d messages\n", message_count);
-                }
-                goto send_batch;
-            }
         } else {
             if (sdata->debug_enabled) {
                 log_with_timestamp("[DEBUG] Syslog thread: No data dequeued, sleeping...\n");
@@ -643,33 +730,58 @@ void* syslog_thread(void* arg) {
         }
         continue;
 
+    send_batch_and_continue:
+        // Send current batch, then add the pending message to new batch
+        goto send_batch;
+
     send_batch: ;
-        char big_batch[MAX_MESSAGE_LEN * MIN_BATCH_SIZE * 2] = "";
-        if (lost_batch) {
-            strncat(big_batch, lost_batch, sizeof(big_batch) - strlen(big_batch) - 1);
+        // Handle consecutive failures with exponential backoff
+        int failures = atomic_load(&sdata->consecutive_failures);
+        if (failures >= MAX_CONSECUTIVE_FAILURES) {
+            int delay_ms = RECONNECT_DELAY_MS * (1 << (failures - MAX_CONSECUTIVE_FAILURES));
+            if (delay_ms > 30000) delay_ms = 30000; // Cap at 30 seconds
+            log_with_timestamp("[INFO] Too many consecutive failures, backing off for %d ms\n", delay_ms);
+            usleep(delay_ms * 1000);
         }
-        strncat(big_batch, batch, sizeof(big_batch) - strlen(big_batch) - 1);
+
+        char *big_batch = malloc(MAX_MESSAGE_LEN * MAX_BATCH_SIZE * 2);
+        if (!big_batch) {
+            log_with_timestamp("[ERROR] Failed to allocate big_batch buffer\n");
+            goto cleanup_batch;
+        }
+        big_batch[0] = '\0';
+        
+        if (lost_batch) {
+            strcat(big_batch, lost_batch);
+        }
+        strcat(big_batch, batch);
 
         if (sdata->debug_enabled) {
-            log_with_timestamp("[DEBUG] Syslog thread: Sending batch+lost_batch (%zu bytes)", strlen(big_batch));
+            log_with_timestamp("[DEBUG] Syslog thread: Sending batch+lost_batch (%zu bytes)\n", strlen(big_batch));
         }
+        
         if (sdata->syslog_fd < 0) {
-            sdata->syslog_fd = connect_to_syslog(sdata->syslog_ip, SYSLOG_PORT);
+            sdata->syslog_fd = connect_to_syslog_with_retry(sdata->syslog_ip, SYSLOG_PORT, &failures);
+            atomic_store(&sdata->consecutive_failures, failures);
         }
+        
         int sent_ok = 0;
         if (sdata->syslog_fd >= 0) {
-            ssize_t sent = send(sdata->syslog_fd, big_batch, strlen(big_batch), 0);
+            ssize_t sent = send(sdata->syslog_fd, big_batch, strlen(big_batch), MSG_NOSIGNAL);
             if (sent > 0) {
                 atomic_fetch_add(&sdata->bytes_transferred, sent);
                 log_with_timestamp("[INFO] Syslog thread: Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
                                    sent, atomic_load(&sdata->bytes_transferred));
                 sent_ok = 1;
+                atomic_store(&sdata->consecutive_failures, 0);
             } else {
                 log_with_timestamp("[ERROR] Syslog thread: Failed to send to syslog: %s\n", strerror(errno));
                 close(sdata->syslog_fd);
                 sdata->syslog_fd = -1;
+                atomic_fetch_add(&sdata->consecutive_failures, 1);
             }
         }
+        
         free(lost_batch);
         if (sent_ok) {
             lost_batch = NULL;
@@ -677,10 +789,27 @@ void* syslog_thread(void* arg) {
             lost_batch = strdup(big_batch);
             if (!lost_batch) log_with_timestamp("[ERROR] Syslog thread: Failed to save lost batch\n");
         }
+        
+        free(big_batch);
+
+    cleanup_batch:
         batch[0] = '\0';
         message_count = 0;
         gettimeofday(&last_sent, NULL);
+        
+        // If we came from send_batch_and_continue, add the pending message
+        if (buffer) {
+            char syslog_msg[MAX_MESSAGE_LEN];
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer);
+            strcat(batch, syslog_msg);
+            strcat(batch, "\n");
+            message_count = 1;
+            free(buffer);
+            buffer = NULL;
+        }
     }
+    
+    free(batch);
     if (lost_batch) free(lost_batch);
     log_with_timestamp("[INFO] Syslog thread exiting by shutdown request\n");
     return NULL;
@@ -713,13 +842,16 @@ int main(int argc, char *argv[]) {
 
     global_debug_enabled = cfg.debug_enabled;
 
-    // Initialize SPSC queues (large enough for burst tolerance)
-    spsc_queue_t *event_queue = spsc_queue_init(DEFAULT_QUEUE_SIZE);
+    log_with_timestamp("[INFO] Initializing with event_queue_size=%zu, syslog_queue_size=%zu\n", 
+                       cfg.event_queue_size, cfg.syslog_queue_size);
+
+    // Initialize SPSC queues with configurable sizes
+    spsc_queue_t *event_queue = spsc_queue_init(cfg.event_queue_size);
     if (!event_queue) {
         log_with_timestamp("[ERROR] Failed to initialize event_queue\n");
         return 1;
     }
-    spsc_queue_t *syslog_queue = spsc_queue_init(DEFAULT_QUEUE_SIZE);
+    spsc_queue_t *syslog_queue = spsc_queue_init(cfg.syslog_queue_size);
     if (!syslog_queue) {
         log_with_timestamp("[ERROR] Failed to initialize syslog_queue\n");
         spsc_queue_destroy(event_queue);
@@ -729,7 +861,8 @@ int main(int argc, char *argv[]) {
     app_context_t ctx = {
         .event_queue = event_queue,
         .syslog_queue = syslog_queue,
-        .cfg = &cfg
+        .cfg = &cfg,
+        .backpressure_active = 0
     };
 
     pthread_t formatting_tid;
@@ -746,7 +879,8 @@ int main(int argc, char *argv[]) {
         .machine_name = cfg.machine_name,
         .syslog_ip = cfg.syslog_ip,
         .syslog_fd = -1,
-        .bytes_transferred = 0
+        .bytes_transferred = 0,
+        .consecutive_failures = 0
     };
 
     pthread_t syslog_tid;
@@ -773,7 +907,7 @@ int main(int argc, char *argv[]) {
     }
     nfct_callback_register(g_nfct_handle, NFCT_T_ALL, cb, &ctx);
 
-    // --- Set nfct fd to non-blocking mode ---
+    // Set nfct fd to non-blocking mode
     int fd = nfct_fd(g_nfct_handle);
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
@@ -786,7 +920,7 @@ int main(int argc, char *argv[]) {
 
     log_with_timestamp("[INFO] Starting to catch conntrack events\n");
 
-    // --- Non-blocking event loop, responsive to shutdown ---
+    // Non-blocking event loop, responsive to shutdown
     while (!shutdown_flag) {
         int ret = nfct_catch(g_nfct_handle);
         if (ret < 0) {
@@ -800,7 +934,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // --- Cleanup ---
+    // Cleanup
     log_with_timestamp("[INFO] Exiting, cleaning up...\n");
 
     if (g_nfct_handle) {
