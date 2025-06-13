@@ -161,6 +161,39 @@ def check_function():
         
         if client: client.close()
 
+    # Chrony service management (added to check time synchronization)
+    print(colored("[check] Step: Chrony Service Management", BOLD))
+    for host in logger_hosts:
+        client = ssh_connector.connect(host)
+        tag = f"[{host} ssh]" if client else f"[{host} localhost]"
+        
+        cmd_check_status = "sudo systemctl is-active chrony"
+        if client is None:
+            status, output, err = run_command_locally(cmd_check_status, tag)
+        else:
+            status, output, err = run_command_remotely(client, cmd_check_status, tag)
+        
+        if status and "active" in output.strip():
+            print(colored(f"{tag} chrony service is already active.", GREEN))
+        else:
+            print(colored(f"{tag} chrony service is not active. Starting it...", YELLOW))
+            
+            cmd_start = "sudo systemctl start chrony"
+            if client is None:
+                start_status, start_output, start_err = run_command_locally(cmd_start, tag)
+            else:
+                start_status, start_output, start_err = run_command_remotely(client, cmd_start, tag)
+            
+            if not start_status:
+                print(colored(f"{tag} Failed to start chrony service!", RED))
+                if client: client.close()
+                return 10
+            
+            time.sleep(3)
+            print(colored(f"{tag} chrony service started successfully.", GREEN))
+        
+        if client: client.close()
+
     # Truncate logs
     print(colored("[check] Step: Truncate Logs", BOLD))
     ssh_convsrc2 = ssh_connector.connect("convsrc2")
@@ -221,11 +254,10 @@ def check_function():
 
     print(colored("[check] All services active and conntrack tables flushed.", GREEN))
 
-    # Log monitoring
+    # Log monitoring (removed PTP monitoring completely)
     print(colored("[check] Step: Log Monitoring", BOLD))
     
     conntrack_stop_event = threading.Event()
-    ptp_stop_event = threading.Event()
     monitor_results = {}
 
     conntrack_monitor_thread = threading.Thread(
@@ -243,7 +275,6 @@ def check_function():
 
     print(colored("[check] Started log monitors.", CYAN))
     conntrack_monitor_thread.start()
-    ptp_monitor_thread.start()
 
     print(colored("[check] Step: Start Client Threads", BOLD))
     client_threads = get_client_threads(10, 1, 1)
@@ -256,17 +287,15 @@ def check_function():
     print(colored("[check] All client threads completed.", CYAN))
 
     conntrack_monitor_thread.join()
-    ptp_monitor_thread.join()
 
     conntrack_matches = monitor_results.get("conntrack-monitor", 0)
-    ptp_matches = monitor_results.get("ptp-monitor", 0)
-    total_matches = conntrack_matches + ptp_matches
+    total_matches = conntrack_matches
 
     print(f"[check] Total matches: {total_matches}")
 
-    if total_matches == 4:
+    if total_matches == 2:
         print(colored("[check] MATCH found! Proceeding...", GREEN))
-        return 4
+        return 2
     else:
         print(colored("[check] Required matches not found!", RED))
         return 0
@@ -303,7 +332,7 @@ def pre_experimentation(experiment_name, concurrency, iteration):
     CAlog = f"/tmp/CA.log"
     log_configs = [
         ("connt1", f"sudo ./start.sh -i {iteration} -l /var/log/exp/{experiment_name}{concurrency}/{iteration} -p conntrackd --iface enp3s0 -d", "start.sh", "/opt/MasterThesis/CMNpsutil/", True),
-        ("convsrc2", f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o /var/log/exp/{experiment_name}{concurrency}/{iteration}_ca.csv -d -D -L {CAlog}", "conntrackAnalysis.py", "/opt/MasterThesis/connectiontrackingAnalysis/", True),
+        ("convsrc2", f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o /var/log/exp/{experiment_name}{concurrency}/{iteration}_ca.csv -d -D -L {CAlog}", "conntrackAnalysis.py", "/opt/MasterThesis/connectiontrackingAnalysis/", True)
     ]
     
     print("[pre-exp] Setting up logging scripts")
@@ -502,7 +531,7 @@ def main():
                 print(f"\nEXPERIMENT {current_experiment}/{total_experiments}: {experiment_name} - Concurrency {c} - Iteration {iteration_number}")
                 
                 check_result = check_function()
-                if check_result != 4:
+                if check_result != 2:
                     raise Exception("check_function failed")
                     
                 if not pre_experimentation(experiment_name, c, iteration_number):
