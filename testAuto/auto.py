@@ -240,18 +240,6 @@ def check_function():
         ),
         name="conntrack-monitor"
     )
-    ptp_monitor_thread = threading.Thread(
-        target=monitor_log_file_watchdog,
-        kwargs=dict(
-            filepath="/var/log/ptp.log",
-            keyword_expr="'connt1' 'connt2'",
-            timeout=120,
-            print_output=False,
-            result_dict=monitor_results,
-            stop_event=ptp_stop_event,
-        ),
-        name="ptp-monitor"
-    )
 
     print(colored("[check] Started log monitors.", CYAN))
     conntrack_monitor_thread.start()
