@@ -425,52 +425,34 @@ class StatisticsCollector:
 
 def create_flexible_keys(entry):
     """
-    Create multiple matching keys for more flexible matching.
-    Returns a list of keys to try for matching.
+    Create a single hash-based key for matching.
+    Returns a list with only the hash-based key.
     """
-    base_key = (entry['type_num'], entry['state_num'], entry['proto_num'], 
-                entry['srcip'], entry['srcport'], entry['dstip'], entry['dstport'])
-    
-    # Different key variations for flexible matching
-    keys = [
-        # Original key with hash
-        (entry['hash'], entry['type_num'], entry['state_num'], entry['proto_num'], 
-         entry['srcip'], entry['srcport'], entry['dstip'], entry['dstport']),
-        
-        # Key without hash (in case hash differs between devices)
-        base_key,
-        
-        # Key with reversed src/dst (in case of bidirectional flows)
-        (entry['type_num'], entry['state_num'], entry['proto_num'], 
-         entry['dstip'], entry['dstport'], entry['srcip'], entry['srcport']),
-        
-        # Key with only connection tuple (ignoring type/state differences)
-        (entry['proto_num'], entry['srcip'], entry['srcport'], entry['dstip'], entry['dstport']),
-        
-        # Key with reversed connection tuple
-        (entry['proto_num'], entry['dstip'], entry['dstport'], entry['srcip'], entry['srcport'])
-    ]
-    
-    return keys
+    # Only use hash-based key
+    return [(entry['hash'], entry['type_num'], entry['state_num'], entry['proto_num'], 
+             entry['srcip'], entry['srcport'], entry['dstip'], entry['dstport'])]
 
 def find_best_match(entry, candidates, time_tolerance_ns=1000000000):  # 1 second tolerance
     """
-    Find the best matching candidate based on timestamp proximity.
+    Find the best matching candidate where candidate's timestamp is greater than entry's timestamp.
+    Only matches where conn2_time - conn1_time > 0
     """
     best_match = None
     best_time_diff = float('inf')
     
     for candidate in candidates:
-        time_diff = abs(entry['timestamp_nano'] - candidate['timestamp_nano'])
-        if time_diff < best_time_diff and time_diff <= time_tolerance_ns:
+        # Only consider matches where conn2_time > conn1_time (positive difference)
+        time_diff = candidate['timestamp_nano'] - entry['timestamp_nano']
+        if time_diff > 0 and time_diff < best_time_diff and time_diff <= time_tolerance_ns:
             best_match = candidate
             best_time_diff = time_diff
     
-    return best_match, best_time_diff
+    return best_match, best_time_diff if best_match else 0
 
 def process_entry(entry, device_a, device_b, dict_a, dict_b, writer, stats_collector, debug_mode):
     """
     Process a single log entry, checking for matches and writing results.
+    Only match from device A (conn1) to device B (conn2).
     """
     D = entry['device']
     if D not in [device_a, device_b]:
@@ -479,49 +461,50 @@ def process_entry(entry, device_a, device_b, dict_a, dict_b, writer, stats_colle
     # Count this packet
     stats_collector.add_packet_processed(D)
     
-    # Determine which dictionaries to use
+    # Only process matching when the entry is from device A (conn1)
     if D == device_a:
-        self_dict = dict_a
-        other_dict = dict_b
-        other_D = device_b
-    else:
-        self_dict = dict_b
-        other_dict = dict_a
-        other_D = device_a
-    
-    # Try multiple matching strategies
-    matched = False
-    flexible_keys = create_flexible_keys(entry)
-    
-    for key_idx, K in enumerate(flexible_keys):
-        if K in other_dict and other_dict[K]:
-            # Find best match based on timestamp
-            best_match, time_diff = find_best_match(entry, other_dict[K])
-            if best_match:
-                diff_nano = entry['timestamp_nano'] - best_match['timestamp_nano']
-                debug_str = f"{D} ({entry['payload']}) -> {other_D} ({best_match['payload']}) [key_type:{key_idx}]" if debug_mode else ''
-                writer.writerow([diff_nano, entry['proto_num'], entry['state_num'], debug_str])
-                
-                # Update statistics - count as one match pair
-                stats_collector.update_stats(matches_found=1)
-                stats_collector.add_matched_pair(entry, best_match)
-                
-                logging.debug(f"Match found (key_type {key_idx}): {D} ({entry['payload']}) -> {other_D} ({best_match['payload']}) (matched)")
-                other_dict[K].remove(best_match)
-                matched = True
-                break
-    
-    if not matched:
-        # Store with all flexible keys for later matching
-        for K in flexible_keys:
-            self_dict[K].append(entry)
+        # Create hash-based key only
+        flexible_keys = create_flexible_keys(entry)
+        matched = False
         
-        # This will be counted as unmatched later if no match is found
-        stats_collector.add_unmatched_entry(entry, D)
+        for key_idx, K in enumerate(flexible_keys):
+            if K in dict_b and dict_b[K]:
+                # Find best match where conn2_time - conn1_time > 0
+                best_match, time_diff = find_best_match(entry, dict_b[K])
+                if best_match:
+                    # Calculate positive time difference (conn2 - conn1)
+                    diff_nano = best_match['timestamp_nano'] - entry['timestamp_nano']
+                    # Maintain original debug format
+                    debug_str = f"{D} ({entry['payload']}) -> {device_b} ({best_match['payload']}) [key_type:{key_idx}]" if debug_mode else ''
+                    writer.writerow([diff_nano, entry['proto_num'], entry['state_num'], debug_str])
+                    
+                    # Update statistics - count as one match pair
+                    stats_collector.update_stats(matches_found=1)
+                    stats_collector.add_matched_pair(entry, best_match)
+                    
+                    logging.debug(f"Match found (key_type {key_idx}): {D} ({entry['payload']}) -> {device_b} ({best_match['payload']}) (matched)")
+                    dict_b[K].remove(best_match)
+                    matched = True
+                    break
+        
+        if not matched:
+            # Store only in device A dictionary for later matching by device B entries
+            for K in flexible_keys:
+                dict_a[K].append(entry)
+            
+            # This will be counted as unmatched later if no match is found
+            stats_collector.add_unmatched_entry(entry, D)
+    else:
+        # This is a device B (conn2) entry
+        # Only store it for potential matching with device A entries
+        flexible_keys = create_flexible_keys(entry)
+        for K in flexible_keys:
+            dict_b[K].append(entry)
 
 def second_pass_matching(dict_a, dict_b, device_a, device_b, writer, stats_collector, debug_mode):
     """
     Perform a second pass to match previously unmatched entries with more relaxed criteria.
+    Only match from device A (conn1) to device B (conn2) with positive time difference.
     """
     logging.info("Starting second pass matching for unmatched entries...")
     
@@ -556,6 +539,7 @@ def second_pass_matching(dict_a, dict_b, device_a, device_b, writer, stats_colle
     matched_indices_a = set()
     matched_indices_b = set()
     
+    # Only match from device A to device B with positive time difference
     for i, entry_a in enumerate(unmatched_a):
         if i in matched_indices_a:
             continue
@@ -564,34 +548,31 @@ def second_pass_matching(dict_a, dict_b, device_a, device_b, writer, stats_colle
             if j in matched_indices_b:
                 continue
                 
+            # Only consider matches where conn2_time > conn1_time (positive difference)
+            time_diff = entry_b['timestamp_nano'] - entry_a['timestamp_nano']
+            
             # Check if they could be a match with relaxed criteria
-            if (entry_a['proto_num'] == entry_b['proto_num'] and
-                entry_a['state_num'] == entry_b['state_num'] and
-                abs(entry_a['timestamp_nano'] - entry_b['timestamp_nano']) <= time_tolerance_ns):
+            if (time_diff > 0 and
+                time_diff <= time_tolerance_ns and
+                entry_a['proto_num'] == entry_b['proto_num'] and
+                entry_a['hash'] == entry_b['hash']):
                 
-                # Check if it's the same connection (either direction)
-                same_connection = (
-                    (entry_a['srcip'] == entry_b['srcip'] and entry_a['srcport'] == entry_b['srcport'] and
-                     entry_a['dstip'] == entry_b['dstip'] and entry_a['dstport'] == entry_b['dstport']) or
-                    (entry_a['srcip'] == entry_b['dstip'] and entry_a['srcport'] == entry_b['dstport'] and
-                     entry_a['dstip'] == entry_b['srcip'] and entry_a['dstport'] == entry_b['srcport'])
-                )
+                # Write the positive time difference
+                diff_nano = entry_b['timestamp_nano'] - entry_a['timestamp_nano']
+                # Maintain original debug format
+                debug_str = f"{device_a} ({entry_a['payload']}) -> {device_b} ({entry_b['payload']}) [second_pass]" if debug_mode else ''
+                writer.writerow([diff_nano, entry_a['proto_num'], entry_a['state_num'], debug_str])
                 
-                if same_connection:
-                    diff_nano = entry_a['timestamp_nano'] - entry_b['timestamp_nano']
-                    debug_str = f"{device_a} ({entry_a['payload']}) -> {device_b} ({entry_b['payload']}) [second_pass]" if debug_mode else ''
-                    writer.writerow([diff_nano, entry_a['proto_num'], entry_a['state_num'], debug_str])
-                    
-                    second_pass_matches += 1
-                    matched_indices_a.add(i)
-                    matched_indices_b.add(j)
-                    
-                    # Update statistics - count as one match pair
-                    stats_collector.update_stats(matches_found=1, second_pass_matches=1)
-                    stats_collector.add_matched_pair(entry_a, entry_b)
-                    
-                    logging.debug(f"Second pass match: {device_a} ({entry_a['payload']}) -> {device_b} ({entry_b['payload']})")
-                    break
+                second_pass_matches += 1
+                matched_indices_a.add(i)
+                matched_indices_b.add(j)
+                
+                # Update statistics - count as one match pair
+                stats_collector.update_stats(matches_found=1, second_pass_matches=1)
+                stats_collector.add_matched_pair(entry_a, entry_b)
+                
+                logging.debug(f"Second pass match: {device_a} ({entry_a['payload']}) -> {device_b} ({entry_b['payload']})")
+                break
     
     logging.info(f"Second pass completed: {second_pass_matches} additional matches found")
     return second_pass_matches
