@@ -767,14 +767,12 @@ class ProgressTracker:
         elapsed = time.time() - self.start_time
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        print(f"\n{BOLD}{MAGENTA}╔═════════════════════════════════════════════════════════════════════════╗{RESET}")
-        print(f"{BOLD}{MAGENTA}║                    COMPREHENSIVE LOG GROWTH REPORT                    ║{RESET}")
+     
+        print(f"{BOLD}{MAGENTA} COMPREHENSIVE LOG GROWTH REPORT{RESET}")
         print(f"{BOLD}{MAGENTA}║ Time: {current_time} | Elapsed: {elapsed/60:.1f} minutes{' '*(35-len(current_time))}║{RESET}")
-        print(f"{BOLD}{MAGENTA}╠═════════════════════════════════════════════════════════════════════════╣{RESET}")
         
         if not self.file_stats:
             print(f"{MAGENTA}║{RESET} {RED}No log files being monitored!{RESET}")
-            print(f"{BOLD}{MAGENTA}╚═════════════════════════════════════════════════════════════════════════╝{RESET}")
             return
         
         total_size = 0
@@ -838,7 +836,7 @@ class ProgressTracker:
             
             print(f"{MAGENTA}║{RESET} {CYAN}{filename_display:30}{RESET} │ {BOLD}{size_str:>8}{RESET} │ {growth_color}{growth_str:>10}{RESET} │ Lines: {BLUE}{line_count:>6}{RESET} │ {YELLOW}{update_status:>8}{RESET} ║")
         
-        print(f"{BOLD}{MAGENTA}╠═════════════════════════════════════════════════════════════════════════╣{RESET}")
+
         
         # Summary
         total_size_str = f"{total_size/(1024*1024):.1f}MB" if total_size > 1024*1024 else f"{total_size/1024:.1f}KB"
@@ -847,7 +845,6 @@ class ProgressTracker:
         avg_rate_str = f"{avg_rate:.1f}KB/s" if avg_rate >= 1 else f"{avg_rate*1000:.0f}B/s"
         
         print(f"{MAGENTA}║{RESET} {BOLD}TOTAL:{' '*24}{RESET} │ {BOLD}{GREEN}{total_size_str:>8}{RESET} │ {BOLD}{GREEN}{total_growth_str:>10}{RESET} │ Lines: {BOLD}{BLUE}{total_lines:>6}{RESET} │ {BOLD}{CYAN}{avg_rate_str:>8}{RESET} ║")
-        print(f"{BOLD}{MAGENTA}╚═════════════════════════════════════════════════════════════════════════╝{RESET}")
 
 # Global progress tracker
 progress_tracker = ProgressTracker()
