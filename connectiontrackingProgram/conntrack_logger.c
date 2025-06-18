@@ -1,14 +1,16 @@
 /*
- * Improved conntrack logger with better queue handling and flow control
+ * Improved conntrack logger with test mode for measuring event processing times
  * 
  * Key improvements:
- * - Dynamic backpressure mechanism to slow down event generation when queues are full
+ * - Added --test mode to measure event arrival and processing times
+ * - Immediate event capture with precise timing measurements
+ * - Statistics collection for performance analysis
  * - Larger queue sizes and configurable queue sizes
  * - Better error handling and retry logic for syslog connections
  * - Batch size optimization based on queue load
  * - Connection pooling for syslog to reduce connection overhead
  * 
- * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger_improved conntrack_logger_improved.c
+ * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger_test conntrack_logger_test_mode.c
  */
 
 #include <stdio.h>
@@ -31,29 +33,42 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <blake3.h>
+#include <limits.h>
 
-// ----------- IMPROVED CONFIGURABLE CONSTANTS -----------------
-#define DEFAULT_EVENT_QUEUE_SIZE 200000    // Increased from 20480 to handle bursts better
-#define DEFAULT_SYSLOG_QUEUE_SIZE 200000   // Separate sizing for syslog queue
-#define MIN_BATCH_SIZE 50                 // Increased from 10 for better efficiency
-#define MAX_BATCH_SIZE 500                // Maximum batch size to prevent oversized sends
-#define ADAPTIVE_BATCH_SIZE 1             // Enable adaptive batching
+// ----------- CONFIGURABLE CONSTANTS -----------------
+#define DEFAULT_EVENT_QUEUE_SIZE 200000
+#define DEFAULT_SYSLOG_QUEUE_SIZE 200000
+#define MIN_BATCH_SIZE 50
+#define MAX_BATCH_SIZE 500
+#define ADAPTIVE_BATCH_SIZE 1
 #define MAX_MESSAGE_LEN 1024
-#define BATCH_TIMEOUT_US 500000           // Reduced from 1s to 500ms for better responsiveness
+#define BATCH_TIMEOUT_US 500000
 #define SYSLOG_PORT "514"
 #define LOGFILE_PATH "/var/log/conntrack_logger.log"
-#define MAX_CONSECUTIVE_FAILURES 5       // Max failures before exponential backoff
-#define RECONNECT_DELAY_MS 1000          // Base delay for reconnection attempts
-#define QUEUE_HIGH_WATERMARK 0.8         // Trigger backpressure at 80% full
-#define QUEUE_LOW_WATERMARK 0.3          // Release backpressure at 30% full
+#define MAX_CONSECUTIVE_FAILURES 5
+#define RECONNECT_DELAY_MS 1000
 
-// ----------- ENHANCED SPSC QUEUE IMPLEMENTATION -------------
+// ----------- TEST MODE STATISTICS -------------------
+typedef struct {
+    atomic_llong total_events;
+    atomic_llong min_arrival_to_format_ns;
+    atomic_llong max_arrival_to_format_ns;
+    atomic_llong sum_arrival_to_format_ns;
+    atomic_llong min_arrival_to_syslog_ns;
+    atomic_llong max_arrival_to_syslog_ns;
+    atomic_llong sum_arrival_to_syslog_ns;
+    atomic_llong total_processed_events;
+    atomic_llong total_sent_events;
+    struct timespec start_time;
+} test_stats_t;
+
+// ----------- SPSC QUEUE IMPLEMENTATION -------------
 typedef struct {
     void **items;
     size_t head;
     size_t tail;
     size_t capacity;
-    atomic_size_t count;  // Track current queue size for load monitoring
+    atomic_size_t count;
 } spsc_queue_t;
 
 // Create a new SPSC queue with given capacity
@@ -61,7 +76,10 @@ spsc_queue_t* spsc_queue_init(size_t capacity) {
     spsc_queue_t *q = malloc(sizeof(spsc_queue_t));
     if (!q) return NULL;
     q->items = malloc(sizeof(void*) * capacity);
-    if (!q->items) { free(q); return NULL; }
+    if (!q->items) {
+        free(q);
+        return NULL;
+    }
     q->head = 0;
     q->tail = 0;
     q->capacity = capacity;
@@ -113,6 +131,7 @@ typedef struct {
     char *src_range;
     size_t event_queue_size;
     size_t syslog_queue_size;
+    int test_mode;  // New test mode flag
 } config_t;
 
 // ----------- EVENT STRUCTURES -----------------------
@@ -121,6 +140,7 @@ typedef struct {
     struct nf_conntrack *ct;
     enum nf_conntrack_msg_type type;
     long long count;
+    struct timespec arrival_ts;  // Exact arrival time for test mode
 } event_data_t;
 
 typedef struct {
@@ -139,6 +159,7 @@ typedef struct {
     int type_num;
     int state_num;
     int proto_num;
+    struct timespec arrival_ts;  // Pass through for test mode
 } conn_event_t;
 
 // ----------- APPLICATION CONTEXT --------------------
@@ -146,7 +167,7 @@ typedef struct {
     spsc_queue_t *event_queue;
     spsc_queue_t *syslog_queue;
     config_t *cfg;
-    atomic_int backpressure_active;  // Backpressure control
+    test_stats_t *test_stats;  // Test statistics
 } app_context_t;
 
 typedef struct {
@@ -158,6 +179,8 @@ typedef struct {
     atomic_size_t bytes_transferred;
     atomic_int consecutive_failures;
     struct timespec last_failure_time;
+    test_stats_t *test_stats;  // Reference to test statistics
+    int test_mode;
 } syslog_data_t;
 
 // ----------- GLOBALS --------------------------------
@@ -167,6 +190,110 @@ volatile sig_atomic_t shutdown_flag = 0;
 struct nfct_handle *g_nfct_handle = NULL;
 static atomic_int event_overflow_reported = 0;
 static atomic_int syslog_overflow_reported = 0;
+static test_stats_t global_test_stats = {0};
+
+// ----------- TEST STATISTICS FUNCTIONS --------------
+void init_test_stats(test_stats_t *stats) {
+    atomic_store(&stats->total_events, 0);
+    atomic_store(&stats->min_arrival_to_format_ns, LLONG_MAX);
+    atomic_store(&stats->max_arrival_to_format_ns, 0);
+    atomic_store(&stats->sum_arrival_to_format_ns, 0);
+    atomic_store(&stats->min_arrival_to_syslog_ns, LLONG_MAX);
+    atomic_store(&stats->max_arrival_to_syslog_ns, 0);
+    atomic_store(&stats->sum_arrival_to_syslog_ns, 0);
+    atomic_store(&stats->total_processed_events, 0);
+    atomic_store(&stats->total_sent_events, 0);
+    clock_gettime(CLOCK_REALTIME, &stats->start_time);
+}
+
+void update_format_timing(test_stats_t *stats, long long diff_ns) {
+    atomic_fetch_add(&stats->total_processed_events, 1);
+    atomic_fetch_add(&stats->sum_arrival_to_format_ns, diff_ns);
+    
+    // Update min
+    long long current_min = atomic_load(&stats->min_arrival_to_format_ns);
+    while (diff_ns < current_min) {
+        if (atomic_compare_exchange_weak(&stats->min_arrival_to_format_ns, &current_min, diff_ns)) {
+            break;
+        }
+    }
+    
+    // Update max
+    long long current_max = atomic_load(&stats->max_arrival_to_format_ns);
+    while (diff_ns > current_max) {
+        if (atomic_compare_exchange_weak(&stats->max_arrival_to_format_ns, &current_max, diff_ns)) {
+            break;
+        }
+    }
+}
+
+void update_syslog_timing(test_stats_t *stats, long long diff_ns) {
+    atomic_fetch_add(&stats->total_sent_events, 1);
+    atomic_fetch_add(&stats->sum_arrival_to_syslog_ns, diff_ns);
+    
+    // Update min
+    long long current_min = atomic_load(&stats->min_arrival_to_syslog_ns);
+    while (diff_ns < current_min) {
+        if (atomic_compare_exchange_weak(&stats->min_arrival_to_syslog_ns, &current_min, diff_ns)) {
+            break;
+        }
+    }
+    
+    // Update max
+    long long current_max = atomic_load(&stats->max_arrival_to_syslog_ns);
+    while (diff_ns > current_max) {
+        if (atomic_compare_exchange_weak(&stats->max_arrival_to_syslog_ns, &current_max, diff_ns)) {
+            break;
+        }
+    }
+}
+
+void print_test_stats(test_stats_t *stats) {
+    struct timespec end_time;
+    clock_gettime(CLOCK_REALTIME, &end_time);
+    
+    long long total_runtime_ns = (long long)(end_time.tv_sec - stats->start_time.tv_sec) * 1000000000LL +
+                                (end_time.tv_nsec - stats->start_time.tv_nsec);
+    
+    long long total_events = atomic_load(&stats->total_events);
+    long long processed_events = atomic_load(&stats->total_processed_events);
+    long long sent_events = atomic_load(&stats->total_sent_events);
+    
+    printf("\n=== TEST MODE STATISTICS ===\n");
+    printf("Runtime: %.3f seconds\n", total_runtime_ns / 1000000000.0);
+    printf("Total events received: %lld\n", total_events);
+    printf("Total events processed: %lld\n", processed_events);
+    printf("Total events sent: %lld\n", sent_events);
+    
+    if (total_runtime_ns > 0) {
+        printf("Event rate: %.2f events/second\n", (double)total_events * 1000000000.0 / total_runtime_ns);
+    }
+    
+    if (processed_events > 0) {
+        long long sum_format = atomic_load(&stats->sum_arrival_to_format_ns);
+        long long min_format = atomic_load(&stats->min_arrival_to_format_ns);
+        long long max_format = atomic_load(&stats->max_arrival_to_format_ns);
+        
+        printf("\nArrival to Formatting Times:\n");
+        printf("  Min: %lld ns (%.3f µs)\n", min_format, min_format / 1000.0);
+        printf("  Max: %lld ns (%.3f µs)\n", max_format, max_format / 1000.0);
+        printf("  Avg: %lld ns (%.3f µs)\n", sum_format / processed_events, 
+               (sum_format / processed_events) / 1000.0);
+    }
+    
+    if (sent_events > 0) {
+        long long sum_syslog = atomic_load(&stats->sum_arrival_to_syslog_ns);
+        long long min_syslog = atomic_load(&stats->min_arrival_to_syslog_ns);
+        long long max_syslog = atomic_load(&stats->max_arrival_to_syslog_ns);
+        
+        printf("\nArrival to Syslog Times:\n");
+        printf("  Min: %lld ns (%.3f µs)\n", min_syslog, min_syslog / 1000.0);
+        printf("  Max: %lld ns (%.3f µs)\n", max_syslog, max_syslog / 1000.0);
+        printf("  Avg: %lld ns (%.3f µs)\n", sum_syslog / sent_events,
+               (sum_syslog / sent_events) / 1000.0);
+    }
+    printf("============================\n\n");
+}
 
 // ----------- LOGGING --------------------------------
 void log_with_timestamp(const char *fmt, ...) {
@@ -214,9 +341,10 @@ static void print_help(const char *progname) {
     printf("  -H, --hash                Include BLAKE3 hash in log messages\n");
     printf("  -P, --payload             Include detailed payload tuple\n");
     printf("  -r, --src-range <range>   Filter events by source IP range (CIDR, e.g., 192.168.1.0/24)\n");
+    printf("  -T, --test                Enable test mode for performance measurement\n");
     printf("  --event-queue-size <size> Event queue size (default: %d)\n", DEFAULT_EVENT_QUEUE_SIZE);
     printf("  --syslog-queue-size <size> Syslog queue size (default: %d)\n", DEFAULT_SYSLOG_QUEUE_SIZE);
-    printf("Note: At least one of -H or -P must be specified.\n");
+    printf("Note: At least one of -H or -P must be specified (unless in test mode).\n");
 }
 
 // ----------- ARGUMENT PARSING -----------------------
@@ -232,6 +360,7 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
         {"hash", no_argument, 0, 'H'},
         {"payload", no_argument, 0, 'P'},
         {"src-range", required_argument, 0, 'r'},
+        {"test", no_argument, 0, 'T'},
         {"event-queue-size", required_argument, 0, 1001},
         {"syslog-queue-size", required_argument, 0, 1002},
         {0, 0, 0, 0}
@@ -248,25 +377,53 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
     cfg->src_range = NULL;
     cfg->event_queue_size = DEFAULT_EVENT_QUEUE_SIZE;
     cfg->syslog_queue_size = DEFAULT_SYSLOG_QUEUE_SIZE;
+    cfg->test_mode = 0;
 
-    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DHPr:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hn:l:dkc:DHPr:T", long_options, NULL)) != -1) {
         switch (opt) {
-            case 'h': print_help(argv[0]); exit(0);
-            case 'n': cfg->machine_name = optarg; break;
-            case 'l': cfg->syslog_ip = optarg; break;
-            case 'd': cfg->daemonize = 1; break;
-            case 'k': cfg->kill_daemons = 1; break;
+            case 'h':
+                print_help(argv[0]);
+                exit(0);
+            case 'n':
+                cfg->machine_name = optarg;
+                break;
+            case 'l':
+                cfg->syslog_ip = optarg;
+                break;
+            case 'd':
+                cfg->daemonize = 1;
+                break;
+            case 'k':
+                cfg->kill_daemons = 1;
+                break;
             case 'c':
                 if (strcasecmp(optarg, "yes") == 0) cfg->count_enabled = 1;
                 else cfg->count_enabled = 0;
                 break;
-            case 'D': cfg->debug_enabled = 1; break;
-            case 'H': cfg->hash_enabled = 1; break;
-            case 'P': cfg->payload_enabled = 1; break;
-            case 'r': cfg->src_range = optarg; break;
-            case 1001: cfg->event_queue_size = atoi(optarg); break;
-            case 1002: cfg->syslog_queue_size = atoi(optarg); break;
-            default: print_help(argv[0]); return 1;
+            case 'D':
+                cfg->debug_enabled = 1;
+                break;
+            case 'H':
+                cfg->hash_enabled = 1;
+                break;
+            case 'P':
+                cfg->payload_enabled = 1;
+                break;
+            case 'r':
+                cfg->src_range = optarg;
+                break;
+            case 'T':
+                cfg->test_mode = 1;
+                break;
+            case 1001:
+                cfg->event_queue_size = atoi(optarg);
+                break;
+            case 1002:
+                cfg->syslog_queue_size = atoi(optarg);
+                break;
+            default:
+                print_help(argv[0]);
+                return 1;
         }
     }
 
@@ -276,8 +433,9 @@ static int parse_config(int argc, char *argv[], config_t *cfg) {
         return 1;
     }
 
-    if (!cfg->kill_daemons && !cfg->hash_enabled && !cfg->payload_enabled) {
-        log_with_timestamp("Error: At least one of -H or -P must be specified.\n");
+    // In test mode, we don't require -H or -P
+    if (!cfg->kill_daemons && !cfg->test_mode && !cfg->hash_enabled && !cfg->payload_enabled) {
+        log_with_timestamp("Error: At least one of -H or -P must be specified (unless in test mode).\n");
         print_help(argv[0]);
         return 1;
     }
@@ -360,10 +518,19 @@ static void calculate_hash(const char *input, char *output) {
 static void extract_conn_event(
     struct nf_conntrack *ct, enum nf_conntrack_msg_type type,
     conn_event_t *event, int count_enabled, int hash_enabled,
-    int payload_enabled, long long count, long long timestamp_ns
+    int payload_enabled, long long count, long long timestamp_ns,
+    struct timespec *arrival_ts
 ) {
     event->count = count_enabled ? count : 0;
     event->timestamp_ns = timestamp_ns;
+    
+    // Copy arrival timestamp for test mode
+    if (arrival_ts) {
+        event->arrival_ts = *arrival_ts;
+    } else {
+        event->arrival_ts.tv_sec = 0;
+        event->arrival_ts.tv_nsec = 0;
+    }
 
     struct in_addr src_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC) };
     struct in_addr dst_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_DST) };
@@ -394,10 +561,18 @@ static void extract_conn_event(
         else snprintf(event->protocol_str, sizeof(event->protocol_str), "proto %d", event->proto_num);
 
         switch (type) {
-            case NFCT_T_NEW:     strcpy(event->msg_type_str, "NEW");     break;
-            case NFCT_T_UPDATE:  strcpy(event->msg_type_str, "UPDATE");  break;
-            case NFCT_T_DESTROY: strcpy(event->msg_type_str, "DESTROY"); break;
-            default:             strcpy(event->msg_type_str, "UNKNOWN"); break;
+            case NFCT_T_NEW:
+                strcpy(event->msg_type_str, "NEW");
+                break;
+            case NFCT_T_UPDATE:
+                strcpy(event->msg_type_str, "UPDATE");
+                break;
+            case NFCT_T_DESTROY:
+                strcpy(event->msg_type_str, "DESTROY");
+                break;
+            default:
+                strcpy(event->msg_type_str, "UNKNOWN");
+                break;
         }
 
         if (event->state_num < 0 && event->proto_num == IPPROTO_TCP && nfct_attr_is_set(ct, ATTR_TCP_STATE)) {
@@ -405,16 +580,16 @@ static void extract_conn_event(
         }
         if (event->state_num >= 0) {
             switch (event->state_num) {
-                case 0: strcpy(event->state_str, "NONE"); break;
-                case 1: strcpy(event->state_str, "SYN_SENT"); break;
-                case 2: strcpy(event->state_str, "SYN_RECV"); break;
-                case 3: strcpy(event->state_str, "ESTABLISHED"); break;
-                case 4: strcpy(event->state_str, "FIN_WAIT"); break;
-                case 5: strcpy(event->state_str, "CLOSE_WAIT"); break;
-                case 6: strcpy(event->state_str, "LAST_ACK"); break;
-                case 7: strcpy(event->state_str, "TIME_WAIT"); break;
-                case 8: strcpy(event->state_str, "CLOSE"); break;
-                default: strcpy(event->state_str, "UNKNOWN"); break;
+                case 0:  strcpy(event->state_str, "NONE");       break;
+                case 1:  strcpy(event->state_str, "SYN_SENT");   break;
+                case 2:  strcpy(event->state_str, "SYN_RECV");   break;
+                case 3:  strcpy(event->state_str, "ESTABLISHED");break;
+                case 4:  strcpy(event->state_str, "FIN_WAIT");   break;
+                case 5:  strcpy(event->state_str, "CLOSE_WAIT"); break;
+                case 6:  strcpy(event->state_str, "LAST_ACK");   break;
+                case 7:  strcpy(event->state_str, "TIME_WAIT");  break;
+                case 8:  strcpy(event->state_str, "CLOSE");      break;
+                default: strcpy(event->state_str, "UNKNOWN");    break;
             }
         } else {
             strcpy(event->state_str, "N/A");
@@ -423,9 +598,11 @@ static void extract_conn_event(
 
     if (hash_enabled) {
         char hash_input[256];
-        snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%u,%s",
-                 event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
-                 event->src_port, event->dst_port, event->msg_type_str);
+        snprintf(
+            hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%u,%s",
+            event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
+            event->src_port, event->dst_port, event->msg_type_str
+        );
         calculate_hash(hash_input, event->hash);
     } else {
         event->hash[0] = '\0';
@@ -443,15 +620,11 @@ static void extract_conn_event(
 static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     app_context_t *ctx = (app_context_t *)data;
 
-    // Check backpressure - if active, drop some events to relieve pressure
-    if (atomic_load(&ctx->backpressure_active)) {
-        // Drop every other event during backpressure
-        static atomic_int drop_counter = 0;
-        if (atomic_fetch_add(&drop_counter, 1) % 2 == 0) {
-            if (ctx->cfg->debug_enabled)
-                log_with_timestamp("[DEBUG] Event dropped due to backpressure\n");
-            return NFCT_CB_CONTINUE;
-        }
+    // Immediately capture arrival time if in test mode
+    struct timespec arrival_time;
+    if (ctx->cfg->test_mode) {
+        clock_gettime(CLOCK_REALTIME, &arrival_time);
+        atomic_fetch_add(&ctx->test_stats->total_events, 1);
     }
 
     // Filter by source IP range (if specified)
@@ -460,8 +633,9 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src_addr, src_ip, INET_ADDRSTRLEN);
         if (!ip_in_range(src_ip, ctx->cfg->src_range)) {
-            if (ctx->cfg->debug_enabled)
+            if (ctx->cfg->debug_enabled) {
                 log_with_timestamp("[DEBUG] Event ignored: src_ip %s not in range %s\n", src_ip, ctx->cfg->src_range);
+            }
             return NFCT_CB_CONTINUE;
         }
     }
@@ -472,9 +646,20 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
         log_with_timestamp("[ERROR] Failed to allocate event_data_t\n");
         return NFCT_CB_CONTINUE;
     }
+
+    // Store arrival time
+    if (ctx->cfg->test_mode) {
+        event->arrival_ts = arrival_time;
+    } else {
+        event->arrival_ts.tv_sec = 0;
+        event->arrival_ts.tv_nsec = 0;
+    }
+
+    // Standard timestamp for normal usage
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     event->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
     event->ct = nfct_clone(ct);
     if (!event->ct) {
         log_with_timestamp("[ERROR] Failed to clone conntrack\n");
@@ -484,21 +669,18 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
     event->type = type;
     event->count = ctx->cfg->count_enabled ? atomic_fetch_add(&event_counter, 1) + 1 : 0;
 
-    // Attempt to enqueue event in event_queue
+    // Attempt to enqueue event in event_queue immediately
     if (spsc_queue_push(ctx->event_queue, event) != 0) {
         if (atomic_exchange(&event_overflow_reported, 1) == 0) {
             log_with_timestamp("[WARNING] event_queue OVERFLOW: events are being dropped!\n");
         }
         nfct_destroy(event->ct);
         free(event);
-        
-        // Activate backpressure
-        atomic_store(&ctx->backpressure_active, 1);
     } else {
-        // Reset overflow report if queue recovers
         atomic_store(&event_overflow_reported, 0);
-        if (ctx->cfg->debug_enabled)
-            log_with_timestamp("[DEBUG] Event enqueued to event_queue\n");
+        if (ctx->cfg->debug_enabled) {
+            log_with_timestamp("[DEBUG] Event enqueued to event_queue immediately\n");
+        }
     }
 
     return NFCT_CB_CONTINUE;
@@ -527,7 +709,7 @@ static int connect_to_syslog_with_retry(const char *host, const char *port_str, 
         // Set socket options for better performance
         int opt = 1;
         setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
-        
+
         // Set send timeout
         struct timeval timeout;
         timeout.tv_sec = 5;
@@ -563,27 +745,35 @@ void* formatting_thread(void* arg) {
     app_context_t *ctx = (app_context_t *)arg;
 
     while (!shutdown_flag) {
-        // Monitor queue utilization for backpressure control
-        double syslog_util = spsc_queue_utilization(ctx->syslog_queue);
-        
-        if (syslog_util > QUEUE_HIGH_WATERMARK && !atomic_load(&ctx->backpressure_active)) {
-            atomic_store(&ctx->backpressure_active, 1);
-            log_with_timestamp("[INFO] Activating backpressure - syslog queue at %.1f%% capacity\n", syslog_util * 100);
-        } else if (syslog_util < QUEUE_LOW_WATERMARK && atomic_load(&ctx->backpressure_active)) {
-            atomic_store(&ctx->backpressure_active, 0);
-            log_with_timestamp("[INFO] Releasing backpressure - syslog queue at %.1f%% capacity\n", syslog_util * 100);
-        }
-
         void *item;
         if (spsc_queue_try_pop(ctx->event_queue, &item)) {
             event_data_t *event_data = (event_data_t *)item;
+            
+            // Measure time from arrival to formatting in test mode
+            if (ctx->cfg->test_mode && event_data->arrival_ts.tv_sec > 0) {
+                struct timespec now_ts;
+                clock_gettime(CLOCK_REALTIME, &now_ts);
+                long long arrival_ns = (long long)event_data->arrival_ts.tv_sec * 1000000000LL + 
+                                      event_data->arrival_ts.tv_nsec;
+                long long now_ns = (long long)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+                long long diff_ns = now_ns - arrival_ns;
+                
+                update_format_timing(ctx->test_stats, diff_ns);
+                
+                if (ctx->cfg->debug_enabled) {
+                    log_with_timestamp("[TEST] Arrival to formatting: %lld ns (%.3f µs)\n", 
+                                      diff_ns, diff_ns / 1000.0);
+                }
+            }
+
             conn_event_t event;
             memset(&event, 0, sizeof(conn_event_t));
 
             extract_conn_event(
                 event_data->ct, event_data->type, &event,
                 ctx->cfg->count_enabled, ctx->cfg->hash_enabled,
-                ctx->cfg->payload_enabled, event_data->count, event_data->timestamp_ns
+                ctx->cfg->payload_enabled, event_data->count, event_data->timestamp_ns,
+                ctx->cfg->test_mode ? &event_data->arrival_ts : NULL
             );
 
             char buffer[MAX_MESSAGE_LEN] = {0};
@@ -610,27 +800,44 @@ void* formatting_thread(void* arg) {
                 }
             }
             if (ctx->cfg->payload_enabled) {
-                ptr += snprintf(ptr, remaining, "%d,%d,%d,%s,%u,%s,%u",
-                                event.type_num, event.state_num, event.proto_num,
-                                event.src_ip, event.src_port, event.dst_ip, event.dst_port);
+                ptr += snprintf(
+                    ptr, remaining, "%d,%d,%d,%s,%u,%s,%u",
+                    event.type_num, event.state_num, event.proto_num,
+                    event.src_ip, event.src_port, event.dst_ip, event.dst_port
+                );
             }
 
             if (ctx->cfg->debug_enabled) {
                 log_with_timestamp("[DEBUG] Formatting thread: Formatted event: %s\n", buffer);
             }
 
-            // Enqueue to syslog_queue; report overflow only once per burst
-            char *formatted_msg = strdup(buffer);
+            // Create a message with arrival timestamp for test mode
+            typedef struct {
+                char *data;
+                struct timespec arrival_ts;
+            } formatted_msg_t;
+
+            formatted_msg_t *formatted_msg = malloc(sizeof(formatted_msg_t));
             if (formatted_msg) {
+                formatted_msg->data = strdup(buffer);
+                if (ctx->cfg->test_mode && event_data->arrival_ts.tv_sec > 0) {
+                    formatted_msg->arrival_ts = event_data->arrival_ts;
+                } else {
+                    formatted_msg->arrival_ts.tv_sec = 0;
+                    formatted_msg->arrival_ts.tv_nsec = 0;
+                }
+
                 if (spsc_queue_push(ctx->syslog_queue, formatted_msg) != 0) {
                     if (atomic_exchange(&syslog_overflow_reported, 1) == 0) {
                         log_with_timestamp("[WARNING] syslog_queue OVERFLOW: formatted messages are being dropped!\n");
                     }
+                    free(formatted_msg->data);
                     free(formatted_msg);
                 } else {
                     atomic_store(&syslog_overflow_reported, 0);
-                    if (ctx->cfg->debug_enabled)
+                    if (ctx->cfg->debug_enabled) {
                         log_with_timestamp("[DEBUG] Formatting thread: Message enqueued to syslog_queue\n");
+                    }
                 }
             } else {
                 log_with_timestamp("[ERROR] Formatting thread: Failed to allocate formatted message\n");
@@ -639,8 +846,9 @@ void* formatting_thread(void* arg) {
             nfct_destroy(event_data->ct);
             free(event_data);
         } else {
-            if (ctx->cfg->debug_enabled)
+            if (ctx->cfg->debug_enabled) {
                 log_with_timestamp("[DEBUG] Formatting thread: No data dequeued, sleeping...\n");
+            }
             usleep(1000);
         }
     }
@@ -648,10 +856,10 @@ void* formatting_thread(void* arg) {
     return NULL;
 }
 
-// ----------- ENHANCED SYSLOG THREAD --------------------------
+// ----------- SYSLOG THREAD --------------------------
 void* syslog_thread(void* arg) {
     syslog_data_t *sdata = (syslog_data_t *)arg;
-    char *buffer = NULL;
+    void *buffer = NULL;
     char *batch = malloc(MAX_MESSAGE_LEN * MAX_BATCH_SIZE);
     char *lost_batch = NULL;
     int message_count = 0;
@@ -685,26 +893,52 @@ void* syslog_thread(void* arg) {
         // Send batch due to timeout or reaching batch size
         if (message_count > 0 && (elapsed_us >= BATCH_TIMEOUT_US || message_count >= current_batch_size)) {
             if (sdata->debug_enabled) {
-                log_with_timestamp("[DEBUG] Syslog thread: Sending batch of %d messages (timeout: %s, size: %s)\n", 
-                    message_count, 
+                log_with_timestamp(
+                    "[DEBUG] Syslog thread: Sending batch of %d messages (timeout: %s, size: %s)\n",
+                    message_count,
                     elapsed_us >= BATCH_TIMEOUT_US ? "yes" : "no",
-                    message_count >= current_batch_size ? "yes" : "no");
+                    message_count >= current_batch_size ? "yes" : "no"
+                );
             }
             goto send_batch;
         }
 
         // Try to dequeue a formatted message
-        if (spsc_queue_try_pop(sdata->queue, (void**)&buffer)) {
+        if (spsc_queue_try_pop(sdata->queue, &buffer)) {
+            typedef struct {
+                char *data;
+                struct timespec arrival_ts;
+            } formatted_msg_t;
+
+            formatted_msg_t *formatted_msg = (formatted_msg_t *)buffer;
+
             if (sdata->debug_enabled) {
-                log_with_timestamp("[DEBUG] Syslog thread: Dequeued buffer: %s\n", buffer);
+                log_with_timestamp("[DEBUG] Syslog thread: Dequeued buffer: %s\n", formatted_msg->data);
+            }
+
+            // Measure time from arrival to syslog in test mode
+            if (sdata->test_mode && formatted_msg->arrival_ts.tv_sec > 0) {
+                struct timespec now_ts;
+                clock_gettime(CLOCK_REALTIME, &now_ts);
+                long long arrival_ns = (long long)formatted_msg->arrival_ts.tv_sec * 1000000000LL + 
+                                      formatted_msg->arrival_ts.tv_nsec;
+                long long now_ns = (long long)now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+                long long diff_ns = now_ns - arrival_ns;
+                
+                update_syslog_timing(sdata->test_stats, diff_ns);
+                
+                if (sdata->debug_enabled) {
+                    log_with_timestamp("[TEST] Arrival to syslog: %lld ns (%.3f µs)\n", 
+                                      diff_ns, diff_ns / 1000.0);
+                }
             }
 
             char syslog_msg[MAX_MESSAGE_LEN];
-            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer);
-            
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, formatted_msg->data);
+
             size_t current_batch_len = strlen(batch);
             size_t msg_len = strlen(syslog_msg);
-            
+
             // Check if adding this message would exceed buffer
             if (current_batch_len + msg_len + 2 < MAX_MESSAGE_LEN * MAX_BATCH_SIZE) {
                 strcat(batch, syslog_msg);
@@ -719,7 +953,8 @@ void* syslog_thread(void* arg) {
                 log_with_timestamp("[DEBUG] Syslog thread: Added message to batch, count: %d\n", message_count);
             }
 
-            free(buffer);
+            free(formatted_msg->data);
+            free(formatted_msg);
             buffer = NULL;
         } else {
             if (sdata->debug_enabled) {
@@ -734,12 +969,11 @@ void* syslog_thread(void* arg) {
         // Send current batch, then add the pending message to new batch
         goto send_batch;
 
-    send_batch: ;
-        // Handle consecutive failures with exponential backoff
+    send_batch:;
         int failures = atomic_load(&sdata->consecutive_failures);
         if (failures >= MAX_CONSECUTIVE_FAILURES) {
             int delay_ms = RECONNECT_DELAY_MS * (1 << (failures - MAX_CONSECUTIVE_FAILURES));
-            if (delay_ms > 30000) delay_ms = 30000; // Cap at 30 seconds
+            if (delay_ms > 30000) delay_ms = 30000;
             log_with_timestamp("[INFO] Too many consecutive failures, backing off for %d ms\n", delay_ms);
             usleep(delay_ms * 1000);
         }
@@ -750,7 +984,7 @@ void* syslog_thread(void* arg) {
             goto cleanup_batch;
         }
         big_batch[0] = '\0';
-        
+
         if (lost_batch) {
             strcat(big_batch, lost_batch);
         }
@@ -759,19 +993,21 @@ void* syslog_thread(void* arg) {
         if (sdata->debug_enabled) {
             log_with_timestamp("[DEBUG] Syslog thread: Sending batch+lost_batch (%zu bytes)\n", strlen(big_batch));
         }
-        
+
         if (sdata->syslog_fd < 0) {
             sdata->syslog_fd = connect_to_syslog_with_retry(sdata->syslog_ip, SYSLOG_PORT, &failures);
             atomic_store(&sdata->consecutive_failures, failures);
         }
-        
+
         int sent_ok = 0;
         if (sdata->syslog_fd >= 0) {
             ssize_t sent = send(sdata->syslog_fd, big_batch, strlen(big_batch), MSG_NOSIGNAL);
             if (sent > 0) {
                 atomic_fetch_add(&sdata->bytes_transferred, sent);
-                log_with_timestamp("[INFO] Syslog thread: Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
-                                   sent, atomic_load(&sdata->bytes_transferred));
+                log_with_timestamp(
+                    "[INFO] Syslog thread: Sent %zd bytes to syslog. Total transferred: %zu bytes\n",
+                    sent, atomic_load(&sdata->bytes_transferred)
+                );
                 sent_ok = 1;
                 atomic_store(&sdata->consecutive_failures, 0);
             } else {
@@ -781,37 +1017,59 @@ void* syslog_thread(void* arg) {
                 atomic_fetch_add(&sdata->consecutive_failures, 1);
             }
         }
-        
+
         free(lost_batch);
         if (sent_ok) {
             lost_batch = NULL;
         } else {
             lost_batch = strdup(big_batch);
-            if (!lost_batch) log_with_timestamp("[ERROR] Syslog thread: Failed to save lost batch\n");
+            if (!lost_batch) {
+                log_with_timestamp("[ERROR] Syslog thread: Failed to save lost batch\n");
+            }
         }
-        
+
         free(big_batch);
 
     cleanup_batch:
         batch[0] = '\0';
         message_count = 0;
         gettimeofday(&last_sent, NULL);
-        
-        // If we came from send_batch_and_continue, add the pending message
+
         if (buffer) {
+            typedef struct {
+                char *data;
+                struct timespec arrival_ts;
+            } formatted_msg_t;
+
+            formatted_msg_t *formatted_msg = (formatted_msg_t *)buffer;
             char syslog_msg[MAX_MESSAGE_LEN];
-            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, buffer);
+            create_syslog_message(syslog_msg, sizeof(syslog_msg), sdata->machine_name, formatted_msg->data);
             strcat(batch, syslog_msg);
             strcat(batch, "\n");
             message_count = 1;
-            free(buffer);
+            free(formatted_msg->data);
+            free(formatted_msg);
             buffer = NULL;
         }
     }
-    
+
     free(batch);
     if (lost_batch) free(lost_batch);
     log_with_timestamp("[INFO] Syslog thread exiting by shutdown request\n");
+    return NULL;
+}
+
+// ----------- STATS PRINTING THREAD ------------------
+void* stats_thread(void* arg) {
+    test_stats_t *stats = (test_stats_t *)arg;
+    
+    while (!shutdown_flag) {
+        sleep(5);  // Print stats every 5 seconds
+        if (!shutdown_flag) {
+            print_test_stats(stats);
+        }
+    }
+    
     return NULL;
 }
 
@@ -842,10 +1100,16 @@ int main(int argc, char *argv[]) {
 
     global_debug_enabled = cfg.debug_enabled;
 
-    log_with_timestamp("[INFO] Initializing with event_queue_size=%zu, syslog_queue_size=%zu\n", 
+    // Initialize test statistics if in test mode
+    if (cfg.test_mode) {
+        init_test_stats(&global_test_stats);
+        log_with_timestamp("[INFO] Test mode enabled - measuring event processing times\n");
+    }
+
+    log_with_timestamp("[INFO] Initializing with event_queue_size=%zu, syslog_queue_size=%zu\n",
                        cfg.event_queue_size, cfg.syslog_queue_size);
 
-    // Initialize SPSC queues with configurable sizes
+    // Initialize SPSC queues
     spsc_queue_t *event_queue = spsc_queue_init(cfg.event_queue_size);
     if (!event_queue) {
         log_with_timestamp("[ERROR] Failed to initialize event_queue\n");
@@ -862,7 +1126,7 @@ int main(int argc, char *argv[]) {
         .event_queue = event_queue,
         .syslog_queue = syslog_queue,
         .cfg = &cfg,
-        .backpressure_active = 0
+        .test_stats = &global_test_stats
     };
 
     pthread_t formatting_tid;
@@ -880,7 +1144,9 @@ int main(int argc, char *argv[]) {
         .syslog_ip = cfg.syslog_ip,
         .syslog_fd = -1,
         .bytes_transferred = 0,
-        .consecutive_failures = 0
+        .consecutive_failures = 0,
+        .test_stats = &global_test_stats,
+        .test_mode = cfg.test_mode
     };
 
     pthread_t syslog_tid;
@@ -889,6 +1155,14 @@ int main(int argc, char *argv[]) {
         spsc_queue_destroy(event_queue);
         spsc_queue_destroy(syslog_queue);
         return 1;
+    }
+
+    // Create stats thread for test mode
+    pthread_t stats_tid;
+    if (cfg.test_mode) {
+        if (pthread_create(&stats_tid, NULL, stats_thread, &global_test_stats) != 0) {
+            log_with_timestamp("[WARNING] Failed to create stats thread\n");
+        }
     }
 
     // Signal handling for shutdown
@@ -925,7 +1199,7 @@ int main(int argc, char *argv[]) {
         int ret = nfct_catch(g_nfct_handle);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100000); // Sleep 100ms
+                usleep(10); // Sleep 0.01ms for better responsiveness
                 continue;
             }
             if (errno == EINTR) continue;
@@ -944,6 +1218,13 @@ int main(int argc, char *argv[]) {
 
     pthread_join(formatting_tid, NULL);
     pthread_join(syslog_tid, NULL);
+    
+    if (cfg.test_mode) {
+        pthread_join(stats_tid, NULL);
+        // Print final statistics
+        log_with_timestamp("[INFO] Final test statistics:\n");
+        print_test_stats(&global_test_stats);
+    }
 
     spsc_queue_destroy(event_queue);
     spsc_queue_destroy(syslog_queue);
