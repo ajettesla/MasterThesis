@@ -737,7 +737,7 @@ class ProgressTracker:
         self.lock = threading.Lock()
         self.start_time = time.time()
         self.last_full_display = 0
-        self.display_interval = 90  # Display every 90 seconds (1.5 minutes)
+        self.display_interval = 10  # Changed from 90 to 10 seconds
         
     def update_file_progress(self, filename, prev_size, current_size, line_count, total_bytes, update_display=False):
         with self.lock:
@@ -763,16 +763,15 @@ class ProgressTracker:
             self.last_full_display = time.time()
     
     def _display_full_progress(self):
-        """Display progress for ALL monitored files"""
+        """Display progress for ALL monitored files - simplified format"""
         elapsed = time.time() - self.start_time
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-     
-        print(f"{BOLD}{MAGENTA} COMPREHENSIVE LOG GROWTH REPORT{RESET}")
-        print(f"{BOLD}{MAGENTA}║ Time: {current_time} | Elapsed: {elapsed/60:.1f} minutes{' '*(35-len(current_time))}║{RESET}")
+        print(f"{BOLD}{MAGENTA}COMPREHENSIVE LOG GROWTH REPORT{RESET}")
+        print(f"{BOLD}{MAGENTA}Time: {current_time} | Elapsed: {elapsed/60:.1f} minutes{RESET}")
         
         if not self.file_stats:
-            print(f"{MAGENTA}║{RESET} {RED}No log files being monitored!{RESET}")
+            print(f"{RED}No log files being monitored!{RESET}")
             return
         
         total_size = 0
@@ -815,7 +814,7 @@ class ProgressTracker:
                 growth_str = "no change"
                 growth_color = YELLOW
             
-            # Calculate growth rate (KB per second, then format as KB/sec)
+            # Calculate growth rate
             if elapsed > 0:
                 rate_kb_sec = (current_size / 1024) / elapsed
                 if rate_kb_sec >= 1:
@@ -831,20 +830,18 @@ class ProgressTracker:
             total_lines += line_count
             total_growth += growth
             
-            # Display file info
+            # Display file info - simplified format
             filename_display = filename[:25] + "..." if len(filename) > 28 else filename
             
-            print(f"{MAGENTA}║{RESET} {CYAN}{filename_display:30}{RESET} │ {BOLD}{size_str:>8}{RESET} │ {growth_color}{growth_str:>10}{RESET} │ Lines: {BLUE}{line_count:>6}{RESET} │ {YELLOW}{update_status:>8}{RESET} ║")
+            print(f"{CYAN}{filename_display:30}{RESET} │ {BOLD}{size_str:>8}{RESET} │ {growth_color}{growth_str:>10}{RESET} │ Lines: {BLUE}{line_count:>6}{RESET} │ {YELLOW}{update_status:>8}{RESET}")
         
-
-        
-        # Summary
+        # Summary - simplified format
         total_size_str = f"{total_size/(1024*1024):.1f}MB" if total_size > 1024*1024 else f"{total_size/1024:.1f}KB"
         total_growth_str = f"{total_growth/(1024*1024):.1f}MB" if total_growth > 1024*1024 else f"{total_growth/1024:.1f}KB"
         avg_rate = (total_size / 1024) / elapsed if elapsed > 0 else 0
         avg_rate_str = f"{avg_rate:.1f}KB/s" if avg_rate >= 1 else f"{avg_rate*1000:.0f}B/s"
         
-        print(f"{MAGENTA}║{RESET} {BOLD}TOTAL:{' '*24}{RESET} │ {BOLD}{GREEN}{total_size_str:>8}{RESET} │ {BOLD}{GREEN}{total_growth_str:>10}{RESET} │ Lines: {BOLD}{BLUE}{total_lines:>6}{RESET} │ {BOLD}{CYAN}{avg_rate_str:>8}{RESET} ║")
+        print(f"{BOLD}TOTAL:{' '*24}{RESET} │ {BOLD}{GREEN}{total_size_str:>8}{RESET} │ {BOLD}{GREEN}{total_growth_str:>10}{RESET} │ Lines: {BOLD}{BLUE}{total_lines:>6}{RESET} │ {BOLD}{YELLOW}{avg_rate_str:>8}{RESET}")
 
 # Global progress tracker
 progress_tracker = ProgressTracker()
