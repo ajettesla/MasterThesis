@@ -1129,17 +1129,7 @@ void* connection_monitor_thread(void* arg) {
             int failures = atomic_load(&sdata->consecutive_failures);
             sdata->syslog_fd = connect_to_syslog_with_retry(sdata->syslog_ip, SYSLOG_PORT, &failures);
             atomic_store(&sdata->consecutive_failures, failures);
-        } else {
-            // Verify connection is still good
-            char test_msg[64];
-            snprintf(test_msg, sizeof(test_msg), "<134> %s conntrack_logger PING\n", sdata->machine_name);
-            
-            if (send(sdata->syslog_fd, test_msg, strlen(test_msg), MSG_NOSIGNAL) < 0) {
-                log_with_timestamp("[WARNING] Connection test failed: %s\n", strerror(errno));
-                close(sdata->syslog_fd);
-                sdata->syslog_fd = -1;
-            }
-        }
+        } 
     }
     
     return NULL;
