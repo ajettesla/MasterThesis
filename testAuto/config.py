@@ -1,70 +1,65 @@
 #!/usr/bin/env python3
 
 import os
-import string
-import random
-import json
 import threading
 import logging
 from datetime import datetime
+import yaml
 
 # ---- Colors ----
-RESET  = "\033[0m"
-RED    = "\033[31m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-BLUE   = "\033[34m"
-CYAN   = "\033[36m"
-MAGENTA= "\033[35m"
-BOLD   = "\033[1m"
+RESET   = "\033[0m"
+RED     = "\033[31m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+BLUE    = "\033[34m"
+CYAN    = "\033[36m"
+MAGENTA = "\033[35m"
+BOLD    = "\033[1m"
 
-# State file path for persistence between script executions
-STATE_FILE = "/tmp/auto_experiment_state.json"
+# Directory and filename template for state files (per experiment+concurrency)
+STATE_DIR = "/tmp"
+STATE_FILENAME_TEMPLATE = "auto_state_{experiment_name}_{conc_str}.yaml"
+# This global will be initialized at runtime via init_state_file()
+STATE_FILE = None
 
 # Default monitoring time in seconds
 DEFAULT_MONITORING_TIME = 250
 
-# Current date/time and user - hardcoded from your provided values
-CURRENT_TIMESTAMP = "2025-06-22 12:35:39"  # UTC time
-CURRENT_USER = "ajettesla"  # Current user
+# Global constants for timestamp/user
+CURRENT_TIMESTAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+CURRENT_USER = os.getenv("USER", "unknown")
 
-# Global variables for experiment state
 class ExperimentState:
     def __init__(self):
         self.current_experiment_name = None
-        self.current_experiment_id = None
-        self.current_concurrency = None
-        self.current_iteration = None
-        self.monitoring_threads = []
-        self.monitoring_stop_events = []
-        self.original_stdout = None
-        self.original_stderr = None
-        self.log_file = None
-        self.demon_mode = False
+        self.current_experiment_id   = None
+        self.current_concurrency     = None
+        self.current_iteration       = None
+        self.monitoring_threads      = []
+        self.monitoring_stop_events  = []
+        self.original_stdout         = None
+        self.original_stderr         = None
+        self.log_file                = None
+        self.demon_mode              = False
 
     def reset(self):
-        """Reset the experiment state"""
-        self.current_experiment_name = None
-        self.current_experiment_id = None
-        self.current_concurrency = None
-        self.current_iteration = None
-        self.monitoring_threads = []
-        self.monitoring_stop_events = []
+        """Reset the experiment state to initial values."""
+        self.__init__()
 
-# Initialize global state
+# Global state instance
 experiment_state = ExperimentState()
 
-# Progress tracking class
 class ProgressTracker:
-    """Centralized progress tracking for all log monitors"""
+    """Centralized progress tracking for all monitored log files."""
     def __init__(self):
-        self.file_stats = {}
-        self.lock = threading.Lock()
-        self.start_time = 0
+        self.file_stats        = {}
+        self.lock              = threading.Lock()
+        self.start_time        = 0
         self.last_full_display = 0
-        self.display_interval = 10  # Update display every 10 seconds
+        self.display_interval  = 10  # seconds
 
-    def update_file_progress(self, filename, prev_size, current_size, line_count, total_bytes, update_display=False):
+    def update_file_progress(self, filename, prev_size, current_size,
+                             line_count, total_bytes, update_display=False):
         with self.lock:
             self.file_stats[filename] = {
                 'size': current_size,
@@ -74,109 +69,136 @@ class ProgressTracker:
                 'total_bytes': total_bytes,
                 'last_update': datetime.now(),
             }
-            
-            # Only display if enough time has passed AND update_display is True
-            current_time = datetime.now().timestamp()
-            if update_display and (current_time - self.last_full_display >= self.display_interval):
+            now_ts = datetime.now().timestamp()
+            if update_display and (now_ts - self.last_full_display >= self.display_interval):
                 self._display_full_progress()
-                self.last_full_display = current_time
-    
+                self.last_full_display = now_ts
+
     def force_display_progress(self):
-        """Force display progress now"""
+        """Force an immediate display of all file progress."""
         with self.lock:
             self._display_full_progress()
             self.last_full_display = datetime.now().timestamp()
-    
+
     def _display_full_progress(self):
-        """Display progress for ALL monitored files in a simplified format"""
         elapsed = datetime.now().timestamp() - self.start_time
-        elapsed_minutes = elapsed / 60.0
-        
-        # Collect stats for the files we're monitoring
-        stats_message = []
-        total_size = 0
-        total_delta = 0
-        total_lines = 0
-        
-        for filepath, stats in self.file_stats.items():
-            if stats.get('size', 0) > 0:
-                filename = os.path.basename(filepath)
-                size_mb = stats.get('size', 0) / (1024 * 1024)
-                delta_mb = stats.get('delta_size', 0) / (1024 * 1024)
-                lines = stats.get('lines', 0)
-                
-                stats_message.append(f"{filename:<25} | {size_mb:7.2f}MB | +{delta_mb:7.2f}MB | Lines: {lines:7d}")
-                
-                total_size += stats.get('size', 0)
-                total_delta += stats.get('delta_size', 0)
-                total_lines += lines
-        
-        # Print a simple progress report
-        logging.info(f"\n[Progress] Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Elapsed: {elapsed_minutes:.1f} minutes")
+        elapsed_min = elapsed / 60.0
+        stats_lines = []
+        total_size = total_delta = total_lines = 0
+
+        for path, stats in self.file_stats.items():
+            size = stats.get('size', 0)
+            if size > 0:
+                name     = os.path.basename(path)
+                mb_size  = size / (1024 * 1024)
+                mb_delta = stats['delta_size'] / (1024 * 1024)
+                ln       = stats.get('lines', 0)
+                stats_lines.append(
+                    f"{name:<25} | {mb_size:7.2f}MB | +{mb_delta:7.2f}MB | Lines: {ln:7d}"
+                )
+                total_size  += size
+                total_delta += stats['delta_size']
+                total_lines += ln
+
+        logging.info(f"\n[Progress] Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | " +
+                     f"Elapsed: {elapsed_min:.1f} minutes")
         logging.info("-" * 70)
-        
-        # Only show file stats and total if we have data
-        if stats_message:
-            for line in stats_message:
+        if stats_lines:
+            for line in stats_lines:
                 logging.info(line)
             logging.info("-" * 70)
-            
-            total_size_mb = total_size / (1024 * 1024)
-            total_delta_mb = total_delta / (1024 * 1024)
-            logging.info(f"TOTAL: {total_size_mb:.2f}MB | +{total_delta_mb:.2f}MB | Lines: {total_lines}")
+            logging.info(
+                f"TOTAL: {total_size/(1024*1024):.2f}MB | +" +
+                f"{total_delta/(1024*1024):.2f}MB | Lines: {total_lines}"
+            )
 
 # Global progress tracker
 progress_tracker = ProgressTracker()
 
 def generate_experiment_id(length=5):
-    """Generate a random alphanumeric identifier for the experiment"""
-    characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
+    """Generate a random alphanumeric identifier."""
+    import string, random
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def init_state_file(experiment_name, concurrency_values):
+    """
+    Initialize the global STATE_FILE path based on experiment name and concurrency list.
+    Must be called before load_experiment_state or save_experiment_state.
+    """
+    global STATE_FILE
+    conc_str = "_".join(str(x) for x in concurrency_values)
+    filename = STATE_FILENAME_TEMPLATE.format(
+        experiment_name=experiment_name,
+        conc_str=conc_str
+    )
+    STATE_FILE = os.path.join(STATE_DIR, filename)
+    logging.info(f"[config] STATE_FILE set to: {STATE_FILE}")
 
 def load_experiment_state():
-    """Load experiment state from file"""
+    """
+    Load experiment state from the YAML file.
+    Returns a dict (possibly empty) if file missing or on error.
+    """
+    if not STATE_FILE:
+        logging.error("load_experiment_state: STATE_FILE not initialized")
+        return {}
     if not os.path.exists(STATE_FILE):
-        return None
-    
+        return {}
     try:
         with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        logging.warning(f"Failed to load state file {STATE_FILE}")
-        return None
+            data = yaml.safe_load(f) or {}
+        logging.info(f"[config] Loaded state from {STATE_FILE}: {data}")
+        return data
+    except Exception as e:
+        logging.warning(f"[config] Failed to load state file {STATE_FILE}: {e}")
+        return {}
 
 def save_experiment_state(state):
-    """Save experiment state to file"""
+    """
+    Save experiment state dict to the YAML file.
+    Returns True on success, False on failure.
+    """
+    if not STATE_FILE:
+        logging.error("save_experiment_state: STATE_FILE not initialized")
+        return False
+    if 'name' not in state or 'concurrency' not in state:
+        logging.error("save_experiment_state: Missing 'name' or 'concurrency' in state")
+        return False
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
-        # Make the file readable/writable by all users
+            yaml.safe_dump(state, f, default_flow_style=False)
         os.chmod(STATE_FILE, 0o666)
-        logging.info(f"Saved experiment state to {STATE_FILE}")
+        logging.info(f"[config] Saved state to {STATE_FILE}")
         return True
-    except IOError as e:
-        logging.error(f"Failed to save state file {STATE_FILE}: {e}")
+    except Exception as e:
+        logging.error(f"[config] Failed to save state file {STATE_FILE}: {e}")
         return False
 
 def clear_experiment_state():
-    """Clear experiment state file"""
+    """
+    Remove the state file if it exists.
+    Returns True if file removed or did not exist.
+    """
+    if not STATE_FILE:
+        return True
     if os.path.exists(STATE_FILE):
         try:
             os.remove(STATE_FILE)
-            logging.info(f"Cleared experiment state file {STATE_FILE}")
+            logging.info(f"[config] Cleared state file {STATE_FILE}")
             return True
-        except IOError as e:
-            logging.error(f"Failed to clear state file {STATE_FILE}: {e}")
+        except Exception as e:
+            logging.error(f"[config] Failed to clear state file {STATE_FILE}: {e}")
             return False
     return True
 
 def get_experiment_path(experiment_name, experiment_id, concurrency, iteration=None):
-    """Get path for experiment with ID included"""
-    base_path = f"/var/log/exp/{experiment_name}_{experiment_id}{concurrency}"
-    if iteration:
-        return f"{base_path}/{iteration}"
-    return base_path
+    """
+    Get the directory path for logs of a given experiment, concurrency, and optional iteration.
+    """
+    base = f"/var/log/exp/{experiment_name}_{experiment_id}{concurrency}"
+    return f"{base}/{iteration}" if iteration is not None else base
 
 def colored(msg, color):
-    """Return text with ANSI color codes"""
+    """Wrap a message in ANSI color codes."""
     return f"{color}{msg}{RESET}"
