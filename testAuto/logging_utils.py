@@ -23,73 +23,65 @@ def configure_logging(log_level=logging.INFO, log_file=None):
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
     
-    # Clear any existing handlers
     root_logger = logging.getLogger()
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
-    
-    # Set log level
     root_logger.setLevel(log_level)
-    
-    # Console handler
+
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(logging.Formatter(log_format, date_format))
     root_logger.addHandler(console_handler)
     
-    # File handler if specified
     if log_file:
         try:
-            # Create directory if it doesn't exist
             log_dir = os.path.dirname(log_file)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir)
-                
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setFormatter(logging.Formatter(log_format, date_format))
-            root_logger.addHandler(file_handler)
+            fh = logging.FileHandler(log_file)
+            fh.setFormatter(logging.Formatter(log_format, date_format))
+            root_logger.addHandler(fh)
             logging.info(f"Logging to file: {log_file}")
         except Exception as e:
-            logging.error(f"Failed to set up file logging: {str(e)}")
-    
-    # Log uncaught exceptions
+            logging.error(f"Failed to set up file logging: {e}")
+
     def exception_handler(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
-            # Don't log keyboard interrupt
             sys.__excepthook__(exc_type, exc_value, exc_traceback)
             return
         logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-    
     sys.excepthook = exception_handler
-    
-    # Log initial information
+
     logging.info(f"Logging initialized at level {logging.getLevelName(log_level)}")
     logging.info(f"Python version: {sys.version}")
     logging.info(f"Platform: {sys.platform}")
     logging.info(f"User: {getpass.getuser()}")
     logging.info(f"Current time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# Configure basic logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(message)s',
     handlers=[logging.StreamHandler()]
 )
 
-# Custom output class to write to both file and stdout
 class TeeOutput:
     def __init__(self, file_stream, original_stream):
         self.file_stream = file_stream
         self.original_stream = original_stream
         
     def write(self, data):
-        self.file_stream.write(data)
+        try:
+            self.file_stream.write(data)
+        except Exception:
+            pass
         self.original_stream.write(data)
         
     def flush(self):
-        self.file_stream.flush()
+        try:
+            self.file_stream.flush()
+        except Exception:
+            pass
         self.original_stream.flush()
         
-    # Ensure compatibility with other stdout/stderr methods
     def isatty(self):
         return self.original_stream.isatty()
         
@@ -97,214 +89,187 @@ class TeeOutput:
         return self.original_stream.fileno()
 
 def get_current_hostname():
-    """Get the current hostname where the script is running"""
     try:
         return subprocess.check_output(['hostname'], text=True).strip()
     except:
-        import socket
         return socket.gethostname()
+
 
 def setup_logging(experiment_name, experiment_id, demon, timestamp, user):
     """Set up logging to both file and stdout when in demon mode"""
-    # Save original stdout/stderr
     experiment_state.original_stdout = sys.stdout
     experiment_state.original_stderr = sys.stderr
     experiment_state.demon_mode = demon
-    
+
     if demon:
-        # Create log file with timestamp and experiment ID
+        # include iteration suffix if set
+        iteration = getattr(experiment_state, "current_iteration", None)
+        iter_suffix = f"_{iteration}" if iteration is not None else ""
+
         log_timestamp = timestamp.replace(" ", "_").replace(":", "")
-        log_path = f"/tmp/{experiment_name}_{experiment_id}_{log_timestamp}_auto.log"
+        log_path = f"/tmp/{experiment_name}_{experiment_id}{iter_suffix}_{log_timestamp}_auto.log"
         experiment_state.log_file = open(log_path, 'w', buffering=1)
-        
-        # Write header to log file
+
+        # write header
         header = (
-            f"=== Experiment Log ===\n"
+            "=== Experiment Log ===\n"
             f"Date/Time: {timestamp}\n"
             f"User: {user}\n"
             f"Host: {get_current_hostname()}\n"
             f"Experiment: {experiment_name}\n"
             f"Experiment ID: {experiment_id}\n"
-            f"==============================\n\n"
+            + (f"Iteration: {iteration}\n" if iteration is not None else "")
+            + "==============================\n\n"
         )
         experiment_state.log_file.write(header)
-        
-        # Create Tee output that writes to both file and original stdout/stderr
+        experiment_state.original_stdout.write(header)
+
+        # tee stdout/stderr
         sys.stdout = TeeOutput(experiment_state.log_file, experiment_state.original_stdout)
         sys.stderr = TeeOutput(experiment_state.log_file, experiment_state.original_stderr)
-        
-        # Also print header to stdout
-        experiment_state.original_stdout.write(header)
-        
+
+        # route logging to same file
+        fh = logging.FileHandler(log_path)
+        fh.setLevel(logging.getLogger().level)
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            '%Y-%m-%d %H:%M:%S'
+        ))
+        logging.getLogger().addHandler(fh)
+
         return log_path
     else:
-        # In normal mode, keep stdout/stderr as they are
         return None
 
 def cleanup_logging():
-    """Close log file if in demon mode"""
     if experiment_state.log_file and experiment_state.demon_mode:
-        experiment_state.log_file.close()
-        # Restore original stdout/stderr
+        logger = logging.getLogger()
+        for h in logger.handlers[:]:
+            if isinstance(h, logging.FileHandler):
+                if getattr(h.stream, 'name', None) == getattr(experiment_state.log_file, 'name', None):
+                    logger.removeHandler(h)
+                    try:
+                        h.close()
+                    except:
+                        pass
         sys.stdout = experiment_state.original_stdout
         sys.stderr = experiment_state.original_stderr
+        try:
+            experiment_state.log_file.close()
+        except:
+            pass
+        experiment_state.log_file = None
+        experiment_state.demon_mode = False
 
 def check_and_clear_memory_usage():
-    """Check memory usage and take action if it's too high"""
     try:
         import psutil
-        memory_percent = psutil.virtual_memory().percent
-        if memory_percent > 85:  # If memory usage is over 85%
-            logging.warning(f"High memory usage detected: {memory_percent}%. Clearing caches...")
-            # Try to free up memory
-            import gc
-            gc.collect()
-            if hasattr(psutil, 'Process'):
-                # Clear process memory if possible
-                try:
-                    process = psutil.Process()
-                    if hasattr(process, 'memory_info'):
-                        before = process.memory_info().rss / 1024 / 1024
-                        # On Linux, try to clear page cache
-                        if sys.platform.startswith('linux'):
-                            subprocess.run("sync", shell=True)
-                            with open("/proc/sys/vm/drop_caches", "w") as f:
-                                f.write("1")
-                        after = process.memory_info().rss / 1024 / 1024
-                        logging.info(f"Memory usage reduced from {before:.1f}MB to {after:.1f}MB")
-                except:
-                    pass
-        return memory_percent
+        mem = psutil.virtual_memory().percent
+        if mem > 85:
+            logging.warning(f"High memory usage: {mem}%. Clearing caches...")
+            import gc; gc.collect()
+            try:
+                proc = psutil.Process()
+                if hasattr(proc, 'memory_info'):
+                    before = proc.memory_info().rss / 1024 / 1024
+                    if sys.platform.startswith('linux'):
+                        subprocess.run("sync", shell=True)
+                        with open("/proc/sys/vm/drop_caches", "w") as f:
+                            f.write("1")
+                    after = proc.memory_info().rss / 1024 / 1024
+                    logging.info(f"Memory usage reduced from {before:.1f}MB to {after:.1f}MB")
+            except:
+                pass
+        return mem
     except ImportError:
         return None
     except Exception as e:
-        logging.error(f"Error checking memory: {str(e)}")
+        logging.error(f"Error checking memory: {e}")
         return None
 
-# Progress display thread that updates every 5 seconds
 class SimpleProgressDisplay(threading.Thread):
     def __init__(self, stop_event):
-        super().__init__(daemon=True)  # Make thread a daemon so it doesn't block program exit
+        super().__init__(daemon=True)
         self.stop_event = stop_event
         self.name = "SimpleProgressDisplay"
-        self.last_connt1_count = 0
-        self.last_connt2_count = 0
-        self.ssh_connector = None  # Will be initialized in run()
-        self.clients = {}  # Cache SSH connections
-        
+        self.last_connt1 = 0
+        self.last_connt2 = 0
+        self.ssh_connector = None
+        self.clients = {}
+
     def __del__(self):
-        # Clean up SSH connections when object is destroyed
         self.close_connections()
-        
+
     def close_connections(self):
-        """Close all cached SSH connections"""
         for host, client in self.clients.items():
             if client:
                 try:
                     client.close()
-                    logging.debug(f"Closed SSH connection to {host}")
                 except:
                     pass
         self.clients.clear()
-        
+
     def get_conntrack_count(self, host):
-        """Get conntrack entries count from a host with connection caching"""
         from ssh_utils import SSHConnector, run_command_locally, run_command_with_timeout
-        
-        count = 0
-        
-        # Initialize SSH connector if needed
         if self.ssh_connector is None:
             self.ssh_connector = SSHConnector()
-        
-        # Get or create SSH connection
         if host not in self.clients:
             self.clients[host] = self.ssh_connector.connect(host)
-        
         client = self.clients[host]
-        cmd_count = "sudo conntrack -C"
-        
+        cmd = "sudo conntrack -C"
         if client is None:
-            status, output, _ = run_command_locally(cmd_count, f"[{host}]")
+            status, out, _ = run_command_locally(cmd, f"[{host}]")
         else:
             try:
-                status, output = run_command_with_timeout(client, cmd_count, 5, hostname=host)
-            except Exception as e:
-                # If connection failed, try to reconnect once
-                logging.warning(f"SSH connection to {host} failed, reconnecting: {str(e)}")
+                status, out = run_command_with_timeout(client, cmd, 5, hostname=host)
+            except:
                 self.clients[host] = self.ssh_connector.connect(host)
                 client = self.clients[host]
                 if client:
-                    status, output = run_command_with_timeout(client, cmd_count, 5, hostname=host)
+                    status, out = run_command_with_timeout(client, cmd, 5, hostname=host)
                 else:
-                    status, output = False, "0"
-            
-        if status and output.strip():
-            try:
-                count = int(output.strip())
-            except (ValueError, TypeError):
-                count = 0
-                
-        return count
-        
+                    status, out = False, "0"
+        try:
+            return int(out.strip()) if status and out.strip().isdigit() else 0
+        except:
+            return 0
+
     def run(self):
         try:
             while not self.stop_event.is_set():
                 try:
-                    # Get current conntrack counts
-                    connt1_count = self.get_conntrack_count("connt1")
-                    connt2_count = self.get_conntrack_count("connt2")
-                    
-                    # Calculate deltas
-                    connt1_delta = connt1_count - self.last_connt1_count
-                    connt2_delta = connt2_count - self.last_connt2_count
-                    
-                    # Update last counts
-                    self.last_connt1_count = connt1_count
-                    self.last_connt2_count = connt2_count
-                    
-                    # Header
-                    logging.info("\n" + "=" * 80)
-                    logging.info(f"Progress Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    logging.info("=" * 80)
-                    
-                    # Format file information
-                    file_info_format = "{:<25} | {:>10} | {:>10} | {:>10}"
-                    logging.info(file_info_format.format("File", "Size (MB)", "Lines", "Delta (KB)"))
-                    logging.info("-" * 80)
-                    
-                    # File stats
-                    for filepath, stats in progress_tracker.file_stats.items():
-                        filename = os.path.basename(filepath)
-                        size_mb = stats.get('size', 0) / (1024 * 1024)
-                        lines = stats.get('lines', 0)
-                        delta_kb = stats.get('delta_size', 0) / 1024
-                        
-                        logging.info(file_info_format.format(
-                            filename, 
-                            f"{size_mb:.2f}", 
-                            f"{lines}", 
-                            f"{delta_kb:.2f}"
-                        ))
-                    
-                    # Conntrack counts
-                    logging.info("-" * 80)
-                    logging.info("Conntrack Entries:")
-                    logging.info(f"connt1: {connt1_count} (Δ: {connt1_delta:+d})")
-                    logging.info(f"connt2: {connt2_count} (Δ: {connt2_delta:+d})")
-                    logging.info("=" * 80)
-                    
-                    # Check memory usage periodically
-                    check_and_clear_memory_usage()
-                    
-                    self.stop_event.wait(timeout=5)  # Update every 5 seconds
-                except Exception as e:
-                    logging.error(f"Error in progress display: {str(e)}")
-                    time.sleep(5)  # Wait before retrying
-        finally:
-            # Clean up resources
-            self.close_connections()
+                    c1 = self.get_conntrack_count("connt1")
+                    c2 = self.get_conntrack_count("connt2")
+                    d1 = c1 - self.last_connt1
+                    d2 = c2 - self.last_connt2
+                    self.last_connt1, self.last_connt2 = c1, c2
 
+                    logging.info("\n" + "="*80)
+                    logging.info(f"Progress Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    logging.info("="*80)
+                    fmt = "{:<25} | {:>10} | {:>10} | {:>10}"
+                    logging.info(fmt.format("File","Size (MB)","Lines","Delta (KB)"))
+                    logging.info("-"*80)
+                    for fp, stats in progress_tracker.file_stats.items():
+                        name = os.path.basename(fp)
+                        size_mb = stats.get('size',0)/(1024*1024)
+                        lines  = stats.get('lines',0)
+                        dk     = stats.get('delta_size',0)/1024
+                        logging.info(fmt.format(name,f"{size_mb:.2f}",f"{lines}",f"{dk:.2f}"))
+                    logging.info("-"*80)
+                    logging.info("Conntrack Entries:")
+                    logging.info(f"connt1: {c1} (Δ: {d1:+d})")
+                    logging.info(f"connt2: {c2} (Δ: {d2:+d})")
+                    logging.info("="*80)
+
+                    check_and_clear_memory_usage()
+                    self.stop_event.wait(5)
+                except Exception as e:
+                    logging.error(f"Error in progress display: {e}")
+                    time.sleep(5)
+        finally:
+            self.close_connections()	
+			
 # Log monitoring class for watching files for growth or specific content
 class LogMonitorHandler(threading.Thread): 
     def __init__(self, filepath, keywords, print_output, stop_event, result_dict, progress_callback=None):
@@ -323,7 +288,7 @@ class LogMonitorHandler(threading.Thread):
         self.current_host = get_current_hostname()
         self.proc = None
         self.last_progress_time = time.time()
-        self.progress_interval = 30  # Update progress every 30 seconds
+        self.progress_interval = 10  # Update progress every 30 seconds
         
     def get_file_size(self):
         try:
@@ -592,7 +557,7 @@ def monitor_remote_log_file(filepath, host, keyword_expr="", timeout=None, print
         
         start_time = time.time()
         last_progress_time = time.time()
-        progress_interval = 30  # Update progress every 30 seconds
+        progress_interval = 10  # Update progress every 30 seconds
         
         def get_remote_file_stats():
             """Get line count and file size from remote host"""
@@ -728,4 +693,5 @@ def monitor_remote_log_file(filepath, host, keyword_expr="", timeout=None, print
                 if match_mode:
                     result_dict[f"remote-{host}-{threading.current_thread().name}"] = len(seen_keywords)
                 else:
+                    result_dict[f"remote-{host}-{threading.current_thread().name}"] = total_lines_grown
                     result_dict[f"remote-{host}-{threading.current_thread().name}"] = total_lines_grown
