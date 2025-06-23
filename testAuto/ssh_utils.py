@@ -144,7 +144,7 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
             start = time.time()
             
-            # Use select for non-blocking read with timeout
+            # Use select-like wait for exit with timeout
             channel = stdout.channel
             while not channel.exit_status_ready():
                 if time.time() - start > timeout:
@@ -157,7 +157,8 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             out = stdout.read().decode()
             err = stderr.read().decode()
             
-            if exit_status != 0:
+            # Only log errors for non-pgrep commands
+            if exit_status != 0 and 'pgrep' not in command:
                 logging.error(f"Command failed with exit status {exit_status}: {command}")
                 logging.error(f"Error output: {err}")
             
@@ -216,18 +217,18 @@ def force_kill_all_monitoring_processes():
             # First try SIGTERM
             kill_cmd = f"sudo pkill -f {process}"
             if client is None:
-                status, output, _ = run_command_locally(kill_cmd, tag)
+                run_command_locally(kill_cmd, tag)
             else:
-                status, output = run_command_with_timeout(client, kill_cmd, 3, hostname=host)
+                run_command_with_timeout(client, kill_cmd, 3, hostname=host)
             
             time.sleep(1)
             
             # Then force kill with SIGKILL
             force_kill_cmd = f"sudo pkill -9 -f {process}"
             if client is None:
-                status, output, _ = run_command_locally(force_kill_cmd, tag)
+                run_command_locally(force_kill_cmd, tag)
             else:
-                status, output = run_command_with_timeout(client, force_kill_cmd, 3, hostname=host)
+                run_command_with_timeout(client, force_kill_cmd, 3, hostname=host)
             
             logging.info(f"{GREEN}[cleanup] [{host}] Force killed {process}{RESET}")
         
@@ -251,28 +252,27 @@ class RemoteProgramRunner:
         verbose: bool = False,
         program_name: str = None,
     ):
-        self.hostname = hostname
-        self.command = command
-        self.working_dir = working_dir
-        self.check_stuck = check_stuck
-        self.stuck_check_interval = stuck_check_interval
+        self.hostname                = hostname
+        self.command                 = command
+        self.working_dir             = working_dir
+        self.check_stuck             = check_stuck
+        self.stuck_check_interval    = stuck_check_interval
         self.stuck_check_idle_threshold = stuck_check_idle_threshold
-        self.timeout = timeout
-        self.max_duration = max_duration
-        self.cleanup = cleanup
-        self.verbose = verbose
-        self.program_name = program_name or self._extract_program_name()
-
-        self.log_file = f"/tmp/{self.program_name}.log"
-        self.pid_file = f"/tmp/{self.program_name}.pid"
-        self.client = None
-        self.pid = None
-        self.result = {
+        self.timeout                 = timeout
+        self.max_duration            = max_duration
+        self.cleanup                 = cleanup
+        self.verbose                 = verbose
+        self.program_name            = program_name or self._extract_program_name()
+        self.log_file                = f"/tmp/{self.program_name}.log"
+        self.pid_file                = f"/tmp/{self.program_name}.pid"
+        self.client                  = None
+        self.pid                     = None
+        self.result                  = {
             "hostname": hostname,
-            "status": "unknown",
-            "output": "",
-            "error": "",
-            "pid": None,
+            "status":   "unknown",
+            "output":   "",
+            "error":    "",
+            "pid":      None,
             "log_file": self.log_file,
         }
 
@@ -427,22 +427,6 @@ def get_client_threads(concurrency_n, concurrency_c, tcp_timeout_t):
                 command=f"./udp_client_sub -s 172.16.1.1 -p 3000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.10-22 -r 10000-65000"
             ),
             name="Client-udp-convsrc1"
-        ),
-        threading.Thread(
-            target=build_and_run_client,
-            kwargs=dict(
-                hostname="convsrc2",
-                command=f"./udp_client_sub -s 172.16.1.1 -p 3000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.26-39 -r 10000-65000"
-            ),
-            name="Client-udp-convsrc2"
-        ),
-        threading.Thread(
-            target=build_and_run_client,
-            kwargs=dict(
-                hostname="convsrc2",
-                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -w 1 -a 172.16.1.26-39 -k -r 10000-65000 -t {tcp_timeout_t}"
-            ),
-            name="Client-tcp-convsrc2"
         )
     ]
     return client_threads
