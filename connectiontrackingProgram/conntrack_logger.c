@@ -929,7 +929,6 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
 
 
 
-// ----------- MAIN FUNCTION WITH EDGE-TRIGGERED EPOLL -------------
 int main(int argc, char *argv[]) {
     config_t cfg;
     if (parse_config(argc, argv, &cfg) != 0) return 1;
@@ -956,38 +955,23 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGINT, signal_handler);
 
-    // Initialize start time for statistics
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     char hostname[256];
     gethostname(hostname, sizeof(hostname));
-    
     log_with_timestamp("[INFO] Starting conntrack logger on %s \n", hostname);
     log_with_timestamp("[INFO] Machine name: %s, Syslog server: %s\n", 
                       cfg.machine_name, cfg.syslog_ip);
-    log_with_timestamp("[INFO] Debug: %s, Hash: %s, Payload: %s, Count: %s\n",
-                      cfg.debug_enabled ? "enabled" : "enabled by default",
-                      cfg.hash_enabled ? "enabled" : "enabled by default",
-                      cfg.payload_enabled ? "enabled" : "enabled by default",
-                      cfg.count_enabled ? "enabled" : "disabled");
-    
-    if (cfg.src_range) {
-        log_with_timestamp("[INFO] Filtering by source IP range: %s\n", cfg.src_range);
-    }
-    
-    // Initialize protocol statistics counters
+
     memset(&proto_stats, 0, sizeof(proto_stats));
-    
     event_queue = spsc_queue_init(cfg.event_queue_size);
     if (!event_queue) {
         log_with_timestamp("[ERROR] Failed to initialize event queue\n");
         return 1;
     }
-    
     log_with_timestamp("[INFO] Initialized event queue with capacity %zu\n", cfg.event_queue_size);
-    
+
     app_context_t app_ctx = { .event_queue = event_queue, .cfg = &cfg, .event_counter = 0 };
-    
     g_nfct_handle = nfct_open(NFNL_SUBSYS_CTNETLINK,
                               NFNLGRP_CONNTRACK_NEW | NFNLGRP_CONNTRACK_UPDATE | NFNLGRP_CONNTRACK_DESTROY);
     if (!g_nfct_handle) {
@@ -995,22 +979,17 @@ int main(int argc, char *argv[]) {
         spsc_queue_destroy(event_queue);
         return 1;
     }
-    
     nfct_callback_register(g_nfct_handle, NFCT_T_ALL, cb, &app_ctx);
     int conntrack_fd = nfct_fd(g_nfct_handle);
     fcntl(conntrack_fd, F_SETFL, fcntl(conntrack_fd, F_GETFL, 0) | O_NONBLOCK);
-    
-    int rcvbuf = 8*1024*1024;  // Increased receive buffer for high-load scenarios
-    if (setsockopt(conntrack_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-        log_with_timestamp("[WARNING] Failed to set SO_RCVBUF: %s\n", strerror(errno));
-    } else {
-        log_with_timestamp("[INFO] Set netlink receive buffer to %d bytes\n", rcvbuf);
-    }
-    
+
+    int rcvbuf = 8*1024*1024;
+    setsockopt(conntrack_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = conntrack_fd };
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conntrack_fd, &ev);
-    
+
     worker_config_t worker_cfg = {
         .machine_name = cfg.machine_name, 
         .syslog_ip = cfg.syslog_ip,
@@ -1022,72 +1001,50 @@ int main(int argc, char *argv[]) {
         .consecutive_failures = 0,
         .stats_interval = cfg.stats_interval
     };
-    
     pthread_create(&worker_thread, NULL, syslog_worker, &worker_cfg);
-    
+
     struct sched_param sp = { .sched_priority = sched_get_priority_max(SCHED_FIFO) };
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-        log_with_timestamp("[WARNING] Failed to set RT priority: %s\n", strerror(errno));
-    } else {
-        log_with_timestamp("[INFO] Set main thread to RT priority\n");
-    }
-    
-    log_with_timestamp("[INFO] Main event loop started - %s\n", "2025-06-28 10:46:16");
-    
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+    log_with_timestamp("[INFO] Main event loop started\n");
+
+    // --- Main Event Loop: Now as minimal as possible ---
     while (!shutdown_flag) {
-        struct epoll_event events[64];  // Process multiple events per epoll_wait
-        int nfds = epoll_wait(epoll_fd, events, 64, 10);  // 10ms timeout
+        struct epoll_event events[64];
+        int nfds = epoll_wait(epoll_fd, events, 64, -1); // -1: wait forever
 
         if (nfds < 0 && errno != EINTR) {
             log_with_timestamp("[ERROR] epoll_wait: %s\n", strerror(errno));
             break;
         }
 
-        if (nfds > 0) {
-            // Process all events from this epoll notification
-            for (int i = 0; i < nfds; i++) {
-                if (events[i].data.fd == conntrack_fd) {
-                    // Process as many events as possible with edge-triggered mode
-                    int processed = 0;
-                    while (!shutdown_flag) {
-                        int ret = nfct_catch(g_nfct_handle);
-                        if (ret < 0) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                // No more events to read
-                                break;
-                            } else if (errno != EINTR) {
-                                log_with_timestamp("[ERROR] nfct_catch: %s\n", strerror(errno));
-                                break;
-                            }
-                        } else {
-                            processed++;
-                            // Removed sched_yield() for lower latency
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == conntrack_fd) {
+                while (!shutdown_flag) {
+                    int ret = nfct_catch(g_nfct_handle);
+                    if (ret < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno != EINTR) {
+                            log_with_timestamp("[ERROR] nfct_catch: %s\n", strerror(errno));
+                            break;
                         }
-                    }
-                    
-                    if (processed > 0 && cfg.debug_enabled) {
-                        log_with_timestamp("[DEBUG] Processed %d conntrack events in this batch\n", processed);
                     }
                 }
             }
         }
-        // No periodic stats printing in main thread. Worker thread handles stats printing.
     }
-    
+
     log_with_timestamp("[INFO] Shutting down...\n");
     close(epoll_fd);
-    
+
     if (g_nfct_handle) {
         nfct_callback_unregister(g_nfct_handle);
         nfct_close(g_nfct_handle);
     }
-    
     pthread_cond_broadcast(&event_queue->not_empty_cond);
     pthread_cond_broadcast(&event_queue->not_full_cond);
     pthread_join(worker_thread, NULL);
-    
     spsc_queue_destroy(event_queue);
-    
     log_with_timestamp("[INFO] Clean shutdown complete\n");
     return 0;
 }
