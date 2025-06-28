@@ -1030,7 +1030,7 @@ int main(int argc, char *argv[]) {
     
     while (!shutdown_flag) {
         struct epoll_event events[64];  // Process multiple events per epoll_wait
-        int nfds = epoll_wait(epoll_fd, events, 64, 0);  // 0ms timeout - CHANGED
+        int nfds = epoll_wait(epoll_fd, events, 64, 10);  // 10ms timeout - CHANGED
         
         if (nfds < 0 && errno != EINTR) {
             log_with_timestamp("[ERROR] epoll_wait: %s\n", strerror(errno));
