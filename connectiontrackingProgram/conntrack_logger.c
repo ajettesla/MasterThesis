@@ -12,6 +12,7 @@
  */
 
 #define _GNU_SOURCE
+#include <sched.h>
 #include <sys/epoll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -951,7 +952,7 @@ int main(int argc, char *argv[]) {
     char hostname[256];
     gethostname(hostname, sizeof(hostname));
     
-    log_with_timestamp("[INFO] Starting conntrack logger on %s (ajettesla)\n", hostname);
+    log_with_timestamp("[INFO] Starting conntrack logger on %s \n", hostname);
     log_with_timestamp("[INFO] Machine name: %s, Syslog server: %s\n", 
                       cfg.machine_name, cfg.syslog_ip);
     log_with_timestamp("[INFO] Debug: %s, Hash: %s, Payload: %s, Count: %s\n",
@@ -1029,7 +1030,7 @@ int main(int argc, char *argv[]) {
     
     while (!shutdown_flag) {
         struct epoll_event events[64];  // Process multiple events per epoll_wait
-        int nfds = epoll_wait(epoll_fd, events, 64, 10);  // 10ms timeout - CHANGED
+        int nfds = epoll_wait(epoll_fd, events, 64, 0);  // 0ms timeout - CHANGED
         
         if (nfds < 0 && errno != EINTR) {
             log_with_timestamp("[ERROR] epoll_wait: %s\n", strerror(errno));
