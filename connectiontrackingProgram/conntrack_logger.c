@@ -1,5 +1,5 @@
 /*
- * High-performance conntrack logger optimized
+ * High-performance conntrack logger optimized for 100k events/sec
  * 
  * Key features:
  * - Zero-latency edge-triggered epoll with RT priority
@@ -8,6 +8,8 @@
  * - Enhanced message formatting with BLAKE3 hash
  * - Proper syslog message formatting with RFC5424 compliance
  * 
+ * Author: ajettesla
+ * Date: 2025-06-28 09:12:12
  * 
  * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger conntrack_logger.c
  */
@@ -1023,54 +1025,63 @@ send_batch:
 static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
     app_context_t *ctx = (app_context_t *)data;
     atomic_fetch_add(&total_events_received, 1);
-    
+
+    // Take timestamp as soon as the callback is entered
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long long timestamp_ns = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+    // Source IP range filtering
     if (ctx->cfg->src_range) {
         struct in_addr src_addr = { .s_addr = nfct_get_attr_u32(ct, ATTR_ORIG_IPV4_SRC) };
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src_addr, src_ip, sizeof(src_ip));
+
         if (!ip_in_range(src_ip, ctx->cfg->src_range)) {
             if (ctx->cfg->debug_enabled) {
                 log_with_timestamp("[DEBUG] Filtered event from %s (not in range %s)\n", 
-                                 src_ip, ctx->cfg->src_range);
+                                   src_ip, ctx->cfg->src_range);
             }
             return NFCT_CB_CONTINUE;
         }
     }
-    
+
+    // Allocate memory for event
     event_data_t *event = calloc(1, sizeof(event_data_t));
     if (!event) {
         log_with_timestamp("[ERROR] Failed to allocate event_data_t\n");
         atomic_fetch_add(&total_events_dropped, 1);
         return NFCT_CB_CONTINUE;
     }
-    
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    event->timestamp_ns = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-    
+
+    event->timestamp_ns = timestamp_ns;
+    event->type = type;
+    event->count = ctx->cfg->count_enabled ? atomic_fetch_add(&ctx->event_counter, 1) + 1 : 0;
+
+    // Clone conntrack entry (protect if needed)
     pthread_mutex_lock(&conntrack_mutex);
     event->ct = nfct_clone(ct);
     pthread_mutex_unlock(&conntrack_mutex);
-    
+
     if (!event->ct) {
         log_with_timestamp("[ERROR] Failed to clone conntrack\n");
         free(event);
         atomic_fetch_add(&total_events_dropped, 1);
         return NFCT_CB_CONTINUE;
     }
-    
-    event->type = type;
-    event->count = ctx->cfg->count_enabled ? atomic_fetch_add(&ctx->event_counter, 1) + 1 : 0;
-    
+
+    // Push event to queue
     if (spsc_queue_push_blocking(ctx->event_queue, event) != 0) {
         log_with_timestamp("[ERROR] Failed to push event to queue\n");
         nfct_destroy(event->ct);
         free(event);
         atomic_fetch_add(&total_events_dropped, 1);
     }
-    
+
     return NFCT_CB_CONTINUE;
 }
+
+
 
 // ----------- MAIN FUNCTION WITH EDGE-TRIGGERED EPOLL -------------
 int main(int argc, char *argv[]) {
