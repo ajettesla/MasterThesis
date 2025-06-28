@@ -12,7 +12,6 @@
  */
 
 #define _GNU_SOURCE
-#include <sched.h>
 #include <sys/epoll.h>
 #include <stdio.h>
 #include <stdlib.h>
