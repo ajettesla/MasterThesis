@@ -1,5 +1,4 @@
 /*
- * High-performance conntrack logger optimized for 100k events/sec
  * 
  * Key features:
  * - Zero-latency edge-triggered epoll with RT priority
@@ -8,11 +7,10 @@
  * - Enhanced message formatting with BLAKE3 hash
  * - Proper syslog message formatting with RFC5424 compliance
  * 
- * Author: ajettesla
- * Date: 2025-06-28 09:12:12
  * 
  * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger conntrack_logger.c
  */
+
 #define _GNU_SOURCE
 #include <sys/epoll.h>
 #include <stdio.h>
@@ -39,16 +37,16 @@
 #include <sched.h>
 
 // ----------- CONFIGURABLE CONSTANTS -----------------
-#define DEFAULT_EVENT_QUEUE_SIZE 500000   // 5s of events at 100k/sec
+#define DEFAULT_EVENT_QUEUE_SIZE 500000   // 5s of events 
 #define QUEUE_RESIZE_THRESHOLD 0.7        // Resize when 70% full
 #define MAX_QUEUE_SIZE 2000000            // Max queue size (20s of events)
 
 #define MAX_WORKERS 1                     // Fixed single worker for memory safety
 #define MAX_BUFFER_SIZE (500 * 1024)      // 500KB buffer
-#define MIN_BATCH_COUNT 100               // Min msgs before flush
-#define MAX_BATCH_COUNT 1000              // Max msgs in one batch
-#define ADAPTIVE_BATCH_ENABLED 1          // Enable adaptive batch sizing
-#define BATCH_TIMEOUT_US 1000000          // 1 second flush timeout
+#define MIN_BATCH_COUNT 1                 // Min msgs before flush - CHANGED FOR LOW LATENCY
+#define MAX_BATCH_COUNT 1                 // Max msgs in one batch - CHANGED FOR LOW LATENCY
+#define ADAPTIVE_BATCH_ENABLED 0          // Disable adaptive batch sizing - CHANGED FOR LOW LATENCY
+#define BATCH_TIMEOUT_US 1000             // 1 millisecond flush timeout - CHANGED FOR LOW LATENCY
 
 #define MAX_MESSAGE_LEN 1024
 #define SYSLOG_PORT "514"
@@ -732,48 +730,21 @@ static void create_syslog_message(char *msg, size_t len, const char *machine_nam
     snprintf(msg, len, "<134> %s conntrack_logger - - - %s", machine_name, data);
 }
 
-// ----------- WORKER THREAD IMPLEMENTATION -----------------------
+// ----------- WORKER THREAD IMPLEMENTATION (MODIFIED FOR LOW LATENCY) -----------------------
 void* syslog_worker(void* arg) {
     worker_config_t *cfg = (worker_config_t *)arg;
     int syslog_fd = -1;
     atomic_store(&cfg->consecutive_failures, 0);
-    
-    char *batch_buf = malloc(MAX_BUFFER_SIZE);
-    if (!batch_buf) {
-        log_with_timestamp("[ERROR] Worker failed to allocate batch buffer\n");
-        return NULL;
-    }
-    
-    batch_buf[0] = '\0';
-    size_t batch_len = 0;
-    int batch_count = 0;
-    struct timeval last_flush;
+
     struct timeval last_stats;
-    gettimeofday(&last_flush, NULL);
     gettimeofday(&last_stats, NULL);
     
-    // Dynamic batch sizing parameters
-    int current_batch_limit = MIN_BATCH_COUNT;
-    
-    log_with_timestamp("[INFO] Worker thread started with %dKB buffer and %dms timeout\n", 
-                     MAX_BUFFER_SIZE/1024, BATCH_TIMEOUT_US/1000);
+    log_with_timestamp("[INFO] Worker thread started in LOW LATENCY mode (no batching)\n");
 
     while (!shutdown_flag) {
         void *item = NULL;
         if (!spsc_queue_pop_blocking(event_queue, &item) || !item) {
             if (shutdown_flag) break;
-            
-            // Check if we need to flush based on timeout
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            long elapsed_us = (now.tv_sec - last_flush.tv_sec) * 1000000 + (now.tv_usec - last_flush.tv_usec);
-            
-            if (batch_count > 0 && elapsed_us >= BATCH_TIMEOUT_US) {
-                log_with_timestamp("[INFO] Flushing batch due to timeout: %d events, %zu bytes\n", 
-                                 batch_count, batch_len);
-                goto send_batch;
-            }
-            
             continue;
         }
 
@@ -788,238 +759,102 @@ void* syslog_worker(void* arg) {
         
         free(event_data); // Free the container immediately after use.
 
-        // Format message content based on the first program's structure
+        // Format message content
         char message_content[MAX_MESSAGE_LEN];
         if (cfg->hash_enabled && cfg->payload_enabled) {
             if (cfg->count_enabled) {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%lld,%s,%d,%d,%d,%s,%u,%s,%u",
-                         conn_info.count, 
-                         conn_info.timestamp_ns, 
-                         conn_info.hash,
-                         conn_info.type_num, 
-                         conn_info.state_num, 
-                         conn_info.proto_num,
-                         conn_info.src_ip, 
-                         conn_info.src_port, 
-                         conn_info.dst_ip, 
-                         conn_info.dst_port);
+                snprintf(message_content, sizeof(message_content), "%lld,%lld,%s,%d,%d,%d,%s,%u,%s,%u",
+                         conn_info.count, conn_info.timestamp_ns, conn_info.hash, conn_info.type_num, 
+                         conn_info.state_num, conn_info.proto_num, conn_info.src_ip, conn_info.src_port, 
+                         conn_info.dst_ip, conn_info.dst_port);
             } else {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%s,%d,%d,%d,%s,%u,%s,%u",
-                         conn_info.timestamp_ns, 
-                         conn_info.hash,
-                         conn_info.type_num, 
-                         conn_info.state_num, 
-                         conn_info.proto_num,
-                         conn_info.src_ip, 
-                         conn_info.src_port, 
-                         conn_info.dst_ip, 
+                snprintf(message_content, sizeof(message_content), "%lld,%s,%d,%d,%d,%s,%u,%s,%u",
+                         conn_info.timestamp_ns, conn_info.hash, conn_info.type_num, conn_info.state_num, 
+                         conn_info.proto_num, conn_info.src_ip, conn_info.src_port, conn_info.dst_ip, 
                          conn_info.dst_port);
             }
         } else if (cfg->hash_enabled) {
             if (cfg->count_enabled) {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%lld,%s", 
-                         conn_info.count, 
-                         conn_info.timestamp_ns, 
-                         conn_info.hash);
+                snprintf(message_content, sizeof(message_content), "%lld,%lld,%s", 
+                         conn_info.count, conn_info.timestamp_ns, conn_info.hash);
             } else {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%s", 
-                         conn_info.timestamp_ns, 
-                         conn_info.hash);
+                snprintf(message_content, sizeof(message_content), "%lld,%s", 
+                         conn_info.timestamp_ns, conn_info.hash);
             }
         } else if (cfg->payload_enabled) {
             if (cfg->count_enabled) {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%lld,%d,%d,%d,%s,%u,%s,%u",
-                         conn_info.count, 
-                         conn_info.timestamp_ns, 
-                         conn_info.type_num, 
-                         conn_info.state_num, 
-                         conn_info.proto_num,
-                         conn_info.src_ip, 
-                         conn_info.src_port, 
-                         conn_info.dst_ip, 
+                snprintf(message_content, sizeof(message_content), "%lld,%lld,%d,%d,%d,%s,%u,%s,%u",
+                         conn_info.count, conn_info.timestamp_ns, conn_info.type_num, conn_info.state_num, 
+                         conn_info.proto_num, conn_info.src_ip, conn_info.src_port, conn_info.dst_ip, 
                          conn_info.dst_port);
             } else {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%d,%d,%d,%s,%u,%s,%u",
-                         conn_info.timestamp_ns, 
-                         conn_info.type_num, 
-                         conn_info.state_num, 
-                         conn_info.proto_num,
-                         conn_info.src_ip, 
-                         conn_info.src_port, 
-                         conn_info.dst_ip, 
-                         conn_info.dst_port);
+                snprintf(message_content, sizeof(message_content), "%lld,%d,%d,%d,%s,%u,%s,%u",
+                         conn_info.timestamp_ns, conn_info.type_num, conn_info.state_num, conn_info.proto_num,
+                         conn_info.src_ip, conn_info.src_port, conn_info.dst_ip, conn_info.dst_port);
             }
         } else {
-            // Minimal content for test mode
             if (cfg->count_enabled) {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld,%lld", 
-                         conn_info.count, 
-                         conn_info.timestamp_ns);
+                snprintf(message_content, sizeof(message_content), "%lld,%lld", 
+                         conn_info.count, conn_info.timestamp_ns);
             } else {
-                snprintf(message_content, sizeof(message_content), 
-                         "%lld", 
+                snprintf(message_content, sizeof(message_content), "%lld", 
                          conn_info.timestamp_ns);
             }
         }
         
-        // Create properly formatted syslog message using the first program's format
         char syslog_msg[MAX_MESSAGE_LEN];
         create_syslog_message(syslog_msg, sizeof(syslog_msg), cfg->machine_name, message_content);
-        
+        strcat(syslog_msg, "\n"); // Add newline for proper syslog message termination
         size_t msg_len = strlen(syslog_msg);
-        
-        // Add newline for proper syslog message termination
-        if (batch_len + msg_len + 2 >= MAX_BUFFER_SIZE) {
-            // Current batch is full, send it
-            log_with_timestamp("[INFO] Buffer size limit reached (%zu bytes), sending batch\n", batch_len);
-            goto send_batch;
+
+        // --- SEND EVENT IMMEDIATELY ---
+        int failures = atomic_load(&cfg->consecutive_failures);
+        if (failures >= MAX_CONSECUTIVE_FAILURES) {
+            int delay_ms = RECONNECT_DELAY_MS * (1 << (failures - MAX_CONSECUTIVE_FAILURES));
+            if (delay_ms > 30000) delay_ms = 30000;
+            log_with_timestamp("[INFO] Too many consecutive failures (%d), backing off for %d ms\n", failures, delay_ms);
+            usleep(delay_ms * 1000);
         }
         
-        // Add message to batch with newline
-        strncat(batch_buf, syslog_msg, MAX_BUFFER_SIZE - batch_len - 2);
-        strcat(batch_buf, "\n");
-        batch_len += msg_len + 1; // +1 for newline
-        batch_count++;
+        if (syslog_fd < 0) {
+            syslog_fd = connect_to_syslog_with_retry(cfg->syslog_ip, SYSLOG_PORT, (int*)&cfg->consecutive_failures);
+        }
         
-        // Dynamic batch sizing based on queue utilization
-        if (ADAPTIVE_BATCH_ENABLED) {
-            double queue_util = spsc_queue_utilization(event_queue);
-            if (queue_util > 0.8) {
-                // High utilization - send smaller batches more frequently
-                current_batch_limit = MIN_BATCH_COUNT;
-            } else if (queue_util > 0.5) {
-                // Medium utilization - moderate batch size
-                current_batch_limit = (MIN_BATCH_COUNT + MAX_BATCH_COUNT) / 2;
+        if (syslog_fd >= 0) {
+            ssize_t sent = send(syslog_fd, syslog_msg, msg_len, MSG_NOSIGNAL);
+            if (sent < 0) {
+                log_with_timestamp("[ERROR] Failed to send event: %s\n", strerror(errno));
+                close(syslog_fd);
+                syslog_fd = -1;
+                atomic_fetch_add(&cfg->consecutive_failures, 1);
+                atomic_fetch_add(&total_events_dropped, 1); // Drop event on failure in low-latency mode
             } else {
-                // Low utilization - larger batches for efficiency
-                current_batch_limit = MAX_BATCH_COUNT;
+                atomic_store(&cfg->consecutive_failures, 0);
+                atomic_fetch_add(&total_events_sent, 1);
+                atomic_fetch_add(&total_bytes_sent, sent);
+                atomic_fetch_add(&total_batches_sent, 1); // Here, a "batch" is a single event
             }
+        } else {
+            log_with_timestamp("[WARNING] No syslog connection, dropping event\n");
+            atomic_fetch_add(&total_events_dropped, 1);
         }
-        
-        // Check if we have enough messages to send a batch
-        if (batch_count >= current_batch_limit) {
-            log_with_timestamp("[INFO] Sending batch due to count (%d events, target: %d)\n", 
-                             batch_count, current_batch_limit);
-            goto send_batch;
-        }
-        
-        // Check if we should send based on timeout
+
+        // Check for stats reporting
         struct timeval now;
         gettimeofday(&now, NULL);
-        long elapsed_us = (now.tv_sec - last_flush.tv_sec) * 1000000 + (now.tv_usec - last_flush.tv_usec);
-        
-        if (elapsed_us >= BATCH_TIMEOUT_US && batch_count > 0) {
-            log_with_timestamp("[INFO] Sending batch due to timeout (%dms elapsed)\n", 
-                             (int)(elapsed_us/1000));
-            goto send_batch;
-        }
-        
-        // Check for stats reporting
         long stats_elapsed_sec = now.tv_sec - last_stats.tv_sec;
         if (stats_elapsed_sec >= cfg->stats_interval) {
             print_stats();
             last_stats = now;
         }
-        
-        continue;
-        
-send_batch:
-        if (batch_count == 0 || batch_len == 0) {
-            // Don't send empty batches
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            last_flush = now;
-            continue;
-        }
-        
-        int failures = atomic_load(&cfg->consecutive_failures);
-        if (failures >= MAX_CONSECUTIVE_FAILURES) {
-            int delay_ms = RECONNECT_DELAY_MS * (1 << (failures - MAX_CONSECUTIVE_FAILURES));
-            if (delay_ms > 30000) delay_ms = 30000;
-            log_with_timestamp("[INFO] Too many consecutive failures (%d), backing off for %d ms\n", 
-                             failures, delay_ms);
-            usleep(delay_ms * 1000);
-        }
-        
-        // Try to connect if needed
-        if (syslog_fd < 0) {
-            syslog_fd = connect_to_syslog_with_retry(cfg->syslog_ip, SYSLOG_PORT, 
-                                                  (int*)&cfg->consecutive_failures);
-        }
-        
-        if (syslog_fd >= 0) {
-            ssize_t sent = send(syslog_fd, batch_buf, batch_len, MSG_NOSIGNAL);
-            if (sent < 0) {
-                log_with_timestamp("[ERROR] Failed to send batch: %s\n", strerror(errno));
-                close(syslog_fd);
-                syslog_fd = -1;
-                atomic_fetch_add(&cfg->consecutive_failures, 1);
-                // DON'T DROP PACKETS - we'll retry sending this batch
-                log_with_timestamp("[INFO] Will retry sending this batch\n");
-            } else {
-                log_with_timestamp("[INFO] Successfully sent batch: %zd bytes, %d events\n", 
-                                 sent, batch_count);
-                atomic_store(&cfg->consecutive_failures, 0);
-                atomic_fetch_add(&total_events_sent, batch_count);
-                atomic_fetch_add(&total_bytes_sent, sent);
-                atomic_fetch_add(&total_batches_sent, 1);
-                
-                // Reset batch
-                batch_buf[0] = '\0';
-                batch_len = 0;
-                batch_count = 0;
-                gettimeofday(&last_flush, NULL);
-            }
-        } else {
-            log_with_timestamp("[WARNING] No syslog connection, will retry this batch\n");
-            // DON'T DROP PACKETS - we'll keep this batch and retry
-        }
-    }
-
-    // Final flush
-    if (batch_count > 0 && batch_len > 0) {
-        log_with_timestamp("[INFO] Final flush: %d events, %zu bytes\n", batch_count, batch_len);
-        
-        if (syslog_fd < 0) {
-            syslog_fd = connect_to_syslog_with_retry(cfg->syslog_ip, SYSLOG_PORT, 
-                                                  (int*)&cfg->consecutive_failures);
-        }
-        
-        if (syslog_fd >= 0) {
-            ssize_t sent = send(syslog_fd, batch_buf, batch_len, MSG_NOSIGNAL);
-            if (sent > 0) {
-                log_with_timestamp("[INFO] Final flush sent: %zd bytes\n", sent);
-                atomic_fetch_add(&total_events_sent, batch_count);
-                atomic_fetch_add(&total_bytes_sent, sent);
-                atomic_fetch_add(&total_batches_sent, 1);
-            } else {
-                log_with_timestamp("[ERROR] Failed to send final batch: %s\n", strerror(errno));
-                // On shutdown, we might lose this batch - that's acceptable
-                atomic_fetch_add(&total_events_dropped, batch_count);
-            }
-        } else {
-            log_with_timestamp("[ERROR] No syslog connection for final flush, dropping %d events\n", 
-                             batch_count);
-            atomic_fetch_add(&total_events_dropped, batch_count);
-        }
     }
     
     if (syslog_fd >= 0) close(syslog_fd);
-    free(batch_buf);
-    
-    // Final stats
-    print_stats();
-    
+    print_stats(); // Final stats
     log_with_timestamp("[INFO] Worker thread exiting.\n");
     return NULL;
 }
+
 
 // ----------- CONNTRACK CALLBACK ---------------------
 static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *data) {
@@ -1186,7 +1021,7 @@ int main(int argc, char *argv[]) {
         log_with_timestamp("[INFO] Set main thread to RT priority\n");
     }
     
-    log_with_timestamp("[INFO] Main event loop started - %s\n", "2025-06-28 09:12:12");
+    log_with_timestamp("[INFO] Main event loop started - %s\n", "2025-06-28 10:46:16");
     
     // Start statistics reporting
     struct timeval last_stats;
@@ -1194,7 +1029,7 @@ int main(int argc, char *argv[]) {
     
     while (!shutdown_flag) {
         struct epoll_event events[64];  // Process multiple events per epoll_wait
-        int nfds = epoll_wait(epoll_fd, events, 64, 100);  // 100ms timeout
+        int nfds = epoll_wait(epoll_fd, events, 64, 10);  // 10ms timeout - CHANGED
         
         if (nfds < 0 && errno != EINTR) {
             log_with_timestamp("[ERROR] epoll_wait: %s\n", strerror(errno));
@@ -1219,10 +1054,7 @@ int main(int argc, char *argv[]) {
                             }
                         } else {
                             processed++;
-                            // After every 1000 events, yield to prevent starvation
-                            if (processed % 1000 == 0) {
-                                sched_yield();
-                            }
+                            // Removed sched_yield() for lower latency
                         }
                     }
                     
