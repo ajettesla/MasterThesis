@@ -1,4 +1,5 @@
 /*
+ * High-performance conntrack logger optimized for 100k events/sec
  * 
  * Key features:
  * - Zero-latency edge-triggered epoll with RT priority
@@ -7,10 +8,11 @@
  * - Enhanced message formatting with BLAKE3 hash
  * - Proper syslog message formatting with RFC5424 compliance
  * 
+ * Author: ajettesla
+ * Date: 2025-06-28 10:46:16
  * 
  * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger conntrack_logger.c
  */
-
 #define _GNU_SOURCE
 #include <sys/epoll.h>
 #include <stdio.h>
@@ -37,7 +39,7 @@
 #include <sched.h>
 
 // ----------- CONFIGURABLE CONSTANTS -----------------
-#define DEFAULT_EVENT_QUEUE_SIZE 500000   // 5s of events 
+#define DEFAULT_EVENT_QUEUE_SIZE 500000   // 5s of events at 100k/sec
 #define QUEUE_RESIZE_THRESHOLD 0.7        // Resize when 70% full
 #define MAX_QUEUE_SIZE 2000000            // Max queue size (20s of events)
 
@@ -738,13 +740,22 @@ void* syslog_worker(void* arg) {
 
     struct timeval last_stats;
     gettimeofday(&last_stats, NULL);
-    
+
     log_with_timestamp("[INFO] Worker thread started in LOW LATENCY mode (no batching)\n");
 
     while (!shutdown_flag) {
         void *item = NULL;
         if (!spsc_queue_pop_blocking(event_queue, &item) || !item) {
             if (shutdown_flag) break;
+            // Even if no event, check if it's time to print stats
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            long stats_elapsed_sec = now.tv_sec - last_stats.tv_sec;
+            if (stats_elapsed_sec >= cfg->stats_interval) {
+                print_stats();
+                last_stats = now;
+            }
+            usleep(1000); // Sleep a bit to avoid busy loop
             continue;
         }
 
@@ -756,7 +767,7 @@ void* syslog_worker(void* arg) {
         nfct_destroy(event_data->ct);
         event_data->ct = NULL;
         pthread_mutex_unlock(&conntrack_mutex);
-        
+
         free(event_data); // Free the container immediately after use.
 
         // Format message content
@@ -801,7 +812,7 @@ void* syslog_worker(void* arg) {
                          conn_info.timestamp_ns);
             }
         }
-        
+
         char syslog_msg[MAX_MESSAGE_LEN];
         create_syslog_message(syslog_msg, sizeof(syslog_msg), cfg->machine_name, message_content);
         strcat(syslog_msg, "\n"); // Add newline for proper syslog message termination
@@ -815,11 +826,11 @@ void* syslog_worker(void* arg) {
             log_with_timestamp("[INFO] Too many consecutive failures (%d), backing off for %d ms\n", failures, delay_ms);
             usleep(delay_ms * 1000);
         }
-        
+
         if (syslog_fd < 0) {
             syslog_fd = connect_to_syslog_with_retry(cfg->syslog_ip, SYSLOG_PORT, (int*)&cfg->consecutive_failures);
         }
-        
+
         if (syslog_fd >= 0) {
             ssize_t sent = send(syslog_fd, syslog_msg, msg_len, MSG_NOSIGNAL);
             if (sent < 0) {
@@ -848,7 +859,7 @@ void* syslog_worker(void* arg) {
             last_stats = now;
         }
     }
-    
+
     if (syslog_fd >= 0) close(syslog_fd);
     print_stats(); // Final stats
     log_with_timestamp("[INFO] Worker thread exiting.\n");
@@ -1023,19 +1034,15 @@ int main(int argc, char *argv[]) {
     
     log_with_timestamp("[INFO] Main event loop started - %s\n", "2025-06-28 10:46:16");
     
-    // Start statistics reporting
-    struct timeval last_stats;
-    gettimeofday(&last_stats, NULL);
-    
     while (!shutdown_flag) {
         struct epoll_event events[64];  // Process multiple events per epoll_wait
-        int nfds = epoll_wait(epoll_fd, events, 64, 10);  // 10ms timeout - CHANGED
-        
+        int nfds = epoll_wait(epoll_fd, events, 64, 10);  // 10ms timeout
+
         if (nfds < 0 && errno != EINTR) {
             log_with_timestamp("[ERROR] epoll_wait: %s\n", strerror(errno));
             break;
         }
-        
+
         if (nfds > 0) {
             // Process all events from this epoll notification
             for (int i = 0; i < nfds; i++) {
@@ -1064,16 +1071,7 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
-        
-        // Print stats periodically from main thread
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long stats_elapsed_sec = now.tv_sec - last_stats.tv_sec;
-        
-        if (stats_elapsed_sec >= cfg.stats_interval) {
-            print_stats();
-            last_stats = now;
-        }
+        // No periodic stats printing in main thread. Worker thread handles stats printing.
     }
     
     log_with_timestamp("[INFO] Shutting down...\n");
