@@ -1011,7 +1011,7 @@ int main(int argc, char *argv[]) {
     // --- Main Event Loop: Now as minimal as possible ---
     while (!shutdown_flag) {
         struct epoll_event events[64];
-        int nfds = epoll_wait(epoll_fd, events, 64, -1); // -1: wait forever
+        int nfds = epoll_wait(epoll_fd, events, 64, 10); // 
 
         if (nfds < 0 && errno != EINTR) {
             log_with_timestamp("[ERROR] epoll_wait: %s\n", strerror(errno));
