@@ -23,3 +23,9 @@ The TCP/UDP server programs and traffic generation tools are included in the `tr
 ---
 
 
+To verify current in-flight connections
+
+watch -n 1 'ss -ant | awk "NR>1 {count[\$1]++} END {for (s in count) print s, count[s]}"'
+
+
+
