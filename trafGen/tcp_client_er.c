@@ -1,6 +1,6 @@
 /**
  * Epoll-based multithreaded TCP client with unique (source IP, source port) per connection.
- * fixed conncurrency isssue and we can check it with watch -n 1 'ss -ant | awk "NR>1 {count[\$1]++} END {for (s in count) print s, count[s]}"'
+ * fixed conncurrency issue and we can check it with watch -n 1 'ss -ant | awk "NR>1 {count[\$1]++} END {for (s in count) print s, count[s]}"'
  * Uses a dynamic work-stealing model where threads pull from a global connection counter.
  * Added explicit timeout checking to prevent stalled/stuck connections.
  * Auto-terminates when all connections are processed.
