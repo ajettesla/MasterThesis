@@ -485,8 +485,9 @@ int main(int argc, char **argv) {
         pthread_create(&tids[t], NULL, connection_worker, &targs); 
     }
     
-    // Use the current date/time provided by the user
-    char time_buf[] = "2025-07-01 14:21:34";
+    time_t now = time(NULL);
+    char time_buf[100];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S UTC", gmtime(&now));
     pthread_create(&tids[num_threads], NULL, progress_reporter, time_buf);
 
     for (int t = 0; t < num_threads + 1; t++) { 
