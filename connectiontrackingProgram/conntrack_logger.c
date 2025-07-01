@@ -8,9 +8,7 @@
  * - Enhanced message formatting with BLAKE3 hash
  * - Proper syslog message formatting with RFC5424 compliance
  * 
- * Author: ajettesla
- * Date: 2025-06-28 10:46:16
- * 
+
  * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger conntrack_logger.c
  */
 #define _GNU_SOURCE
