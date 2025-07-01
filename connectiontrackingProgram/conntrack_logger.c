@@ -8,7 +8,6 @@
  * - Enhanced message formatting with BLAKE3 hash
  * - Proper syslog message formatting with RFC5424 compliance
  * 
-
  * Build: gcc -O2 -Wall -pthread -lblake3 -lnetfilter_conntrack -o conntrack_logger conntrack_logger.c
  */
 #define _GNU_SOURCE
@@ -78,6 +77,7 @@ typedef struct {
     atomic_llong new_events;        // NFCT_T_NEW
     atomic_llong update_events;     // NFCT_T_UPDATE
     atomic_llong destroy_events;    // NFCT_T_DESTROY
+    atomic_llong rejected_events;   // Filtered/rejected events
 } protocol_stats_t;
 
 // ----------- SPSC QUEUE DEFINITION - must come before use -------------
@@ -352,6 +352,7 @@ void print_protocol_stats() {
     log_with_timestamp("[PROTO] NEW:         %lld\n", atomic_load(&proto_stats.new_events));
     log_with_timestamp("[PROTO] UPDATE:      %lld\n", atomic_load(&proto_stats.update_events));
     log_with_timestamp("[PROTO] DESTROY:     %lld\n", atomic_load(&proto_stats.destroy_events));
+    log_with_timestamp("[PROTO] REJECTED:    %lld\n", atomic_load(&proto_stats.rejected_events));
 }
 
 // Print statistics about events processed
@@ -882,6 +883,9 @@ static int cb(enum nf_conntrack_msg_type type, struct nf_conntrack *ct, void *da
         inet_ntop(AF_INET, &src_addr, src_ip, sizeof(src_ip));
 
         if (!ip_in_range(src_ip, ctx->cfg->src_range)) {
+            // Count rejected events
+            atomic_fetch_add(&proto_stats.rejected_events, 1);
+            
             if (ctx->cfg->debug_enabled) {
                 log_with_timestamp("[DEBUG] Filtered event from %s (not in range %s)\n", 
                                    src_ip, ctx->cfg->src_range);
