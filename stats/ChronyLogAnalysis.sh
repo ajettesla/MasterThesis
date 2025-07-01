@@ -27,6 +27,8 @@ analyze_chrony_data() {
     # For pre-experimentation: get last 10 data lines
     if [ "$mode" = "pre" ]; then
         # Get the last 50 non-header lines from the log file
+        rm $output_file $logfile $sample_count_file
+
         grep -v "=\|Date (UTC) Time" "$log_file" | tail -50 > /tmp/chrony_data_temp.txt
         
         # Store the last timestamp for post-experimentation
