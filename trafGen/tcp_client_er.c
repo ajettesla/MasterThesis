@@ -3,6 +3,7 @@
  * Uses a dynamic work-stealing model where threads pull from a global connection counter.
  * Added explicit timeout checking to prevent stalled/stuck connections.
  * Auto-terminates when all connections are processed.
+ * Robust shutdown mechanism to prevent orphaned processes.
  *
  * Usage:
  *   tcp_client_er -s <server IP> -p <server port> -n <total connections> -c <concurrency> -a <client IP range> -r <port range> [-t <threads> ...]
@@ -28,11 +29,13 @@
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <sys/prctl.h>  // For prctl to set process name
 
 #define MAX_EVENTS_PER_THREAD 2048
 #define MAX_MSG 6
 #define CONNECT_TIMEOUT_SEC 5
 #define REPLY_TIMEOUT_SEC 3
+#define MAX_SHUTDOWN_WAIT_SEC 10  // Maximum time to wait for clean shutdown
 
 // Shared flags and debug
 static bool kill_flag = false;
@@ -54,6 +57,7 @@ static long total_connections_target = 0;
 
 // Used for clean shutdown
 static volatile sig_atomic_t global_stop = 0;
+static atomic_int threads_running = 0;
 
 // Mutex for debug log file (since it's shared)
 static pthread_mutex_t debug_log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -139,14 +143,27 @@ struct thread_args {
 
 void* connection_worker(void *arg) {
     struct thread_args *args = (struct thread_args*) arg;
+    
+    // Set thread name for better debugging
+    char thread_name[16];
+    snprintf(thread_name, sizeof(thread_name), "client-w%d", args->thread_id);
+    prctl(PR_SET_NAME, thread_name, 0, 0, 0);
+    
+    // Register this thread is running
+    atomic_fetch_add(&threads_running, 1);
+    
     struct epoll_event events[MAX_EVENTS_PER_THREAD];
     int epfd = epoll_create1(0);
-    if (epfd < 0) { return NULL; }
+    if (epfd < 0) { 
+        atomic_fetch_sub(&threads_running, 1);
+        return NULL; 
+    }
 
     // Array to store all connections for this thread - used for timeout checking
     struct conn_state **all_conns = calloc(args->max_concurrent, sizeof(struct conn_state*));
     int conn_count = 0;
 
+    // Check for global stop FIRST in the loop
     while (!global_stop) {
         // --- AGGRESSIVE CONNECTION CREATION LOOP ---
         // Keep creating connections until the concurrency limit is hit or all connections are started.
@@ -216,8 +233,12 @@ void* connection_worker(void *arg) {
         }
 
         // --- I/O EVENT PROCESSING ---
-        int n = epoll_wait(epfd, events, MAX_EVENTS_PER_THREAD, 50); // 50ms timeout
+        // Short timeout (50ms) to ensure we check global_stop frequently
+        int n = epoll_wait(epfd, events, MAX_EVENTS_PER_THREAD, 50); 
         time_t now = time(NULL);
+
+        // Break immediately if stop flag is set
+        if (global_stop) break;
 
         for (int i = 0; i < n; i++) {
             struct conn_state *cs = events[i].data.ptr;
@@ -335,7 +356,8 @@ void* connection_worker(void *arg) {
         }
     }
 
-    // Clean up
+    // Clean up all remaining connections when exiting
+    debug_log_msg("[T%d] Thread shutting down, cleaning up %d connections", args->thread_id, conn_count);
     for (int i = 0; i < conn_count; i++) {
         if (all_conns[i] != NULL) {
             epoll_ctl(epfd, EPOLL_CTL_DEL, all_conns[i]->fd, NULL);
@@ -346,11 +368,21 @@ void* connection_worker(void *arg) {
     }
     free(all_conns);
     close(epfd);
+    
+    // Deregister this thread before exit
+    atomic_fetch_sub(&threads_running, 1);
+    debug_log_msg("[T%d] Thread exited cleanly", args->thread_id);
     return NULL;
 }
 
 // ========== Progress Reporter Thread ==========
 void* progress_reporter(void *arg) {
+    // Set thread name for better debugging
+    prctl(PR_SET_NAME, "client-reporter", 0, 0, 0);
+    
+    // Register this thread
+    atomic_fetch_add(&threads_running, 1);
+    
     long last_conn_count = 0;
     time_t start_time = time(NULL);
     printf("[INFO] Starting test at %s\n", (char*)arg);
@@ -407,12 +439,17 @@ void* progress_reporter(void *arg) {
         last_conn_count = current_count;
         start_time = current_time;
     }
+    
     printf("[INFO] Progress reporter exiting.\n");
+    atomic_fetch_sub(&threads_running, 1);
     return NULL;
 }
 
 // ========== MAIN PROGRAM ==========
 int main(int argc, char **argv) {
+    // Set process name for better tracking
+    prctl(PR_SET_NAME, "tcp_client_er", 0, 0, 0);
+    
     struct sigaction sa = {.sa_handler = handle_sigint, .sa_flags = SA_RESTART};
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
@@ -480,18 +517,45 @@ int main(int argc, char **argv) {
         .server_port = server_port
     };
     
+    // Initialize the thread counter
+    atomic_store(&threads_running, 0);
+    
     for (int t = 0; t < num_threads; t++) { 
         targs.thread_id = t; 
         pthread_create(&tids[t], NULL, connection_worker, &targs); 
     }
     
+    // Get the current time for the start message
     time_t now = time(NULL);
     char time_buf[100];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S UTC", gmtime(&now));
     pthread_create(&tids[num_threads], NULL, progress_reporter, time_buf);
 
+    // Wait for all threads to finish or for the stop signal
     for (int t = 0; t < num_threads + 1; t++) { 
         pthread_join(tids[t], NULL); 
+    }
+
+    // CRITICAL: Force all remaining threads to exit if any are still running
+    if (atomic_load(&threads_running) > 0) {
+        printf("[WARN] %d threads still running after join - forcing exit\n", 
+               atomic_load(&threads_running));
+               
+        // Give threads a short time to exit gracefully
+        time_t shutdown_start = time(NULL);
+        while (atomic_load(&threads_running) > 0) {
+            // Force the stop flag again
+            global_stop = 1;
+            
+            // Break if we've waited too long
+            if (time(NULL) - shutdown_start > MAX_SHUTDOWN_WAIT_SEC) {
+                printf("[ERROR] Timed out waiting for threads to exit - some threads may remain!\n");
+                break;
+            }
+            
+            // Sleep a bit to give threads a chance to exit
+            usleep(100000);  // 100ms
+        }
     }
 
     fprintf(stderr, "[INFO] Test finished. Completed %d connections.\n", atomic_load(&stat_connection_closed));
@@ -504,6 +568,8 @@ int main(int argc, char **argv) {
     free(tids); free(tuples); free(source_ips); free(source_ports); free(server_ip);
     if (client_ip_range) free(client_ip_range); 
     if (client_port_range) free(client_port_range);
+    
+    printf("[INFO] Clean exit - all resources freed\n");
     return 0;
 }
 
