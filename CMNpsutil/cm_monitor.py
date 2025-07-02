@@ -8,7 +8,7 @@ import signal
 import csv
 from datetime import datetime
 
-PID_FILE = '/tmp/cpu_mem_monitor.pid'
+PID_FILE = '/tmp/exp/cpu_mem_monitor.pid'
 DEFAULT_INTERVAL = 5.0
 
 def timestamp_ns():
