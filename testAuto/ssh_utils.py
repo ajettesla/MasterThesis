@@ -416,7 +416,7 @@ def get_client_threads(concurrency_n, concurrency_c, tcp_timeout_t):
             target=build_and_run_client,
             kwargs=dict(
                 hostname="convsrc1",
-                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -w 1 -a 172.16.1.10-22 -k -r 10000-65000 -t {tcp_timeout_t}"
+                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.10-22 -k -r 10000-65000 -t {tcp_timeout_t}"
             ),
             name="Client-tcp-convsrc1"
          )#,
