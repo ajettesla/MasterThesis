@@ -107,7 +107,7 @@ def setup_logging(experiment_name, experiment_id, demon, timestamp, user):
         iter_suffix = f"_{iteration}" if iteration is not None else ""
 
         log_timestamp = timestamp.replace(" ", "_").replace(":", "")
-        log_path = f"/tmp/{experiment_name}_{experiment_id}{iter_suffix}_{log_timestamp}_auto.log"
+        log_path = f"/tmp/exp/{experiment_name}_{experiment_id}{iter_suffix}_{log_timestamp}_auto.log"
         experiment_state.log_file = open(log_path, 'w', buffering=1)
 
         # write header
