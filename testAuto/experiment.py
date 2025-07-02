@@ -519,7 +519,7 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
     logging.info("[pre-exp] Conntrack tables flushed.")
     
     # Setup logging scripts
-    CAlog = f"/tmp/CA_{experiment_id}.log"
+    CAlog = f"/tmp/exp/CA_{experiment_id}{experiment_name}{concurrency}.log"
     base_path = get_experiment_path(experiment_name, experiment_id, concurrency)
     
     # Create output directories first
