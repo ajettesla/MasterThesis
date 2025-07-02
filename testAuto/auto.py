@@ -68,7 +68,7 @@ def run_chrony_check(phase, experiment_id, concurrency, iteration):
             sys.exit(1)
         
         # First create the temp directory with proper permissions
-        dir_path = f"/tmp/{dir_name}/chrony"
+        dir_path = f"/tmp/exp/{dir_name}/chrony"
         mkdir_cmd = f"sudo mkdir -p {dir_path}"
         stdin, stdout, stderr = client.exec_command(mkdir_cmd)
         if stdout.channel.recv_exit_status() != 0:
@@ -77,7 +77,7 @@ def run_chrony_check(phase, experiment_id, concurrency, iteration):
             sys.exit(1)
         
         # Fix permissions on the directory
-        chmod_cmd = f"sudo chmod 777 -R /tmp/{dir_name}"
+        chmod_cmd = f"sudo chmod 777 -R /tmp/exp/{dir_name}"
         stdin, stdout, stderr = client.exec_command(chmod_cmd)
         if stdout.channel.recv_exit_status() != 0:
             print(f"Failed to set permissions on temp directory on {host}: {stderr.read().decode('utf-8')}")
