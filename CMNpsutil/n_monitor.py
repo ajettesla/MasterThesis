@@ -9,7 +9,7 @@ import csv
 import subprocess
 from datetime import datetime
 
-PID_FILE = '/tmp/network_monitor.pid'
+PID_FILE = '/tmp/exp/network_monitor.pid'
 DEFAULT_INTERVAL = 5.0
 
 def timestamp_ns():
