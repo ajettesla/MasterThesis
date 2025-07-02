@@ -14,26 +14,59 @@ print_header() {
     echo ""
 }
 
+# Function to setup the chrony directory
+setup_chrony_dir() {
+    local id=$1
+    local mode=$2
+    local dir="/tmp/$id/chrony"
+    
+    # Create directory if it doesn't exist
+    if [ ! -d "$dir" ]; then
+        mkdir -p "$dir"
+        echo "Created directory: $dir"
+    else
+        echo "Directory already exists: $dir"
+    fi
+    
+    # Clean up any previous files in pre mode
+    if [ "$mode" = "pre" ]; then
+        echo "Cleaning up previous files in $dir..."
+        rm -f "$dir"/*
+    fi
+    
+    echo "Using directory: $dir"
+    echo ""
+    
+    # Return the directory path without printing anything
+    # This is crucial - don't add any echo statements here
+}
+
 # Function to extract and analyze chrony tracking log data
 analyze_chrony_data() {
-    local mode=$1  # "pre" or "post"
-    local start_timestamp=$2  # Only used in "post" mode
-    local output_file="/tmp/chrony_analysis_${mode}.txt"
+    local mode=$1     # "pre" or "post"
+    local id=$2       # unique ID for directory
+    local start_timestamp=$3  # Only used in "post" mode
+    
+    # Setup chrony directory without capturing output
+    setup_chrony_dir "$id" "$mode"
+    local chrony_dir="/tmp/$id/chrony"
+    
+    local output_file="$chrony_dir/chrony_analysis_${mode}.txt"
     local log_file="/var/log/chrony/tracking.log"
-    local sample_count_file="/tmp/chrony_${mode}_sample_counts.txt"
+    local sample_count_file="$chrony_dir/chrony_${mode}_sample_counts.txt"
+    local temp_data_file="$chrony_dir/chrony_data_temp.txt"
+    local timestamp_file="$chrony_dir/chrony_last_timestamp.txt"
     
     echo "Running ${mode}-experimentation analysis..."
     
-    # For pre-experimentation: get last 10 data lines
+    # For pre-experimentation: get last 50 data lines
     if [ "$mode" = "pre" ]; then
         # Get the last 50 non-header lines from the log file
-        rm $output_file $logfile $sample_count_file
-
-        grep -v "=\|Date (UTC) Time" "$log_file" | tail -50 > /tmp/chrony_data_temp.txt
+        grep -v "=\|Date (UTC) Time" "$log_file" | tail -50 > "$temp_data_file"
         
         # Store the last timestamp for post-experimentation
-        last_timestamp=$(tail -1 /tmp/chrony_data_temp.txt | awk '{print $1 " " $2}')
-        echo "$last_timestamp" > /tmp/chrony_last_timestamp.txt
+        last_timestamp=$(tail -1 "$temp_data_file" | awk '{print $1 " " $2}')
+        echo "$last_timestamp" > "$timestamp_file"
         echo "Last timestamp: $last_timestamp"
         
     # For post-experimentation: get data from the stored timestamp onwards
@@ -50,22 +83,22 @@ analyze_chrony_data() {
         # Extract lines with timestamps after or equal to the start timestamp
         awk -v ts="$formatted_timestamp" '
             $1 " " $2 >= ts && !/=|Date \(UTC\) Time/ {print}
-        ' "$log_file" > /tmp/chrony_data_temp.txt
+        ' "$log_file" > "$temp_data_file"
     fi
     
     # Count total samples and samples per IP
-    total_samples=$(wc -l < /tmp/chrony_data_temp.txt)
+    total_samples=$(wc -l < "$temp_data_file")
     echo "Total samples for ${mode}-experimentation: $total_samples" > "$sample_count_file"
     
     # Count samples per IP
-    awk '{print $3}' /tmp/chrony_data_temp.txt | sort | uniq -c | while read count ip; do
+    awk '{print $3}' "$temp_data_file" | sort | uniq -c | while read count ip; do
         echo "IP $ip: $count samples" >> "$sample_count_file"
     done
     
     # Calculate time range of samples
     if [ "$total_samples" -gt 0 ]; then
-        first_timestamp=$(head -1 /tmp/chrony_data_temp.txt | awk '{print $1 " " $2}')
-        last_timestamp=$(tail -1 /tmp/chrony_data_temp.txt | awk '{print $1 " " $2}')
+        first_timestamp=$(head -1 "$temp_data_file" | awk '{print $1 " " $2}')
+        last_timestamp=$(tail -1 "$temp_data_file" | awk '{print $1 " " $2}')
         
         # Calculate duration if both timestamps are available
         if [ -n "$first_timestamp" ] && [ -n "$last_timestamp" ]; then
@@ -113,7 +146,7 @@ analyze_chrony_data() {
                 sum_max_error[ip]/count[ip];
         }
     }
-    ' /tmp/chrony_data_temp.txt > "$output_file"
+    ' "$temp_data_file" > "$output_file"
     
     echo "Analysis complete. Results stored in $output_file"
     cat "$output_file"
@@ -131,13 +164,17 @@ analyze_chrony_data() {
 
 # Function to compare pre and post experimentation results
 compare_results() {
-    local pre_file="/tmp/chrony_analysis_pre.txt"
-    local post_file="/tmp/chrony_analysis_post.txt"
-    local pre_samples_file="/tmp/chrony_pre_sample_counts.txt"
-    local post_samples_file="/tmp/chrony_post_sample_counts.txt"
-    local threshold=30  # 20% variation threshold
-    local failure_reason_file="/tmp/chrony_failure_reasons.txt"
-    local detailed_report_file="/tmp/chrony_detailed_report.txt"
+    local id=$1
+    local chrony_dir="/tmp/$id/chrony"
+    
+    local pre_file="$chrony_dir/chrony_analysis_pre.txt"
+    local post_file="$chrony_dir/chrony_analysis_post.txt"
+    local pre_samples_file="$chrony_dir/chrony_pre_sample_counts.txt"
+    local post_samples_file="$chrony_dir/chrony_post_sample_counts.txt"
+    local threshold=30  # 30% variation threshold
+    local failure_reason_file="$chrony_dir/chrony_failure_reasons.txt"
+    local detailed_report_file="$chrony_dir/chrony_detailed_report.txt"
+    local comparison_file="$chrony_dir/chrony_comparison.txt"
     
     if [ ! -f "$pre_file" ] || [ ! -f "$post_file" ]; then
         echo "Error: Pre or post analysis files not found"
@@ -147,7 +184,6 @@ compare_results() {
     echo "Comparing pre and post experimentation results..."
     
     # Create a temporary file to store comparison results and failure reasons
-    local comparison_file="/tmp/chrony_comparison.txt"
     echo "IP Address,Status,Freq_Var%,Skew_Var%,Offset_Var%,Root_delay_Var%,Root_disp_Var%,Max_error_Var%" > "$comparison_file"
     > "$failure_reason_file"  # Initialize empty failure reason file
     
@@ -373,27 +409,37 @@ compare_results() {
 main() {
     print_header
     
-    case "$1" in
+    # Check if ID is provided
+    if [ -z "$2" ]; then
+        echo "Error: No ID provided. Usage: $0 {pre|post} <unique_id>"
+        exit 1
+    fi
+    
+    local mode="$1"
+    local id="$2"
+    
+    case "$mode" in
         pre)
             # Pre-experimentation analysis
-            analyze_chrony_data "pre"
+            analyze_chrony_data "pre" "$id"
             ;;
         post)
             # Get the stored timestamp from pre-experimentation
-            if [ ! -f /tmp/chrony_last_timestamp.txt ]; then
+            local timestamp_file="/tmp/$id/chrony/chrony_last_timestamp.txt"
+            if [ ! -f "$timestamp_file" ]; then
                 echo "Error: No stored timestamp found. Run pre-experimentation analysis first."
                 exit 1
             fi
-            start_timestamp=$(cat /tmp/chrony_last_timestamp.txt)
+            start_timestamp=$(cat "$timestamp_file")
             
             # Post-experimentation analysis
-            analyze_chrony_data "post" "$start_timestamp"
+            analyze_chrony_data "post" "$id" "$start_timestamp"
             
             # Compare results
-            compare_results
+            compare_results "$id"
             ;;
         *)
-            echo "Usage: $0 {pre|post}"
+            echo "Usage: $0 {pre|post} <unique_id>"
             exit 1
             ;;
     esac
