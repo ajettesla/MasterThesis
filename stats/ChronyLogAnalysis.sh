@@ -18,7 +18,7 @@ print_header() {
 setup_chrony_dir() {
     local id=$1
     local mode=$2
-    local dir="/tmp/$id/chrony"
+    local dir="/tmp/exp/$id/chrony"
     
     # Create directory if it doesn't exist
     if [ ! -d "$dir" ]; then
@@ -49,7 +49,7 @@ analyze_chrony_data() {
     
     # Setup chrony directory without capturing output
     setup_chrony_dir "$id" "$mode"
-    local chrony_dir="/tmp/$id/chrony"
+    local chrony_dir="/tmp/exp/$id/chrony"
     
     local output_file="$chrony_dir/chrony_analysis_${mode}.txt"
     local log_file="/var/log/chrony/tracking.log"
@@ -165,7 +165,7 @@ analyze_chrony_data() {
 # Function to compare pre and post experimentation results
 compare_results() {
     local id=$1
-    local chrony_dir="/tmp/$id/chrony"
+    local chrony_dir="/tmp/exp/$id/chrony"
     
     local pre_file="$chrony_dir/chrony_analysis_pre.txt"
     local post_file="$chrony_dir/chrony_analysis_post.txt"
@@ -425,7 +425,7 @@ main() {
             ;;
         post)
             # Get the stored timestamp from pre-experimentation
-            local timestamp_file="/tmp/$id/chrony/chrony_last_timestamp.txt"
+            local timestamp_file="/tmp/exp/$id/chrony/chrony_last_timestamp.txt"
             if [ ! -f "$timestamp_file" ]; then
                 echo "Error: No stored timestamp found. Run pre-experimentation analysis first."
                 exit 1
