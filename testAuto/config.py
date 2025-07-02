@@ -17,7 +17,7 @@ MAGENTA = "\033[35m"
 BOLD    = "\033[1m"
 
 # Directory and filename template for state files (per experiment+concurrency)
-STATE_DIR = "/tmp"
+STATE_DIR = "/tmp/exp"
 STATE_FILENAME_TEMPLATE = "auto_state_{experiment_name}_{conc_str}.yaml"
 # This global will be initialized at runtime via init_state_file()
 STATE_FILE = None
