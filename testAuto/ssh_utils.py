@@ -263,8 +263,8 @@ class RemoteProgramRunner:
         self.cleanup                 = cleanup
         self.verbose                 = verbose
         self.program_name            = program_name or self._extract_program_name()
-        self.log_file                = f"/tmp/{self.program_name}.log"
-        self.pid_file                = f"/tmp/{self.program_name}.pid"
+        self.log_file                = f"/tmp/exp/{self.program_name}.log"
+        self.pid_file                = f"/tmp/exp/{self.program_name}.pid"
         self.client                  = None
         self.pid                     = None
         self.result                  = {
