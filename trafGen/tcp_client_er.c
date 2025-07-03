@@ -433,9 +433,13 @@ void* progress_reporter(void *arg) {
 
         long delta_conns = current_count - last_conn_count;
         double rate = (double)delta_conns / time_diff;
+        time_t now = time(NULL);                // Declare and initialize 'now'
+        char timestamp[20];                     // Declare 'timestamp' buffer
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
-        printf("[Progress] Total Conns: %ld/%ld | In-flight: %d | Rate: %.0f conn/s\n",
-               current_count, total_connections_target, current_inflight, rate);
+        printf("[%s] [Progress] Total Conns: %ld/%ld | In-flight: %d | Rate: %.0f conn/s\n",
+               timestamp, current_count, total_connections_target, current_inflight, rate);
+
 
         last_conn_count = current_count;
         start_time = current_time;
