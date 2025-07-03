@@ -662,8 +662,11 @@ static void extract_conn_event(
 
     // Always calculate hash - critical for proper operation
     char hash_input[256];
-    snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%s,%u",
-        event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
+    // snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%s,%u,%s,%u",
+    //     event->protocol_str, event->state_str, event->src_ip, event->dst_ip,
+    //     event->src_port, event->dst_ip, event->dst_port);
+    snprintf(hash_input, sizeof(hash_input), "%s,%s,%s,%u,%s,%u",
+        event->protocol_str, event->src_ip, event->dst_ip,
         event->src_port, event->dst_ip, event->dst_port);
     calculate_hash(hash_input, event->hash);
     
