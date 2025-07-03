@@ -43,6 +43,24 @@ def get_tcp_state_name(state_num):
     }
     return tcp_states.get(state_num, f"UNKNOWN_{state_num}")
 
+def get_tcp_state_short(state_num):
+    """
+    Get short name for TCP state.
+    """
+    tcp_short_states = {
+        0: "none",
+        1: "ss",  # SYN_SENT
+        2: "sr",  # SYN_RECV
+        3: "e",   # ESTABLISHED
+        4: "fw",  # FIN_WAIT
+        5: "cw",  # CLOSE_WAIT
+        6: "la",  # LAST_ACK
+        7: "tw",  # TIME_WAIT
+        8: "c",   # CLOSE
+        9: "ss2"  # SYN_SENT2
+    }
+    return tcp_short_states.get(state_num, f"s{state_num}")
+
 def get_protocol_name(proto_num):
     """
     Convert protocol number to name.
@@ -114,6 +132,10 @@ def parse_line(line):
     try:
         timestamp_str = parts[0]
         timestamp = datetime.datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        # Convert to UTC naive datetime to avoid comparison issues
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            
         device = parts[2]
         payload_str = parts[7]
         payload_fields = payload_str.split(',')
@@ -151,10 +173,23 @@ class StatisticsCollector:
         self.lock = threading.Lock()
 
         self.stats = {
-            'total_lines': 0, 'packets_a': 0, 'packets_b': 0, 'matches': 0, 'unmatched': 0,
+            'total_lines': 0, 'packets_a': 0, 'packets_b': 0, 
+            'matches': {
+                'syn_sent': 0,       # ss -> ss
+                'syn_recv': 0,       # sr -> sr
+                'established': 0,    # e -> e
+                'total': 0
+            }, 
+            'unmatched': 0,
+            'timed_out': 0,
             'neg_diff_matches': 0, 'pos_diff_matches': 0,
             'neg_diff_min_us': 0.0, 'neg_diff_max_us': 0.0,
-            'neg_diff_us_buckets': Counter()
+            'neg_diff_us_buckets': Counter(),
+            'state_transitions': {
+                'syn_sent_to_syn_recv': 0,        # ss -> sr
+                'syn_sent_to_established': 0,     # ss -> e
+                'total': 0
+            }
         }
         self.thread = None
         self.start_time = time.time()
@@ -191,11 +226,17 @@ class StatisticsCollector:
         with self.lock:
             if update_type == 'basic':
                 for key, value in update.items():
-                    self.stats[key] += value
+                    if key in self.stats:
+                        if isinstance(self.stats[key], dict) and isinstance(value, dict):
+                            for subkey, subvalue in value.items():
+                                self.stats[key][subkey] += subvalue
+                        else:
+                            self.stats[key] += value
             elif update_type == 'negative_match':
                 diff_us = update['diff_us']
                 self.stats['neg_diff_matches'] += 1
-                self.stats['neg_diff_min_us'] = min(self.stats['neg_diff_min_us'], diff_us)
+                if self.stats['neg_diff_min_us'] == 0 or diff_us < self.stats['neg_diff_min_us']:
+                    self.stats['neg_diff_min_us'] = diff_us
                 self.stats['neg_diff_max_us'] = max(self.stats['neg_diff_max_us'], diff_us)
                 
                 abs_diff_us = abs(diff_us)
@@ -210,6 +251,13 @@ class StatisticsCollector:
                 else:
                     bucket = '< -1000 us'
                 self.stats['neg_diff_us_buckets'][bucket] += 1
+            elif update_type == 'state_transition':
+                transition_type = update.get('transition_type')
+                if transition_type in self.stats['state_transitions']:
+                    self.stats['state_transitions'][transition_type] += 1
+                    self.stats['state_transitions']['total'] += 1
+                    # Add to grand total matches
+                    self.stats['matches']['total'] += 1
 
     def _log_periodic_stats(self):
         with self.lock:
@@ -217,14 +265,41 @@ class StatisticsCollector:
             lines = self.stats['total_lines']
             packets_a = self.stats['packets_a']
             packets_b = self.stats['packets_b']
-            matches = self.stats['matches']
+            
+            # Direct state matches
+            syn_sent_matches = self.stats['matches']['syn_sent']
+            syn_recv_matches = self.stats['matches']['syn_recv']
+            established_matches = self.stats['matches']['established']
+            direct_total = syn_sent_matches + syn_recv_matches + established_matches
+            
+            # State transitions
+            syn_sent_to_syn_recv = self.stats['state_transitions']['syn_sent_to_syn_recv']
+            syn_sent_to_established = self.stats['state_transitions']['syn_sent_to_established']
+            transition_total = self.stats['state_transitions']['total']
+            
+            # Total combined matches
+            total_matches = direct_total + transition_total
+            self.stats['matches']['total'] = total_matches
+            
             neg_matches = self.stats['neg_diff_matches']
             pos_matches = self.stats['pos_diff_matches']
+            timed_out = self.stats['timed_out']
+            
             rate = lines / runtime if runtime > 0 else 0
+        
         logging.info(
             f"[{self.experiment_name}] Runtime: {runtime:.1f}s, Lines/sec: {rate:.1f}, "
             f"Packets A: {packets_a}, B: {packets_b}, "
-            f"Matches: {matches} (Pos: {pos_matches}, Neg: {neg_matches})"
+            f"Matches: {total_matches} (ss->ss: {syn_sent_matches}, sr->sr: {syn_recv_matches}, "
+            f"e->e: {established_matches}), Timed out: {timed_out}"
+        )
+        logging.info(
+            f"[{self.experiment_name}] Transitions: ss->sr: {syn_sent_to_syn_recv}, "
+            f"ss->e: {syn_sent_to_established}"
+        )
+        logging.info(
+            f"[{self.experiment_name}] Total breakdown: Direct matches: {direct_total}, "
+            f"Transition matches: {transition_total}, Total: {total_matches}"
         )
 
     def update_stats(self, update_type='basic', **kwargs):
@@ -250,17 +325,37 @@ class StatisticsCollector:
             total_packets_a = self.stats['packets_a']
             total_packets_b = self.stats['packets_b']
             total_packets = total_packets_a + total_packets_b
-            matches_found = self.stats['matches']
-            unmatched_count = self.stats['unmatched']
+            
+            # Direct state matches
+            syn_sent_matches = self.stats['matches']['syn_sent']
+            syn_recv_matches = self.stats['matches']['syn_recv']
+            established_matches = self.stats['matches']['established']
+            direct_total = syn_sent_matches + syn_recv_matches + established_matches
+            
+            # State transitions
+            syn_sent_to_syn_recv = self.stats['state_transitions']['syn_sent_to_syn_recv']
+            syn_sent_to_established = self.stats['state_transitions']['syn_sent_to_established']
+            transition_total = self.stats['state_transitions']['total']
+            
+            # Total combined matches
+            total_matches = direct_total + transition_total
+            self.stats['matches']['total'] = total_matches
+            
+            # Recalculate unmatched packets (total_packets - packets_in_matches)
+            packets_in_matches = 2 * total_matches
+            unmatched_count = total_packets - packets_in_matches
+            self.stats['unmatched'] = unmatched_count
+            
+            timed_out_count = self.stats['timed_out']
             pos_matches = self.stats['pos_diff_matches']
             neg_matches = self.stats['neg_diff_matches']
-            accounted_packets = (2 * matches_found) + unmatched_count
+            accounted_packets = packets_in_matches + unmatched_count + timed_out_count
 
             with open(summary_log, 'w') as f:
                 f.write("="*80 + "\n")
                 f.write(f"CONNTRACK ANALYSIS EXPERIMENT SUMMARY\n")
                 f.write(f"Experiment Name: {self.experiment_name}\n")
-                f.write(f"Completion Time: {datetime.datetime(2025, 6, 28, 12, 7, 55).isoformat()}Z\n")
+                f.write(f"Completion Time: 2025-07-03 15:15:54 UTC\n")
                 f.write(f"Runtime: {runtime:.2f} seconds\n")
                 f.write(f"User: ajettesla\n")
                 f.write(f"Device A: {self.device_a}\n")
@@ -274,12 +369,24 @@ class StatisticsCollector:
                 f.write(f"Total packets from {self.device_b} (B): {total_packets_b}\n")
                 f.write(f"Total packets processed: {total_packets}\n\n")
 
-                f.write("MATCHING RESULTS:\n")
-                f.write(f"Total match pairs found: {matches_found}\n")
+                f.write("MATCHING RESULTS BY STATE:\n")
+                f.write(f"Same state matches:\n")
+                f.write(f"  - ss->ss (SYN_SENT): {syn_sent_matches}\n")
+                f.write(f"  - sr->sr (SYN_RECV): {syn_recv_matches}\n")
+                f.write(f"  - e->e (ESTABLISHED): {established_matches}\n")
+                f.write(f"  Direct state matches subtotal: {direct_total}\n\n")
+                
+                f.write(f"State transition matches:\n")
+                f.write(f"  - ss->sr (SYN_SENT to SYN_RECV): {self.stats['state_transitions']['syn_sent_to_syn_recv']}\n")
+                f.write(f"  - ss->e (SYN_SENT to ESTABLISHED): {self.stats['state_transitions']['syn_sent_to_established']}\n")
+                f.write(f"  State transitions subtotal: {transition_total}\n\n")
+                
+                f.write(f"TOTAL MATCH PAIRS FOUND: {total_matches}\n")
                 f.write(f"  - Positive time diff (B > A): {pos_matches}\n")
                 f.write(f"  - Negative time diff (A > B): {neg_matches}\n")
-                f.write(f"Packets involved in matches: {2 * matches_found}\n")
-                f.write(f"Unmatched packets: {unmatched_count}\n\n")
+                f.write(f"Packets involved in matches: {packets_in_matches}\n")
+                f.write(f"Unmatched packets: {unmatched_count}\n")
+                f.write(f"Timed out connections: {timed_out_count}\n\n")
                 
                 f.write("NEGATIVE TIME DIFFERENCE ANALYSIS (microseconds):\n")
                 if neg_matches > 0:
@@ -294,12 +401,12 @@ class StatisticsCollector:
                     f.write("  No negative time differences were recorded.\n")
                 f.write("\n")
 
-                f.write("VERIFICATION (Ideal: 2*matched + unmatched = total):\n")
-                f.write(f"2 * {matches_found} + {unmatched_count} = {accounted_packets}\n")
+                f.write("VERIFICATION (Ideal: 2*matched + unmatched + timed_out = total):\n")
+                f.write(f"2 * {total_matches} + {unmatched_count} + {timed_out_count} = {accounted_packets}\n")
                 f.write(f"Total packets processed: {total_packets}\n")
                 f.write(f"Difference: {total_packets - accounted_packets}\n")
                 if total_packets > 0:
-                    match_rate = (2 * matches_found) / total_packets * 100
+                    match_rate = (2 * total_matches) / total_packets * 100
                     f.write(f"Match rate: {match_rate:.2f}%\n")
                 f.write("\n")
 
@@ -307,54 +414,224 @@ class StatisticsCollector:
                 f.write("="*80 + "\n")
         logging.info(f"Final summary written to: {summary_log}")
 
-def create_hash_key(entry):
-    return (
-        entry['hash'], entry['type_num'], entry['state_num'], entry['proto_num'],
-        entry['srcip'], entry['srcport'], entry['dstip'], entry['dstport']
-    )
+# Track direct matches and already processed connections
+direct_matches_found = set()
 
-def find_best_match(entry, candidates):
-    best_match = None
-    min_abs_diff = float('inf')
-    for candidate in candidates:
-        time_diff = candidate['timestamp_nano'] - entry['timestamp_nano']
-        abs_diff = abs(time_diff)
-        if abs_diff < min_abs_diff:
-            min_abs_diff = abs_diff
-            best_match = candidate
-    return best_match
-
-def process_entry(entry, dict_a, dict_b, writer, stats_collector, debug_mode):
+def process_entry(entry, entries_by_hash, processed_hashes, writer, stats_collector, debug_mode):
+    """Process a single entry using efficient hash-based lookup"""
+    hash_value = entry['hash']
     device = entry['device']
+    state_num = entry['state_num']
     is_device_a = device == stats_collector.device_a
-    stats_collector.update_stats(packets_a=1 if is_device_a else 0, packets_b=1 if not is_device_a else 0)
-
-    current_dict = dict_a if is_device_a else dict_b
-    match_dict = dict_b if is_device_a else dict_a
-    key = create_hash_key(entry)
-
-    if key in match_dict and match_dict[key]:
-        best_match = find_best_match(entry, match_dict[key])
-        entry_a = entry if is_device_a else best_match
-        entry_b = best_match if is_device_a else entry
+    
+    # Update basic statistics
+    stats_collector.update_stats(
+        packets_a=1 if is_device_a else 0, 
+        packets_b=1 if not is_device_a else 0
+    )
+    
+    # Hash key to uniquely identify this connection
+    conn_key = f"{hash_value}"
+    entry_key = f"{conn_key}_{state_num}_{device}"
+    
+    # Skip if we've already processed this exact entry
+    if entry_key in processed_hashes:
+        return
+    
+    processed_hashes.add(entry_key)
+    
+    # Add this entry to the hash dictionary
+    if conn_key not in entries_by_hash:
+        entries_by_hash[conn_key] = {'device_a': {}, 'device_b': {}}
+    
+    device_key = 'device_a' if is_device_a else 'device_b'
+    if state_num not in entries_by_hash[conn_key][device_key]:
+        entries_by_hash[conn_key][device_key][state_num] = []
+    entries_by_hash[conn_key][device_key][state_num].append(entry)
+    
+    # Check if this connection already has a direct match (to avoid duplicate processing)
+    direct_match_key = f"{conn_key}_{state_num}_direct"
+    if direct_match_key in direct_matches_found:
+        return
+    
+    # STEP 1: First look for direct state matches (same state on both devices)
+    if (state_num in entries_by_hash[conn_key]['device_a'] and 
+        state_num in entries_by_hash[conn_key]['device_b'] and
+        entries_by_hash[conn_key]['device_a'][state_num] and 
+        entries_by_hash[conn_key]['device_b'][state_num]):
+        
+        # For direct state matches, find the best timestamp match
+        entry_a = entries_by_hash[conn_key]['device_a'][state_num][0]
+        entry_b = entries_by_hash[conn_key]['device_b'][state_num][0]
+        
         time_diff_ns = entry_b['timestamp_nano'] - entry_a['timestamp_nano']
-
+        
+        # Generate state information
+        state_short = f"{get_tcp_state_short(state_num)}->{get_tcp_state_short(state_num)}"
+        state_name = get_tcp_state_name(state_num)
+        
+        # Write to CSV
         debug_str = f"{entry_a['payload']} -> {entry_b['payload']}" if debug_mode else ''
-        writer.writerow([time_diff_ns, entry_a['proto_num'], entry_a['state_num'], debug_str])
-
-        stats_collector.update_stats(matches=1, unmatched=-1)
+        writer.writerow([
+            time_diff_ns, 
+            entry_a['proto_num'], 
+            state_short,
+            state_name,
+            debug_str
+        ])
+        
+        # Update stats for direct state matches
+        match_stats = {
+            'syn_sent': 1 if state_num == 1 else 0,
+            'syn_recv': 1 if state_num == 2 else 0,
+            'established': 1 if state_num == 3 else 0,
+            'total': 1
+        }
+        stats_collector.update_stats(matches=match_stats)
         
         if time_diff_ns < 0:
-            stats_collector.update_stats(update_type='negative_match', diff_us=time_diff_ns / 1000.0)
+            stats_collector.update_stats(
+                update_type='negative_match', 
+                diff_us=time_diff_ns / 1000.0
+            )
         else:
             stats_collector.update_stats(pos_diff_matches=1)
+            
+        # Remove matched entries from the collections
+        entries_by_hash[conn_key]['device_a'][state_num].pop(0)
+        entries_by_hash[conn_key]['device_b'][state_num].pop(0)
+        
+        # Mark as having a direct match to avoid transition matching
+        direct_matches_found.add(direct_match_key)
+        
+        # Remove empty lists
+        if not entries_by_hash[conn_key]['device_a'][state_num]:
+            del entries_by_hash[conn_key]['device_a'][state_num]
+        if not entries_by_hash[conn_key]['device_b'][state_num]:
+            del entries_by_hash[conn_key]['device_b'][state_num]
+            
+        return
+    
+    # STEP 2: If no direct match, only then check for specific transitions
+    if device == stats_collector.device_b:
+        check_for_state_transitions(conn_key, entry, entries_by_hash, direct_matches_found, writer, stats_collector, debug_mode)
+    
+    # Cleanup empty hash keys
+    if not entries_by_hash[conn_key]['device_a'] and not entries_by_hash[conn_key]['device_b']:
+        del entries_by_hash[conn_key]
 
-        match_dict[key].remove(best_match)
-        if not match_dict[key]:
-            del match_dict[key]
-    else:
-        current_dict[key].append(entry)
-        stats_collector.update_stats(unmatched=1)
+def check_for_state_transitions(conn_key, entry, entries_by_hash, direct_matches_found, writer, stats_collector, debug_mode):
+    """Check for state transitions between different states"""
+    hash_value = entry['hash']
+    device = entry['device']
+    state_num = entry['state_num']
+    
+    # Only run this for Device B entries
+    if device != stats_collector.device_b:
+        return
+    
+    # IMPORTANT: Skip transition matching if this connection already has a direct match
+    direct_match_exists = False
+    for s in range(1, 4):  # Check states 1, 2, 3
+        if f"{conn_key}_{s}_direct" in direct_matches_found:
+            direct_match_exists = True
+            break
+    
+    if direct_match_exists:
+        # There's already a direct match for this connection, so skip transition matching
+        return
+    
+    # Only check for SYN_SENT to SYN_RECV and SYN_SENT to ESTABLISHED transitions
+    # For SYN_RECV in B, check for SYN_SENT in A
+    if state_num == 2:  # B has SYN_RECV
+        # Skip if SYN_RECV already has a direct match in A
+        if 2 in entries_by_hash[conn_key]['device_a'] and entries_by_hash[conn_key]['device_a'][2]:
+            return
+            
+        if 1 in entries_by_hash[conn_key]['device_a'] and entries_by_hash[conn_key]['device_a'][1]:
+            entry_a = entries_by_hash[conn_key]['device_a'][1][0]
+            entry_b = entry
+            
+            time_diff_ns = entry_b['timestamp_nano'] - entry_a['timestamp_nano']
+            
+            # Write state transition to CSV
+            debug_str = f"{entry_a['payload']} -> {entry_b['payload']}" if debug_mode else ''
+            writer.writerow([
+                time_diff_ns, 
+                entry_a['proto_num'], 
+                "ss->sr",
+                f"{get_tcp_state_name(1)}->{get_tcp_state_name(2)}",
+                debug_str
+            ])
+            
+            # Update state transition statistics
+            stats_collector.update_stats(
+                update_type='state_transition',
+                transition_type='syn_sent_to_syn_recv'
+            )
+            
+            if time_diff_ns < 0:
+                stats_collector.update_stats(
+                    update_type='negative_match', 
+                    diff_us=time_diff_ns / 1000.0
+                )
+            else:
+                stats_collector.update_stats(pos_diff_matches=1)
+                
+            # Remove the matched entry
+            entries_by_hash[conn_key]['device_a'][1].pop(0)
+            
+            # Cleanup empty list
+            if not entries_by_hash[conn_key]['device_a'][1]:
+                del entries_by_hash[conn_key]['device_a'][1]
+                
+            return
+    
+    # For ESTABLISHED in B, only check for SYN_SENT in A (skip SYN_RECV in A)
+    elif state_num == 3:  # B has ESTABLISHED
+        # Skip if ESTABLISHED already has a direct match in A
+        if 3 in entries_by_hash[conn_key]['device_a'] and entries_by_hash[conn_key]['device_a'][3]:
+            return
+            
+        # Check only for SYN_SENT in A (skip SYN_RECV in A as requested)
+        if 1 in entries_by_hash[conn_key]['device_a'] and entries_by_hash[conn_key]['device_a'][1]:
+            entry_a = entries_by_hash[conn_key]['device_a'][1][0]
+            entry_b = entry
+            
+            time_diff_ns = entry_b['timestamp_nano'] - entry_a['timestamp_nano']
+            
+            # Write state transition to CSV
+            debug_str = f"{entry_a['payload']} -> {entry_b['payload']}" if debug_mode else ''
+            writer.writerow([
+                time_diff_ns, 
+                entry_a['proto_num'], 
+                "ss->e",
+                f"{get_tcp_state_name(1)}->{get_tcp_state_name(3)}",
+                debug_str
+            ])
+            
+            # Update state transition statistics
+            stats_collector.update_stats(
+                update_type='state_transition',
+                transition_type='syn_sent_to_established'
+            )
+            
+            if time_diff_ns < 0:
+                stats_collector.update_stats(
+                    update_type='negative_match', 
+                    diff_us=time_diff_ns / 1000.0
+                )
+            else:
+                stats_collector.update_stats(pos_diff_matches=1)
+                
+            # Remove the matched entry
+            entries_by_hash[conn_key]['device_a'][1].pop(0)
+            
+            # Cleanup empty list
+            if not entries_by_hash[conn_key]['device_a'][1]:
+                del entries_by_hash[conn_key]['device_a'][1]
+                
+            return
 
 class GracefulShutdown:
     def __init__(self, timeout=3.0):
@@ -381,8 +658,8 @@ class GracefulShutdown:
 
 def main():
     parser = argparse.ArgumentParser(description="Process conntrack logs for matching entries.")
-    parser.add_argument('-a', help="Name of device A (e.g., conn1)", required=True)
-    parser.add_argument('-b', help="Name of device B (e.g., conn2)", required=True)
+    parser.add_argument('-a', help="Name of device A (e.g., connt1)", required=True)
+    parser.add_argument('-b', help="Name of device B (e.g., connt2)", required=True)
     parser.add_argument('-l', help="Path to log file to process", required=True)
     parser.add_argument('-o', help="Path to output CSV file", required=True)
     parser.add_argument('-e', help="Experiment name for logging and summary")
@@ -390,6 +667,7 @@ def main():
     parser.add_argument('-k', action='store_true', help="Kill all running conntrackAnalysis.py processes")
     parser.add_argument('-D', action='store_true', help="Run in daemon mode")
     parser.add_argument('-L', help="Log file path for daemon (default: /tmp/conntrackAnalysis.log)")
+    parser.add_argument('-t', type=int, default=60, help="Connection timeout in seconds (default: 60)")
     args = parser.parse_args()
 
     if args.k:
@@ -437,42 +715,77 @@ def main():
     stats_collector = StatisticsCollector(experiment_name, args.a, args.b, output_dir)
     stats_collector.start()
     
-    dict_a = defaultdict(list)
-    dict_b = defaultdict(list)
+    # Use simple dictionaries instead of complex data structures
+    entries_by_hash = {}
+    processed_hashes = set()
 
     @atexit.register
     def cleanup():
         logging.info("Cleaning up...")
         stats_collector.stop()
-        final_unmatched = sum(len(v) for v in dict_a.values()) + sum(len(v) for v in dict_b.values())
-        logging.info(f"Final unmatched entries at exit: {final_unmatched}")
+        
+        # Count final unmatched entries
+        unmatched_count = 0
+        for key, data in entries_by_hash.items():
+            for device_key in ['device_a', 'device_b']:
+                for state_entries in data[device_key].values():
+                    unmatched_count += len(state_entries)
+        
+        logging.info(f"Final unmatched entries at exit: {unmatched_count}")
         stats_collector.write_final_summary()
         if os.path.exists(pid_file):
             os.remove(pid_file)
 
+    # Create or open the CSV file
     if not os.path.exists(args.o):
         with open(args.o, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['timedifference_ns', 'protocol_num', 'state_num', 'debug_info'])
+            writer.writerow(['time_diff_ns', 'protocol_num', 'state', 'state_name', 'debug_info'])
             
     csvfile = None
     try:
         csvfile = open(args.o, 'a', newline='')
         writer = csv.writer(csvfile)
         last_flush_time = time.time()
+        last_file_pos = 0
+        
         with open(args.l, 'r') as f:
+            # Read the file until the end and then wait for more data
+            no_new_data_since = None
+            
             while not shutdown_handler.is_shutdown_requested():
                 line = f.readline()
                 if line:
+                    no_new_data_since = None  # Reset timer since we got new data
+                    last_file_pos = f.tell()  # Remember where we are
+                    
                     stats_collector.update_stats(total_lines=1)
                     entry = parse_line(line)
                     if entry:
-                        process_entry(entry, dict_a, dict_b, writer, stats_collector, args.d)
+                        process_entry(entry, entries_by_hash, processed_hashes, writer, stats_collector, args.d)
                 else:
-                    time.sleep(0.1)
+                    # No new data - check if file has grown
+                    current_size = os.fstat(f.fileno()).st_size
+                    if current_size > last_file_pos:
+                        # File has grown but we're at EOF, seek to the position we remember
+                        f.seek(last_file_pos)
+                        continue
+                    
+                    # No new data and file hasn't grown
+                    if no_new_data_since is None:
+                        no_new_data_since = time.time()
+                        logging.info(f"No new data, waiting for 30 seconds before exit...")
+                    elif time.time() - no_new_data_since > 30:
+                        logging.info(f"No new data for 30 seconds, exiting.")
+                        break
+                    
+                    time.sleep(0.1)  # Sleep a bit to avoid high CPU usage
+                
+                # Flush CSV periodically
                 if time.time() - last_flush_time >= 5:
                     csvfile.flush()
                     last_flush_time = time.time()
+                    
         logging.info(f"[{experiment_name}] Processing completed normally.")
     except KeyboardInterrupt:
         logging.info(f"[{experiment_name}] Interrupted by user.")
