@@ -14,6 +14,9 @@ chmod +x conntrackAnalysis.py
 cd ../CMNpsutil
 chmod +x cm_monitor.py n_monitor.py start.sh
 
+cd ../stats
+chmod +x ChronyLogAnalysis.sh
+
 cd ../testAuto
 chmod +x auto.py
 
