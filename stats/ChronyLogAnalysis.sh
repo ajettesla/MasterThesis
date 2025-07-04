@@ -3,8 +3,6 @@
 # Function to print a header with date and user information
 print_header() {
     local current_date=$(date -u "+%Y-%m-%d %H:%M:%S")
-    local current_user=$(whoami)
-    
     echo "============================================================"
     echo "Chrony Log Analysis Report"
     echo "============================================================"
@@ -56,6 +54,7 @@ analyze_chrony_data() {
     local sample_count_file="$chrony_dir/chrony_${mode}_sample_counts.txt"
     local temp_data_file="$chrony_dir/chrony_data_temp.txt"
     local timestamp_file="$chrony_dir/chrony_last_timestamp.txt"
+    local stats_file="$chrony_dir/chrony_${mode}_stats.txt"
     
     echo "Running ${mode}-experimentation analysis..."
     
@@ -112,10 +111,22 @@ analyze_chrony_data() {
         fi
     fi
     
-    # Process the extracted data for unique IPs and calculate averages
+    # Process the extracted data for unique IPs and calculate averages, min, max
     awk '
     BEGIN {
         print "IP Address,Count,Avg_Freq_ppm,Avg_Skew_ppm,Avg_Offset,Avg_Root_delay,Avg_Root_disp,Avg_Max_error"
+        
+        # Initialize global min/max trackers for overall stats
+        global_min_freq = 1e10; global_max_freq = -1e10;
+        global_min_skew = 1e10; global_max_skew = -1e10;
+        global_min_offset = 1e10; global_max_offset = -1e10;
+        global_min_root_delay = 1e10; global_max_root_delay = -1e10;
+        global_min_root_disp = 1e10; global_max_root_disp = -1e10;
+        global_min_max_error = 1e10; global_max_max_error = -1e10;
+        
+        global_sum_freq = 0; global_sum_skew = 0; global_sum_offset = 0;
+        global_sum_root_delay = 0; global_sum_root_disp = 0; global_sum_max_error = 0;
+        global_count = 0;
     }
     {
         ip = $3;
@@ -127,14 +138,74 @@ analyze_chrony_data() {
         max_error = $17;
         
         count[ip]++;
+        global_count++;
+        
+        # First sample for this IP, initialize min/max
+        if (count[ip] == 1) {
+            min_freq[ip] = max_freq[ip] = freq;
+            min_skew[ip] = max_skew[ip] = skew;
+            min_offset[ip] = max_offset[ip] = offset;
+            min_root_delay[ip] = max_root_delay[ip] = root_delay;
+            min_root_disp[ip] = max_root_disp[ip] = root_disp;
+            min_max_error[ip] = max_max_error[ip] = max_error;
+        } else {
+            # Update min/max for this IP
+            if (freq < min_freq[ip]) min_freq[ip] = freq;
+            if (freq > max_freq[ip]) max_freq[ip] = freq;
+            
+            if (skew < min_skew[ip]) min_skew[ip] = skew;
+            if (skew > max_skew[ip]) max_skew[ip] = skew;
+            
+            if (offset < min_offset[ip]) min_offset[ip] = offset;
+            if (offset > max_offset[ip]) max_offset[ip] = offset;
+            
+            if (root_delay < min_root_delay[ip]) min_root_delay[ip] = root_delay;
+            if (root_delay > max_root_delay[ip]) max_root_delay[ip] = root_delay;
+            
+            if (root_disp < min_root_disp[ip]) min_root_disp[ip] = root_disp;
+            if (root_disp > max_root_disp[ip]) max_root_disp[ip] = root_disp;
+            
+            if (max_error < min_max_error[ip]) min_max_error[ip] = max_error;
+            if (max_error > max_max_error[ip]) max_max_error[ip] = max_error;
+        }
+        
+        # Update global min/max
+        if (freq < global_min_freq) global_min_freq = freq;
+        if (freq > global_max_freq) global_max_freq = freq;
+        
+        if (skew < global_min_skew) global_min_skew = skew;
+        if (skew > global_max_skew) global_max_skew = skew;
+        
+        if (offset < global_min_offset) global_min_offset = offset;
+        if (offset > global_max_offset) global_max_offset = offset;
+        
+        if (root_delay < global_min_root_delay) global_min_root_delay = root_delay;
+        if (root_delay > global_max_root_delay) global_max_root_delay = root_delay;
+        
+        if (root_disp < global_min_root_disp) global_min_root_disp = root_disp;
+        if (root_disp > global_max_root_disp) global_max_root_disp = root_disp;
+        
+        if (max_error < global_min_max_error) global_min_max_error = max_error;
+        if (max_error > global_max_max_error) global_max_max_error = max_error;
+        
+        # Accumulate sums for averages
         sum_freq[ip] += freq;
         sum_skew[ip] += skew;
         sum_offset[ip] += offset;
         sum_root_delay[ip] += root_delay;
         sum_root_disp[ip] += root_disp;
         sum_max_error[ip] += max_error;
+        
+        # Accumulate global sums
+        global_sum_freq += freq;
+        global_sum_skew += skew;
+        global_sum_offset += offset;
+        global_sum_root_delay += root_delay;
+        global_sum_root_disp += root_disp;
+        global_sum_max_error += max_error;
     }
     END {
+        # Output per-IP statistics
         for (ip in count) {
             printf "%s,%d,%.6f,%.6f,%.6e,%.6e,%.6e,%.6e\n", 
                 ip, count[ip],
@@ -145,15 +216,73 @@ analyze_chrony_data() {
                 sum_root_disp[ip]/count[ip],
                 sum_max_error[ip]/count[ip];
         }
+        
+        # Output global statistics to a separate file with units
+        if (global_count > 0) {
+            print "OVERALL STATISTICS" > "/tmp/chrony_stats.tmp";
+            print "Total samples across all IPs: " global_count > "/tmp/chrony_stats.tmp";
+            print "" > "/tmp/chrony_stats.tmp";
+            
+            print "Frequency (ppm):" > "/tmp/chrony_stats.tmp";
+            printf "  Min: %.6f ppm\n", global_min_freq > "/tmp/chrony_stats.tmp";
+            printf "  Max: %.6f ppm\n", global_max_freq > "/tmp/chrony_stats.tmp";
+            printf "  Avg: %.6f ppm\n", global_sum_freq/global_count > "/tmp/chrony_stats.tmp";
+            print "" > "/tmp/chrony_stats.tmp";
+            
+            print "Skew (ppm):" > "/tmp/chrony_stats.tmp";
+            printf "  Min: %.6f ppm\n", global_min_skew > "/tmp/chrony_stats.tmp";
+            printf "  Max: %.6f ppm\n", global_max_skew > "/tmp/chrony_stats.tmp";
+            printf "  Avg: %.6f ppm\n", global_sum_skew/global_count > "/tmp/chrony_stats.tmp";
+            print "" > "/tmp/chrony_stats.tmp";
+            
+            print "Offset:" > "/tmp/chrony_stats.tmp";
+            printf "  Min: %.6e seconds\n", global_min_offset > "/tmp/chrony_stats.tmp";
+            printf "  Max: %.6e seconds\n", global_max_offset > "/tmp/chrony_stats.tmp";
+            printf "  Avg: %.6e seconds\n", global_sum_offset/global_count > "/tmp/chrony_stats.tmp";
+            print "" > "/tmp/chrony_stats.tmp";
+            
+            print "Root Delay:" > "/tmp/chrony_stats.tmp";
+            printf "  Min: %.6e seconds\n", global_min_root_delay > "/tmp/chrony_stats.tmp";
+            printf "  Max: %.6e seconds\n", global_max_root_delay > "/tmp/chrony_stats.tmp";
+            printf "  Avg: %.6e seconds\n", global_sum_root_delay/global_count > "/tmp/chrony_stats.tmp";
+            print "" > "/tmp/chrony_stats.tmp";
+            
+            print "Root Dispersion:" > "/tmp/chrony_stats.tmp";
+            printf "  Min: %.6e seconds\n", global_min_root_disp > "/tmp/chrony_stats.tmp";
+            printf "  Max: %.6e seconds\n", global_max_root_disp > "/tmp/chrony_stats.tmp";
+            printf "  Avg: %.6e seconds\n", global_sum_root_disp/global_count > "/tmp/chrony_stats.tmp";
+            print "" > "/tmp/chrony_stats.tmp";
+            
+            print "Max Error:" > "/tmp/chrony_stats.tmp";
+            printf "  Min: %.6e seconds\n", global_min_max_error > "/tmp/chrony_stats.tmp";
+            printf "  Max: %.6e seconds\n", global_max_max_error > "/tmp/chrony_stats.tmp";
+            printf "  Avg: %.6e seconds\n", global_sum_max_error/global_count > "/tmp/chrony_stats.tmp";
+        }
     }
     ' "$temp_data_file" > "$output_file"
     
-    echo "Analysis complete. Results stored in $output_file"
-    cat "$output_file"
+    # Move the temporary stats file to the final stats file
+    if [ "$mode" = "post" ] && [ -f "/tmp/chrony_stats.tmp" ]; then
+        mv "/tmp/chrony_stats.tmp" "$stats_file"
+        echo "Analysis complete. Results stored in $output_file"
+        cat "$output_file"
+        
+        echo ""
+        echo "Sample statistics:"
+        cat "$sample_count_file"
+        
+        echo ""
+        echo "Overall statistics:"
+        cat "$stats_file"
+    else
+        echo "Analysis complete. Results stored in $output_file"
+        cat "$output_file"
+        
+        echo ""
+        echo "Sample statistics:"
+        cat "$sample_count_file"
+    fi
     
-    echo ""
-    echo "Sample statistics:"
-    cat "$sample_count_file"
     echo ""
     
     # Return the last timestamp for pre-experimentation
@@ -171,6 +300,7 @@ compare_results() {
     local post_file="$chrony_dir/chrony_analysis_post.txt"
     local pre_samples_file="$chrony_dir/chrony_pre_sample_counts.txt"
     local post_samples_file="$chrony_dir/chrony_post_sample_counts.txt"
+    local post_stats_file="$chrony_dir/chrony_post_stats.txt"
     local threshold=30  # 30% variation threshold
     local failure_reason_file="$chrony_dir/chrony_failure_reasons.txt"
     local detailed_report_file="$chrony_dir/chrony_detailed_report.txt"
@@ -204,6 +334,13 @@ compare_results() {
         echo "--------------------------------------"
         cat "$post_samples_file"
         echo ""
+        
+        if [ -f "$post_stats_file" ]; then
+            echo "POST-EXPERIMENTATION OVERALL STATISTICS"
+            echo "--------------------------------------"
+            cat "$post_stats_file"
+            echo ""
+        fi
         
         echo "COMPARISON RESULTS (Threshold: ${threshold}%)"
         echo "-------------------------------------"
@@ -289,7 +426,7 @@ compare_results() {
             }')
             
             # Determine status - using awk for comparison to avoid bc
-            status="SUCCESS"
+            status="PASS"
             
             # Create an array of metrics and their variations to check
             metrics=("Freq" "Skew" "Offset" "Root_delay" "Root_disp" "Max_error")
@@ -304,7 +441,7 @@ compare_results() {
                     # Use a simple numeric comparison with awk
                     exceeds=$(awk -v var="$var" -v threshold="$threshold" 'BEGIN { print (var > threshold) ? "yes" : "no" }')
                     if [ "$exceeds" = "yes" ]; then
-                        status="FAILURE"
+                        status="FAIL"
                         failure_msg="IP $ip: ${metrics[$i]} variation ($var%) exceeds threshold ($threshold%)"
                         failure_detail="  Pre-value: ${pre_values[$i]}, Post-value: ${post_values[$i]}, Samples: Pre=$pre_count, Post=$post_count"
                         echo "$failure_msg" >> "$failure_reason_file"
@@ -321,12 +458,12 @@ compare_results() {
                 echo "  Status: $status"
                 echo "  Samples: Pre=$pre_count, Post=$post_count"
                 echo "  Variations:"
-                echo "    Freq: $freq_var% (Pre=$pre_freq, Post=$post_freq)"
-                echo "    Skew: $skew_var% (Pre=$pre_skew, Post=$post_skew)"
-                echo "    Offset: $offset_var% (Pre=$pre_offset, Post=$post_offset)"
-                echo "    Root delay: $root_delay_var% (Pre=$pre_root_delay, Post=$post_root_delay)"
-                echo "    Root disp: $root_disp_var% (Pre=$pre_root_disp, Post=$post_root_disp)"
-                echo "    Max error: $max_error_var% (Pre=$pre_max_error, Post=$post_max_error)"
+                echo "    Freq: $freq_var% (Pre=$pre_freq ppm, Post=$post_freq ppm)"
+                echo "    Skew: $skew_var% (Pre=$pre_skew ppm, Post=$post_skew ppm)"
+                echo "    Offset: $offset_var% (Pre=$pre_offset seconds, Post=$post_offset seconds)"
+                echo "    Root delay: $root_delay_var% (Pre=$pre_root_delay seconds, Post=$post_root_delay seconds)"
+                echo "    Root disp: $root_disp_var% (Pre=$pre_root_disp seconds, Post=$post_root_disp seconds)"
+                echo "    Max error: $max_error_var% (Pre=$pre_max_error seconds, Post=$post_max_error seconds)"
                 echo ""
             } >> "$detailed_report_file"
             
@@ -371,14 +508,14 @@ compare_results() {
     } >> "$detailed_report_file"
     
     # Overall experiment status
-    if grep -q "FAILURE" "$comparison_file"; then
-        echo "OVERALL EXPERIMENT STATUS: FAILURE"
+    if grep -q "FAIL" "$comparison_file"; then
+        echo "OVERALL EXPERIMENT STATUS: FAIL"
         echo "Reasons for failure:" 
         cat "$failure_reason_file"
         
         # Add failure reasons to detailed report
         {
-            echo "Status: FAILURE"
+            echo "Status: FAIL"
             echo "Reasons for failure:"
             cat "$failure_reason_file"
         } >> "$detailed_report_file"
@@ -389,11 +526,11 @@ compare_results() {
         
         return 1
     else
-        echo "OVERALL EXPERIMENT STATUS: SUCCESS"
+        echo "OVERALL EXPERIMENT STATUS: PASS"
         
         # Add success message to detailed report
         {
-            echo "Status: SUCCESS"
+            echo "Status: PASS"
             echo "All metrics are within acceptable threshold limits (${threshold}%)."
         } >> "$detailed_report_file"
         
