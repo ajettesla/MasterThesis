@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
-set -e  # Exit if any command fails
+set -e  # Exit on any error
 
-# Ensure script is run with root privileges
+# Ensure script is run as root
 if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root. Use: sudo $0" 
-   exit 1
+    echo "This script must be run as root. Use: sudo \$0"
+    exit 1
 fi
 
-# Change permissions and build components
-cd ConnectiontrackingAnalysis
+# Set base directory
+BASE_DIR="/opt/MasterThesis"
+
+# connectiontrackingAnalysis
+cd "$BASE_DIR/connectiontrackingAnalysis"
 chmod +x conntrackAnalysis.py
 
-cd ../CMNpsutil
+# CMNpsutil
+cd "$BASE_DIR/CMNpsutil"
 chmod +x cm_monitor.py n_monitor.py start.sh
 
-cd ../stats
-chmod +x ChronyLogAnalysis.sh
-
-cd ../testAuto
+# testAuto
+cd "$BASE_DIR/testAuto"
 chmod +x auto.py
 
-cd ../trafGen
+# trafGen
+cd "$BASE_DIR/trafGen"
 make clean
 make
+
+# stats
+cd "$BASE_DIR/stats"
+chmod +x ChronyLogAnalysis.sh
