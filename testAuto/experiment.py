@@ -673,7 +673,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
     progress_thread.start()
     
     logging.info("[exp] Starting client threads")
-    client_threads = get_client_threads(250000, concurrency, 4)
+    client_threads = get_client_threads(500000, concurrency, 4)
     for th in client_threads:
         th.start()
 
