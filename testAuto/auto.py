@@ -36,7 +36,7 @@ def get_run_directory_name(experiment_id, concurrency, iteration):
     """Generate the standard directory name format for this run"""
     return f"{experiment_id}_c{concurrency}_i{iteration}"
 
-def run_chrony_check(phase, experiment_id, concurrency, iteration):
+def run_chrony_check(phase, experiment_id, concurrency, iteration, quiet=False):
     """
     Run Chrony log analysis check on connt1 and connt2 via SSH.
     Uses the standardized directory format: {experiment_id}_c{concurrency}_i{iteration}
@@ -47,19 +47,25 @@ def run_chrony_check(phase, experiment_id, concurrency, iteration):
     # Get directory name in standard format, make sure experiment_id is valid
     if not experiment_id or experiment_id == "None":
         # This is a safeguard - log warning and try to get from state again
-        logging.warning(f"Invalid experiment ID '{experiment_id}' passed to run_chrony_check! Trying to get from state.")
+        if not quiet:
+            logging.warning(f"Invalid experiment ID '{experiment_id}' passed to run_chrony_check! Trying to get from state.")
         state = load_experiment_state()
         experiment_id = state.get("id", "fallback_id")
-        logging.info(f"Retrieved experiment ID from state: {experiment_id}")
+        if not quiet:
+            logging.info(f"Retrieved experiment ID from state: {experiment_id}")
     
     dir_name = get_run_directory_name(experiment_id, concurrency, iteration)
     
     current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n=== Chrony Check ({phase}) - {current_time} - User: {CURRENT_USER} ===")
-    print(f"Run ID: {dir_name}")
+    if not quiet:
+        print(f"\n=== Chrony Check ({phase}) - {current_time} - User: {CURRENT_USER} ===")
+        print(f"Run ID: {dir_name}")
+    else:
+        print(f"✓ Chrony check ({phase}) in progress...")
     
     for host in hosts:
-        print(f"\n>> Running ChronyLogAnalysis.sh {phase} {dir_name} on {host} (as root):")
+        if not quiet:
+            print(f"\n>> Running ChronyLogAnalysis.sh {phase} {dir_name} on {host} (as root):")
         client = ssh.connect(host)
         if client is None:
             msg = f"Failed to connect to {host} for Chrony check"
@@ -86,32 +92,41 @@ def run_chrony_check(phase, experiment_id, concurrency, iteration):
         
         # Run the script with the directory name as parameter
         cmd = f"sudo /opt/MasterThesis/stats/ChronyLogAnalysis.sh {phase} {dir_name}"
-        print(f"Executing: {cmd}")
+        if not quiet:
+            print(f"Executing: {cmd}")
         
         stdin, stdout, stderr = client.exec_command(cmd)
         exit_status = stdout.channel.recv_exit_status()
         output = stdout.read().decode('utf-8')
         error = stderr.read().decode('utf-8')
         
-        # Print the output directly to stdout
-        print(f"--- Output from {host} ---")
-        print(output)
-        if error:
-            print(f"--- Error from {host} ---")
-            print(error)
-        print(f"--- End of output from {host} ---")
+        # Print the output directly to stdout (only in verbose mode)
+        if not quiet:
+            print(f"--- Output from {host} ---")
+            print(output)
+            if error:
+                print(f"--- Error from {host} ---")
+                print(error)
+            print(f"--- End of output from {host} ---")
         
         if exit_status != 0 or "FAILURE" in output or "FAILURE" in error:
             logging.error(f"ChronyLogAnalysis.sh ({phase}) on {host} failed with status {exit_status}")
             print(f"FAILURE detected on {host}")
+            if quiet and (error or "FAILURE" in output):
+                # Show errors even in quiet mode
+                print(f"Error details: {error or output}")
             client.close()
             sys.exit(1)
         
-        logging.info(f"Chrony NTP status on {host}: OK ({phase})")
+        if not quiet:
+            logging.info(f"Chrony NTP status on {host}: OK ({phase})")
         client.close()
     
-    print(f"\n✓ Chrony NTP status on all hosts: OK ({phase})")
-    print(f"=== End of Chrony Check ({phase}) ===\n")
+    if not quiet:
+        print(f"\n✓ Chrony NTP status on all hosts: OK ({phase})")
+        print(f"=== End of Chrony Check ({phase}) ===\n")
+    else:
+        print(f"✓ Chrony check passed")
     
     return dir_name  # Return the directory name for potential reuse
 
@@ -128,6 +143,7 @@ def main():
     group.add_argument("--new",  action="store_true", help="Start new experiment")
     group.add_argument("--cont", action="store_true", help="Continue existing experiment")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode - suppress unnecessary output")
     args = parser.parse_args()
 
     # Parse concurrency values
@@ -142,12 +158,13 @@ def main():
 
     # Set up logging and signal handlers
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    # Call configure_logging with no arguments
-    configure_logging()  # <-- Modified: removed argument
+    # Call configure_logging with quiet flag
+    configure_logging(quiet=args.quiet)
     setup_signal_handlers()
 
     experiment_name = args.name
     demon = args.demon
+    quiet = args.quiet
     requested_iters = args.iterations
 
     continuing = False
@@ -168,7 +185,10 @@ def main():
         }
         logging.info(f"[auto] New state: {state}")
         save_experiment_state(state)
-        logging.info(f"New Experiment ID: {eid}")
+        if not quiet:
+            logging.info(f"New Experiment ID: {eid}")
+        else:
+            print(f"New experiment: {experiment_name}_{eid}")
 
     elif args.cont:
         state = load_experiment_state()
@@ -199,7 +219,10 @@ def main():
             }
             logging.info(f"[auto] Fresh state: {state}")
             save_experiment_state(state)
-            logging.info(f"New Experiment ID: {eid}")
+            if not quiet:
+                logging.info(f"New Experiment ID: {eid}")
+            else:
+                print(f"New experiment: {experiment_name}_{eid}")
 
     else:
         # No persistent state
@@ -232,11 +255,17 @@ def main():
                 raise RuntimeError(f"Failed to create directory {exp_dir}")
     if client:
         client.close()
+        
+    if quiet:
+        print("✓ Remote directories ready")
 
     # Execute experiments
     iterations = 1 if (args.cont and continuing) else requested_iters
     total_runs = len(conc_vals) * iterations
     run_idx = 0
+
+    if quiet:
+        print(f"Starting {total_runs} runs: {conc_vals} x {iterations} iterations")
 
     for c in conc_vals:
         for _ in range(iterations):
@@ -253,11 +282,14 @@ def main():
             # Store the ID explicitly in a local variable to ensure consistency
             run_experiment_id = experiment_id
             
-            logging.info(
-                f"\nRUN {run_idx}/{total_runs}: {experiment_name}_"
-                f"{run_experiment_id} - C={c} - iter={iteration}"
-            )
-            logging.info(f"Using experiment ID: {run_experiment_id}")
+            if quiet:
+                print(f"Run {run_idx}/{total_runs}: C={c}, iter={iteration}")
+            else:
+                logging.info(
+                    f"\nRUN {run_idx}/{total_runs}: {experiment_name}_"
+                    f"{run_experiment_id} - C={c} - iter={iteration}"
+                )
+                logging.info(f"Using experiment ID: {run_experiment_id}")
 
             experiment_state.current_experiment_name = experiment_name
             experiment_state.current_concurrency     = c
@@ -267,15 +299,19 @@ def main():
             # 1) Pre-check
             if check_function() != 2:
                 raise RuntimeError("check_function failed")
+            if quiet:
+                print("✓ Pre-flight checks passed")
                 
             # 1.5) Chrony NTP pre-check - using the explicit ID
-            chrony_dir = run_chrony_check("pre", run_experiment_id, c, iteration)
+            chrony_dir = run_chrony_check("pre", run_experiment_id, c, iteration, quiet)
             
             # 2) Pre-experiment setup
             if not pre_experimentation(
                 experiment_name, c, iteration, run_experiment_id
             ):
                 raise RuntimeError("pre_experimentation failed")
+            if quiet:
+                print("✓ Pre-experiment setup completed")
                 
             # 3) Experimentation (with progress display)
             progress_tracker.start_time = time.time()
@@ -283,6 +319,8 @@ def main():
                 experiment_name, c, iteration, run_experiment_id
             ):
                 raise RuntimeError("experimentation failed")
+            if quiet:
+                print("✓ Experiment completed successfully")
                 
             # 4) Post-experiment cleanup & state update
             if not post_experimentation(
@@ -296,7 +334,7 @@ def main():
                 
             # 4.5) Chrony NTP post-check - IMPORTANT: use the same ID as pre-check
             logging.info(f"Running post-check with same ID: {run_experiment_id}")
-            run_chrony_check("post", run_experiment_id, c, iteration)
+            run_chrony_check("post", run_experiment_id, c, iteration, quiet)
 
             logging.info(f"Run {run_idx}/{total_runs} completed")
             new_state = load_experiment_state()
