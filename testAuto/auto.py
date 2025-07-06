@@ -7,7 +7,7 @@ import time
 import datetime
 import logging
 import signal
-import subprocess  # Added for Chrony check
+import subprocess
 
 import config as _config
 from config import (
@@ -22,7 +22,7 @@ from config import (
     clear_experiment_state,
     get_experiment_path,
 )
-from logging_utils import configure_logging, setup_logging
+from logging_utils import configure_logging
 from ssh_utils import SSHConnector
 from experiment import (
     check_function,
@@ -38,28 +38,26 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
     Runs the command as root (using sudo).
     Exits with code 1 if any host has a FAILURE.
     Prints the stdout from each host's command execution.
-    
-    Now takes experiment_id directly as parameter for reliability.
     """
     hosts = ["connt1", "connt2"]
     ssh = SSHConnector()
-    
+
     # Ensure we have a valid experiment ID
     if not experiment_id:
         experiment_id = "exp_" + datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')
         logging.warning(f"No experiment ID provided, using generated ID: {experiment_id}")
-    
+
     # Create a directory suffix including concurrency and iteration if available
     dir_suffix = ""
     if concurrency is not None:
         dir_suffix += f"_c{concurrency}"
     if iteration is not None:
         dir_suffix += f"_i{iteration}"
-    
+
     current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n=== Chrony Check ({phase}) - {current_time} - User: {CURRENT_USER} ===")
     print(f"Experiment ID: {experiment_id}{dir_suffix}")
-    
+
     for host in hosts:
         print(f"\n>> Running ChronyLogAnalysis.sh {phase} {experiment_id}{dir_suffix} on {host} (as root):")
         client = ssh.connect(host)
@@ -68,7 +66,7 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
             logging.error(msg)
             print(f"FAILURE - {msg}")
             sys.exit(1)
-        
+
         # First create the temp directory with proper permissions
         dir_path = f"/tmp/exp/{experiment_id}{dir_suffix}/chrony"
         mkdir_cmd = f"sudo mkdir -p {dir_path}"
@@ -77,7 +75,7 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
             print(f"Failed to create temp directory on {host}: {stderr.read().decode('utf-8')}")
             client.close()
             sys.exit(1)
-        
+
         # Fix permissions on the directory
         chmod_cmd = f"sudo chmod 777 -R /tmp/exp/{experiment_id}{dir_suffix}"
         stdin, stdout, stderr = client.exec_command(chmod_cmd)
@@ -85,16 +83,16 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
             print(f"Failed to set permissions on temp directory on {host}: {stderr.read().decode('utf-8')}")
             client.close()
             sys.exit(1)
-        
+
         # Run the script with experiment ID as third parameter
         cmd = f"sudo /opt/MasterThesis/stats/ChronyLogAnalysis.sh {phase} {experiment_id}{dir_suffix}"
         print(f"Executing: {cmd}")
-        
+
         stdin, stdout, stderr = client.exec_command(cmd)
         exit_status = stdout.channel.recv_exit_status()
         output = stdout.read().decode('utf-8')
         error = stderr.read().decode('utf-8')
-        
+
         # Print the output directly to stdout
         print(f"--- Output from {host} ---")
         print(output)
@@ -102,16 +100,16 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
             print(f"--- Error from {host} ---")
             print(error)
         print(f"--- End of output from {host} ---")
-        
+
         if exit_status != 0 or "FAILURE" in output or "FAILURE" in error:
             logging.error(f"ChronyLogAnalysis.sh ({phase}) on {host} failed with status {exit_status}")
             print(f"FAILURE detected on {host}")
             client.close()
             sys.exit(1)
-        
+
         logging.info(f"Chrony NTP status on {host}: OK ({phase})")
         client.close()
-    
+
     print(f"\n✓ Chrony NTP status on all hosts: OK ({phase})")
     print(f"=== End of Chrony Check ({phase}) ===\n")
 
@@ -142,8 +140,7 @@ def main():
 
     # Set up logging and signal handlers
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    # Call configure_logging with no arguments
-    configure_logging()  # <-- Modified: removed argument
+    configure_logging()
     setup_signal_handlers()
 
     experiment_name = args.name
@@ -207,15 +204,6 @@ def main():
         experiment_state.current_experiment_id = eid
         logging.info(f"Temporary Experiment ID: {eid}")
 
-    # Start experiment logging (file or console)
-    log_path = setup_logging(
-        experiment_name,
-        experiment_state.current_experiment_id,
-        demon,
-        CURRENT_TIMESTAMP,
-        CURRENT_USER,
-    )
-
     # Prepare remote directories
     ssh = SSHConnector()
     client = ssh.connect("connt1")
@@ -243,20 +231,28 @@ def main():
             run_idx += 1
             state = load_experiment_state()
             iteration = state.get("iteration", current_iter)
-            logging.info(
-                f"\nRUN {run_idx}/{total_runs}: {experiment_name}_"
-                f"{experiment_state.current_experiment_id} - C={c} - iter={iteration}"
-            )
+            experiment_id_for_chrony = state.get("id", experiment_state.current_experiment_id)
 
-            experiment_state.current_experiment_name = experiment_name
-            experiment_state.current_concurrency     = c
-            experiment_state.current_iteration       = iteration
+            # Build log file path with iteration
+            log_path = f"{experiment_name}_{experiment_id_for_chrony}_iter{iteration}_auto.log"
+
+            # Print log file location for this run
+            print(f"[auto.py] Logging for this run will be written to: {os.path.abspath(log_path)}")
+
+            # If in demon mode, redirect stdout/stderr to log file for this run
+            if demon:
+                experiment_state.log_file = open(log_path, "a")
+                if not hasattr(experiment_state, "original_stdout") or experiment_state.original_stdout is None:
+                    experiment_state.original_stdout = sys.stdout
+                    experiment_state.original_stderr = sys.stderr
+                sys.stdout = experiment_state.log_file
+                sys.stderr = experiment_state.log_file
 
             # 1) Pre-check
             if check_function() != 2:
                 raise RuntimeError("check_function failed")
-            # 1.5) Chrony NTP pre-check - pass experiment ID explicitly
-            run_chrony_check("pre", experiment_state.current_experiment_id, c, iteration)
+            # 1.5) Chrony NTP pre-check - pass experiment ID from state
+            run_chrony_check("pre", experiment_id_for_chrony, c, iteration)
             # 2) Pre-experiment setup
             if not pre_experimentation(
                 experiment_name, c, iteration, experiment_state.current_experiment_id
@@ -277,10 +273,14 @@ def main():
                 update_state=True,
             ):
                 raise RuntimeError("post_experimentation failed")
-            # 4.5) Chrony NTP post-check - pass experiment ID explicitly
-            print(experiment_state.current_experiment_id)
-            run_chrony_check("post", experiment_state.current_experiment_id, c, iteration)
-            
+            # 4.5) Chrony NTP post-check - pass experiment ID from state
+            run_chrony_check("post", experiment_id_for_chrony, c, iteration)
+
+            if demon and getattr(experiment_state, 'log_file', None):
+                sys.stdout = experiment_state.original_stdout
+                sys.stderr = experiment_state.original_stderr
+                experiment_state.log_file.close()
+                experiment_state.log_file = None
 
             logging.info(f"Run {run_idx}/{total_runs} completed")
             new_state = load_experiment_state()
@@ -294,26 +294,22 @@ def main():
     logging.info(f"\nAll {total_runs} runs completed successfully!")
     logging.info(f"Experiment ID: {experiment_state.current_experiment_id}")
     logging.info(f"Next iteration: {next_iter}")
-    if log_path:
-        logging.info(f"Log file: {log_path}")
 
-    # Footer in demon mode
-    if demon and experiment_state.log_file:
-        footer = (
-            "\n=== Experiment Complete ===\n"
-            f"End Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Experiment: {experiment_name}_{experiment_state.current_experiment_id}\n"
-            f"Next Iteration: {next_iter}\n"
-            "Status: SUCCESS\n"
-            "===========================\n"
-        )
-        experiment_state.log_file.write(footer)
-        sys.stdout = experiment_state.original_stdout
-        sys.stderr = experiment_state.original_stderr
+    footer = (
+        "\n=== Experiment Complete ===\n"
+        f"End Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Experiment: {experiment_name}_{experiment_state.current_experiment_id}\n"
+        f"Next Iteration: {next_iter}\n"
+        "Status: SUCCESS\n"
+        "===========================\n"
+    )
+    if demon and hasattr(experiment_state, 'original_stdout') and experiment_state.original_stdout:
         experiment_state.original_stdout.write(footer)
-
-    experiment_state.original_stdout.write("SUCCESS\n")
-    experiment_state.original_stdout.flush()
+        experiment_state.original_stdout.write("SUCCESS\n")
+        experiment_state.original_stdout.flush()
+    else:
+        print(footer)
+        print("SUCCESS")
 
 if __name__ == "__main__":
     main()
