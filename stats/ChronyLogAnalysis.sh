@@ -1,18 +1,21 @@
 #!/bin/bash
 
-# Function to print a header with date and user information
+# Function to print a header with date and user information (to file, not stdout)
 print_header() {
     local current_date=$(date -u "+%Y-%m-%d %H:%M:%S")
-    echo "============================================================"
-    echo "Chrony Log Analysis Report"
-    echo "============================================================"
-    echo "Date and Time (UTC): $current_date"
-    echo "User: $current_user"
-    echo "============================================================"
-    echo ""
+    local current_user=$(whoami)
+    {
+        echo "============================================================"
+        echo "Chrony Log Analysis Report"
+        echo "============================================================"
+        echo "Date and Time (UTC): $current_date"
+        echo "User: $current_user"
+        echo "============================================================"
+        echo ""
+    } >> "$1"
 }
 
-# Function to setup the chrony directory
+# Function to setup the chrony directory (silent operation)
 setup_chrony_dir() {
     local id=$1
     local mode=$2
@@ -20,23 +23,13 @@ setup_chrony_dir() {
     
     # Create directory if it doesn't exist
     if [ ! -d "$dir" ]; then
-        mkdir -p "$dir"
-        echo "Created directory: $dir"
-    else
-        echo "Directory already exists: $dir"
+        mkdir -p "$dir" > /dev/null 2>&1
     fi
     
     # Clean up any previous files in pre mode
     if [ "$mode" = "pre" ]; then
-        echo "Cleaning up previous files in $dir..."
-        rm -f "$dir"/*
+        rm -f "$dir"/* > /dev/null 2>&1
     fi
-    
-    echo "Using directory: $dir"
-    echo ""
-    
-    # Return the directory path without printing anything
-    # This is crucial - don't add any echo statements here
 }
 
 # Function to extract and analyze chrony tracking log data
@@ -45,7 +38,7 @@ analyze_chrony_data() {
     local id=$2       # unique ID for directory
     local start_timestamp=$3  # Only used in "post" mode
     
-    # Setup chrony directory without capturing output
+    # Setup chrony directory silently
     setup_chrony_dir "$id" "$mode"
     local chrony_dir="/tmp/exp/$id/chrony"
     
@@ -55,8 +48,19 @@ analyze_chrony_data() {
     local temp_data_file="$chrony_dir/chrony_data_temp.txt"
     local timestamp_file="$chrony_dir/chrony_last_timestamp.txt"
     local stats_file="$chrony_dir/chrony_${mode}_stats.txt"
+    local analysis_log="$chrony_dir/chrony_${mode}_analysis.log"
     
-    echo "Running ${mode}-experimentation analysis..."
+    # Start logging all detailed output to the analysis log
+    print_header "$analysis_log"
+    
+    echo "Running ${mode} analysis..." # Line 1 of stdout
+    
+    # Log details to file instead of stdout
+    {
+        echo "Running ${mode}-experimentation analysis..."
+        echo "Directory: $chrony_dir"
+        echo "Log file: $log_file"
+    } >> "$analysis_log"
     
     # For pre-experimentation: get last 50 data lines
     if [ "$mode" = "pre" ]; then
@@ -66,18 +70,19 @@ analyze_chrony_data() {
         # Store the last timestamp for post-experimentation
         last_timestamp=$(tail -1 "$temp_data_file" | awk '{print $1 " " $2}')
         echo "$last_timestamp" > "$timestamp_file"
-        echo "Last timestamp: $last_timestamp"
+        echo "Timestamp captured: $last_timestamp" >> "$analysis_log"
         
     # For post-experimentation: get data from the stored timestamp onwards
     else
         if [ -z "$start_timestamp" ]; then
-            echo "Error: No start timestamp provided for post-experimentation analysis"
+            echo "Error: No start timestamp found" # Line 2 of stdout on error
+            echo "Error: No start timestamp provided for post-experimentation analysis" >> "$analysis_log"
             return 1
         fi
         
         # Convert timestamp to a format that can be used for comparison
         formatted_timestamp=$(date -d "$start_timestamp" +"%Y-%m-%d %H:%M:%S")
-        echo "Reading data from timestamp: $formatted_timestamp onwards"
+        echo "Analyzing data from $formatted_timestamp onwards" >> "$analysis_log"
         
         # Extract lines with timestamps after or equal to the start timestamp
         awk -v ts="$formatted_timestamp" '
@@ -264,30 +269,29 @@ analyze_chrony_data() {
     # Move the temporary stats file to the final stats file
     if [ "$mode" = "post" ] && [ -f "/tmp/chrony_stats.tmp" ]; then
         mv "/tmp/chrony_stats.tmp" "$stats_file"
-        echo "Analysis complete. Results stored in $output_file"
-        cat "$output_file"
-        
-        echo ""
-        echo "Sample statistics:"
-        cat "$sample_count_file"
-        
-        echo ""
-        echo "Overall statistics:"
-        cat "$stats_file"
-    else
-        echo "Analysis complete. Results stored in $output_file"
-        cat "$output_file"
-        
-        echo ""
-        echo "Sample statistics:"
-        cat "$sample_count_file"
     fi
     
-    echo ""
+    # Log all the detailed output instead of sending to stdout
+    {
+        echo "Analysis complete. Results stored in $output_file"
+        cat "$output_file"
+        
+        echo ""
+        echo "Sample statistics:"
+        cat "$sample_count_file"
+        
+        if [ "$mode" = "post" ] && [ -f "$stats_file" ]; then
+            echo ""
+            echo "Overall statistics:"
+            cat "$stats_file"
+        fi
+    } >> "$analysis_log"
+    
+    echo "Analysis complete. Details in $analysis_log" # Line 2 of stdout
     
     # Return the last timestamp for pre-experimentation
     if [ "$mode" = "pre" ]; then
-        echo "$last_timestamp"
+        echo "Timestamp: $last_timestamp" # Line 3 of stdout for pre mode
     fi
 }
 
@@ -307,20 +311,20 @@ compare_results() {
     local comparison_file="$chrony_dir/chrony_comparison.txt"
     
     if [ ! -f "$pre_file" ] || [ ! -f "$post_file" ]; then
-        echo "Error: Pre or post analysis files not found"
+        echo "Error: Analysis files not found" # Line 3 of stdout on error
         return 1
     fi
     
-    echo "Comparing pre and post experimentation results..."
+    echo "Comparing results..." # Line 3 of stdout
     
     # Create a temporary file to store comparison results and failure reasons
     echo "IP Address,Status,Freq_Var%,Skew_Var%,Offset_Var%,Root_delay_Var%,Root_disp_Var%,Max_error_Var%" > "$comparison_file"
     > "$failure_reason_file"  # Initialize empty failure reason file
     
     # Start building a detailed report
+    print_header "$detailed_report_file"
+    
     {
-        print_header
-        
         echo "EXPERIMENT ANALYSIS DETAILED REPORT"
         echo "====================================="
         echo ""
@@ -344,7 +348,7 @@ compare_results() {
         
         echo "COMPARISON RESULTS (Threshold: ${threshold}%)"
         echo "-------------------------------------"
-    } > "$detailed_report_file"
+    } >> "$detailed_report_file"
     
     # Extract the data using grep and process line by line
     for ip in $(tail -n +2 "$pre_file" | cut -d, -f1); do
@@ -498,9 +502,6 @@ compare_results() {
         fi
     done
     
-    echo "Comparison complete. Results stored in $comparison_file"
-    cat "$comparison_file"
-    
     # Add overall status to detailed report
     {
         echo "OVERALL EXPERIMENT RESULT"
@@ -509,9 +510,7 @@ compare_results() {
     
     # Overall experiment status
     if grep -q "FAIL" "$comparison_file"; then
-        echo "OVERALL EXPERIMENT STATUS: FAIL"
-        echo "Reasons for failure:" 
-        cat "$failure_reason_file"
+        echo "RESULT: FAIL (See $detailed_report_file for details)" # Line 4 of stdout
         
         # Add failure reasons to detailed report
         {
@@ -520,13 +519,9 @@ compare_results() {
             cat "$failure_reason_file"
         } >> "$detailed_report_file"
         
-        echo ""
-        echo "Detailed report available at: $detailed_report_file"
-        echo "To view: cat $detailed_report_file"
-        
         return 1
     else
-        echo "OVERALL EXPERIMENT STATUS: PASS"
+        echo "RESULT: PASS (See $detailed_report_file for details)" # Line 4 of stdout
         
         # Add success message to detailed report
         {
@@ -534,21 +529,15 @@ compare_results() {
             echo "All metrics are within acceptable threshold limits (${threshold}%)."
         } >> "$detailed_report_file"
         
-        echo ""
-        echo "Detailed report available at: $detailed_report_file"
-        echo "To view: cat $detailed_report_file"
-        
         return 0
     fi
 }
 
 # Main function
 main() {
-    print_header
-    
     # Check if ID is provided
     if [ -z "$2" ]; then
-        echo "Error: No ID provided. Usage: $0 {pre|post} <unique_id>"
+        echo "Usage: $0 {pre|post} <unique_id>"
         exit 1
     fi
     
