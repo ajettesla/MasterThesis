@@ -287,6 +287,26 @@ class RemoteProgramRunner:
         current_host = get_current_hostname()
         logging.info(f"{BLUE}[{current_host} local check] {self.hostname}: {msg}{RESET}")
 
+    def ensure_temp_directories(self):
+        """Ensure /tmp/exp directory exists with proper permissions"""
+        exp_dir = "/tmp/exp"
+        mkdir_cmd = f"sudo mkdir -p {exp_dir}"
+        chmod_cmd = f"sudo chmod 777 {exp_dir}"
+        
+        # Create the directory
+        status, output, error = self.run_command(mkdir_cmd, timeout=10)
+        if not status:
+            self.log(f"Failed to create directory {exp_dir}: {error}")
+            return False
+            
+        # Set permissions
+        status, output, error = self.run_command(chmod_cmd, timeout=10)
+        if not status:
+            self.log(f"Failed to set permissions on {exp_dir}: {error}")
+            return False
+            
+        return True
+
     def connect(self):
         connector = SSHConnector()
         self.client = connector.connect(self.hostname)
@@ -309,6 +329,11 @@ class RemoteProgramRunner:
                 return (False, "", str(e))
 
     def launch(self):
+        # Ensure the temp directory exists with proper permissions
+        if not self.ensure_temp_directories():
+            self.result.update({"status": "temp_dir_failed", "error": "Failed to create /tmp/exp directory"})
+            return False
+            
         full_cmd = f"cd {self.working_dir} && nohup {self.command} > {self.log_file} 2>&1 & echo $! > {self.pid_file} && echo $!"
         
         try:

@@ -18,7 +18,7 @@ from config import (
     progress_tracker, experiment_state
 )
 
-def configure_logging(log_level=logging.INFO, log_file=None):
+def configure_logging(log_level=logging.INFO, log_file=None, quiet=False):
     """Configure logging with advanced options"""
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
@@ -32,6 +32,16 @@ def configure_logging(log_level=logging.INFO, log_file=None):
     console_handler.setFormatter(logging.Formatter(log_format, date_format))
     root_logger.addHandler(console_handler)
     
+    # Suppress paramiko and other SSH-related logging in quiet mode
+    if quiet:
+        # Set paramiko loggers to WARNING level to suppress INFO messages
+        logging.getLogger("paramiko").setLevel(logging.WARNING)
+        logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
+        logging.getLogger("paramiko.transport.sftp").setLevel(logging.WARNING)
+        logging.getLogger("paramiko.client").setLevel(logging.WARNING)
+        # Also suppress SSH utils verbose logging
+        logging.getLogger("ssh_utils").setLevel(logging.WARNING)
+    
     if log_file:
         try:
             log_dir = os.path.dirname(log_file)
@@ -40,7 +50,8 @@ def configure_logging(log_level=logging.INFO, log_file=None):
             fh = logging.FileHandler(log_file)
             fh.setFormatter(logging.Formatter(log_format, date_format))
             root_logger.addHandler(fh)
-            logging.info(f"Logging to file: {log_file}")
+            if not quiet:
+                logging.info(f"Logging to file: {log_file}")
         except Exception as e:
             logging.error(f"Failed to set up file logging: {e}")
 
