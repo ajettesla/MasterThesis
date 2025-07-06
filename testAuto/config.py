@@ -41,6 +41,7 @@ class ExperimentState:
         self.original_stderr         = None
         self.log_file                = None
         self.demon_mode              = False
+        self.quiet_mode = False  # Add this line
 
     def reset(self):
         """Reset the experiment state to initial values."""
