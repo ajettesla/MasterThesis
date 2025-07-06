@@ -5,6 +5,7 @@ import threading
 import logging
 from datetime import datetime
 import yaml
+import sys
 
 # ---- Colors ----
 RESET   = "\033[0m"
@@ -29,6 +30,19 @@ DEFAULT_MONITORING_TIME = 250
 CURRENT_TIMESTAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 CURRENT_USER = os.getenv("USER", "unknown")
 
+# Helper functions for stdout printing
+def print_step(step, status, details=None):
+    """Print a step status directly to stdout"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    msg = f"[{timestamp}] {step}: {status}"
+    if details:
+        msg += f" - {details}"
+    print(msg, flush=True)
+
+def print_status(message):
+    """Print a status message directly to stdout"""
+    print(message, flush=True)
+
 class ExperimentState:
     def __init__(self):
         self.current_experiment_name = None
@@ -40,8 +54,8 @@ class ExperimentState:
         self.original_stdout         = None
         self.original_stderr         = None
         self.log_file                = None
+        self.log_file_path           = None
         self.demon_mode              = False
-        self.quiet_mode = False  # Add this line
 
     def reset(self):
         """Reset the experiment state to initial values."""
@@ -57,7 +71,9 @@ class ProgressTracker:
         self.lock              = threading.Lock()
         self.start_time        = 0
         self.last_full_display = 0
+        self.last_console_display = 0
         self.display_interval  = 10  # seconds
+        self.console_interval  = 30  # seconds for console updates
 
     def update_file_progress(self, filename, prev_size, current_size,
                              line_count, total_bytes, update_display=False):
@@ -71,17 +87,27 @@ class ProgressTracker:
                 'last_update': datetime.now(),
             }
             now_ts = datetime.now().timestamp()
+            
+            # Update log file display if requested
             if update_display and (now_ts - self.last_full_display >= self.display_interval):
                 self._display_full_progress()
                 self.last_full_display = now_ts
+                
+            # Update console with simplified status less frequently
+            if now_ts - self.last_console_display >= self.console_interval:
+                self._display_console_progress()
+                self.last_console_display = now_ts
 
     def force_display_progress(self):
         """Force an immediate display of all file progress."""
         with self.lock:
             self._display_full_progress()
+            self._display_console_progress()
             self.last_full_display = datetime.now().timestamp()
+            self.last_console_display = datetime.now().timestamp()
 
     def _display_full_progress(self):
+        """Display detailed progress in log file only"""
         elapsed = datetime.now().timestamp() - self.start_time
         elapsed_min = elapsed / 60.0
         stats_lines = []
@@ -112,6 +138,19 @@ class ProgressTracker:
                 f"TOTAL: {total_size/(1024*1024):.2f}MB | +" +
                 f"{total_delta/(1024*1024):.2f}MB | Lines: {total_lines}"
             )
+    
+    def _display_console_progress(self):
+        """Display simplified progress directly to console"""
+        elapsed = datetime.now().timestamp() - self.start_time
+        elapsed_min = elapsed / 60.0
+        
+        file_count = len(self.file_stats)
+        total_size = sum(stats.get('size', 0) for _, stats in self.file_stats.items())
+        total_lines = sum(stats.get('lines', 0) for _, stats in self.file_stats.items())
+        
+        if file_count > 0:
+            print_status(f"Progress: {elapsed_min:.1f} min | Files: {file_count} | " +
+                        f"Size: {total_size/(1024*1024):.2f}MB | Lines: {total_lines}")
 
 # Global progress tracker
 progress_tracker = ProgressTracker()
@@ -135,6 +174,7 @@ def init_state_file(experiment_name, concurrency_values):
     )
     STATE_FILE = os.path.join(STATE_DIR, filename)
     logging.info(f"[config] STATE_FILE set to: {STATE_FILE}")
+    print_status(f"State file: {STATE_FILE}")
 
 def load_experiment_state():
     """
@@ -142,17 +182,23 @@ def load_experiment_state():
     Returns a dict (possibly empty) if file missing or on error.
     """
     if not STATE_FILE:
-        logging.error("load_experiment_state: STATE_FILE not initialized")
+        error_msg = "load_experiment_state: STATE_FILE not initialized"
+        logging.error(error_msg)
+        print_status(f"ERROR: {error_msg}")
         return {}
+        
     if not os.path.exists(STATE_FILE):
         return {}
+        
     try:
         with open(STATE_FILE, 'r') as f:
             data = yaml.safe_load(f) or {}
         logging.info(f"[config] Loaded state from {STATE_FILE}: {data}")
         return data
     except Exception as e:
-        logging.warning(f"[config] Failed to load state file {STATE_FILE}: {e}")
+        error_msg = f"Failed to load state file {STATE_FILE}: {e}"
+        logging.warning(f"[config] {error_msg}")
+        print_status(f"WARNING: {error_msg}")
         return {}
 
 def save_experiment_state(state):
@@ -161,11 +207,17 @@ def save_experiment_state(state):
     Returns True on success, False on failure.
     """
     if not STATE_FILE:
-        logging.error("save_experiment_state: STATE_FILE not initialized")
+        error_msg = "save_experiment_state: STATE_FILE not initialized"
+        logging.error(error_msg)
+        print_status(f"ERROR: {error_msg}")
         return False
+        
     if 'name' not in state or 'concurrency' not in state:
-        logging.error("save_experiment_state: Missing 'name' or 'concurrency' in state")
+        error_msg = "save_experiment_state: Missing 'name' or 'concurrency' in state"
+        logging.error(error_msg)
+        print_status(f"ERROR: {error_msg}")
         return False
+        
     try:
         with open(STATE_FILE, 'w') as f:
             yaml.safe_dump(state, f, default_flow_style=False)
@@ -173,7 +225,9 @@ def save_experiment_state(state):
         logging.info(f"[config] Saved state to {STATE_FILE}")
         return True
     except Exception as e:
-        logging.error(f"[config] Failed to save state file {STATE_FILE}: {e}")
+        error_msg = f"Failed to save state file {STATE_FILE}: {e}"
+        logging.error(f"[config] {error_msg}")
+        print_status(f"ERROR: {error_msg}")
         return False
 
 def clear_experiment_state():
@@ -183,13 +237,17 @@ def clear_experiment_state():
     """
     if not STATE_FILE:
         return True
+        
     if os.path.exists(STATE_FILE):
         try:
             os.remove(STATE_FILE)
             logging.info(f"[config] Cleared state file {STATE_FILE}")
+            print_status(f"Cleared state file: {STATE_FILE}")
             return True
         except Exception as e:
-            logging.error(f"[config] Failed to clear state file {STATE_FILE}: {e}")
+            error_msg = f"Failed to clear state file {STATE_FILE}: {e}"
+            logging.error(f"[config] {error_msg}")
+            print_status(f"ERROR: {error_msg}")
             return False
     return True
 
