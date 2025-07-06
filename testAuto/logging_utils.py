@@ -5,161 +5,145 @@ import sys
 import time
 import logging
 import threading
-import re
-import select
 import subprocess
-import random
 import socket
+import re
 import getpass
 from datetime import datetime
+import builtins
+import select
 
 from config import (
     colored, RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, BOLD, RESET,
     progress_tracker, experiment_state
 )
 
-def configure_logging(log_level=logging.INFO, log_file=None):
-    """Configure logging with advanced options"""
+
+class FileOnlyHandler(logging.Handler):
+    """Handler that only writes to log file, not to stdout"""
+    def __init__(self, filename):
+        super().__init__()
+        self.filename = filename
+        self.file_handler = logging.FileHandler(filename)
+        
+    def emit(self, record):
+        self.file_handler.emit(record)
+        
+    def close(self):
+        self.file_handler.close()
+        super().close()
+
+def configure_logging(log_file=None):
+    """
+    Configure logging to write only to file, not to stdout
+    All logs will be verbose by default.
+    """
+    # Always use DEBUG level for file logging (verbose by default)
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
-    
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    root_logger.setLevel(log_level)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(log_format, date_format))
-    root_logger.addHandler(console_handler)
+    # Remove existing handlers
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
     
+    # Set root logger level to DEBUG (always verbose)
+    root.setLevel(logging.DEBUG)
+
+    # Only add file handler if log_file is provided
     if log_file:
-        try:
-            log_dir = os.path.dirname(log_file)
-            if log_dir and not os.path.exists(log_dir):
-                os.makedirs(log_dir)
-            fh = logging.FileHandler(log_file)
-            fh.setFormatter(logging.Formatter(log_format, date_format))
-            root_logger.addHandler(fh)
-            logging.info(f"Logging to file: {log_file}")
-        except Exception as e:
-            logging.error(f"Failed to set up file logging: {e}")
+        fh = logging.FileHandler(log_file)
+        formatter = logging.Formatter(log_format, date_format)
+        fh.setFormatter(formatter)
+        root.addHandler(fh)
+    
+    # Disable propagation of messages from paramiko and other third-party libraries
+    for logger_name in ['paramiko', 'paramiko.transport', 'paramiko.client', 'urllib3', 'requests']:
+        third_party_logger = logging.getLogger(logger_name)
+        third_party_logger.propagate = False
+        third_party_logger.setLevel(logging.WARNING)  # Only show warnings and higher from these libraries
+        if log_file:
+            third_party_logger.addHandler(fh)
+    
+    # Disable root logger's propagation to stdout
+    # This is the most critical part to prevent logs showing in console
+    logging.getLogger().handlers = [h for h in logging.getLogger().handlers if not isinstance(h, logging.StreamHandler) or h.stream != sys.stdout]
 
-    def exception_handler(exc_type, exc_value, exc_traceback):
+    # Exception handling
+    def handle_ex(exc_type, exc_val, exc_tb):
         if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            sys.__excepthook__(exc_type, exc_val, exc_tb)
             return
-        logging.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-    sys.excepthook = exception_handler
-
-    logging.info(f"Logging initialized at level {logging.getLevelName(log_level)}")
-    logging.info(f"Python version: {sys.version}")
-    logging.info(f"Platform: {sys.platform}")
-    logging.info(f"User: {getpass.getuser()}")
-    logging.info(f"Current time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    handlers=[logging.StreamHandler()]
-)
-
-class TeeOutput:
-    def __init__(self, file_stream, original_stream):
-        self.file_stream = file_stream
-        self.original_stream = original_stream
-        
-    def write(self, data):
-        try:
-            self.file_stream.write(data)
-        except Exception:
-            pass
-        self.original_stream.write(data)
-        
-    def flush(self):
-        try:
-            self.file_stream.flush()
-        except Exception:
-            pass
-        self.original_stream.flush()
-        
-    def isatty(self):
-        return self.original_stream.isatty()
-        
-    def fileno(self):
-        return self.original_stream.fileno()
+        # Log exception to file
+        logging.error("Uncaught exception", exc_info=(exc_type, exc_val, exc_tb))
+        # Also print to stdout
+        print(f"ERROR: Uncaught exception: {exc_val}", file=sys.__stderr__)
+    
+    sys.excepthook = handle_ex
 
 def get_current_hostname():
     try:
         return subprocess.check_output(['hostname'], text=True).strip()
-    except:
+    except Exception:
         return socket.gethostname()
 
 
 def setup_logging(experiment_name, experiment_id, demon, timestamp, user):
-    """Set up logging to both file and stdout when in demon mode"""
-    experiment_state.original_stdout = sys.stdout
-    experiment_state.original_stderr = sys.stderr
+    """
+    Creates a per-run logfile and sets up logging to file only.
+    stdout will be handled separately with direct print statements.
+    """
     experiment_state.demon_mode = demon
 
-    if demon:
-        # include iteration suffix if set
-        iteration = getattr(experiment_state, "current_iteration", None)
-        iter_suffix = f"_{iteration}" if iteration is not None else ""
+    # Build filename
+    conc = getattr(experiment_state, "current_concurrency", None)
+    it  = getattr(experiment_state, "current_iteration",   None)
+    part_c = f"_C{conc}" if conc is not None else ""
+    part_i = f"_it{it}"  if it  is not None else ""
+    path = f"/tmp/exp/{experiment_name}_{experiment_id}{part_c}{part_i}_auto.log"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        log_timestamp = timestamp.replace(" ", "_").replace(":", "")
-        log_path = f"/tmp/exp/{experiment_name}_{experiment_id}{iter_suffix}_{log_timestamp}_auto.log"
-        experiment_state.log_file = open(log_path, 'w', buffering=1)
+    # Set in state
+    experiment_state.log_file_path = path
 
-        # write header
-        header = (
-            "=== Experiment Log ===\n"
-            f"Date/Time: {timestamp}\n"
-            f"User: {user}\n"
-            f"Host: {get_current_hostname()}\n"
-            f"Experiment: {experiment_name}\n"
-            f"Experiment ID: {experiment_id}\n"
-            + (f"Iteration: {iteration}\n" if iteration is not None else "")
-            + "==============================\n\n"
-        )
-        experiment_state.log_file.write(header)
-        experiment_state.original_stdout.write(header)
+    # Setup logger (write to file only)
+    configure_logging(log_file=path)
+    
+    # Log metadata header to file
+    logging.info("=== Experiment Log ===")
+    logging.info(f"Experiment: {experiment_name}")
+    logging.info(f"Experiment ID: {experiment_id}")
+    logging.info(f"Timestamp: {timestamp}")
+    logging.info(f"User: {user}")
+    if conc is not None:
+        logging.info(f"Concurrency: {conc}")
+    if it is not None:
+        logging.info(f"Iteration: {it}")
+    logging.info("========================")
+    
+    # Print log file path to stdout
+    print(f"Log file: {path}")
 
-        # tee stdout/stderr
-        sys.stdout = TeeOutput(experiment_state.log_file, experiment_state.original_stdout)
-        sys.stderr = TeeOutput(experiment_state.log_file, experiment_state.original_stderr)
+    return path
 
-        # route logging to same file
-        fh = logging.FileHandler(log_path)
-        fh.setLevel(logging.getLogger().level)
-        fh.setFormatter(logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
-            '%Y-%m-%d %H:%M:%S'
-        ))
-        logging.getLogger().addHandler(fh)
-
-        return log_path
-    else:
-        return None
 
 def cleanup_logging():
-    if experiment_state.log_file and experiment_state.demon_mode:
-        logger = logging.getLogger()
-        for h in logger.handlers[:]:
-            if isinstance(h, logging.FileHandler):
-                if getattr(h.stream, 'name', None) == getattr(experiment_state.log_file, 'name', None):
-                    logger.removeHandler(h)
-                    try:
-                        h.close()
-                    except:
-                        pass
-        sys.stdout = experiment_state.original_stdout
-        sys.stderr = experiment_state.original_stderr
+    """
+    Clean up logger handlers and reset demon mode.
+    """
+    if not getattr(experiment_state, "demon_mode", False):
+        return
+
+    log = logging.getLogger()
+    for h in log.handlers[:]:
         try:
-            experiment_state.log_file.close()
+            h.close()
         except:
             pass
-        experiment_state.log_file = None
-        experiment_state.demon_mode = False
+        log.removeHandler(h)
+
+    experiment_state.demon_mode = False
+
 
 def check_and_clear_memory_usage():
     try:
@@ -187,6 +171,7 @@ def check_and_clear_memory_usage():
         logging.error(f"Error checking memory: {e}")
         return None
 
+
 class SimpleProgressDisplay(threading.Thread):
     def __init__(self, stop_event):
         super().__init__(daemon=True)
@@ -201,6 +186,7 @@ class SimpleProgressDisplay(threading.Thread):
         self.close_connections()
 
     def close_connections(self):
+        """Close any open SSH connections"""
         for host, client in self.clients.items():
             if client:
                 try:
@@ -244,6 +230,7 @@ class SimpleProgressDisplay(threading.Thread):
                     d2 = c2 - self.last_connt2
                     self.last_connt1, self.last_connt2 = c1, c2
 
+                    # Log detailed info to file only
                     logging.info("\n" + "="*80)
                     logging.info(f"Progress Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                     logging.info("="*80)
@@ -262,13 +249,16 @@ class SimpleProgressDisplay(threading.Thread):
                     logging.info(f"connt2: {c2} (Δ: {d2:+d})")
                     logging.info("="*80)
 
+                    # Print minimal status to stdout using direct print, not logging
+                    print(f"Progress: connt1={c1}, connt2={c2}, Files={len(progress_tracker.file_stats)}", flush=True)
+
                     check_and_clear_memory_usage()
                     self.stop_event.wait(5)
                 except Exception as e:
                     logging.error(f"Error in progress display: {e}")
                     time.sleep(5)
         finally:
-            self.close_connections()	
+            self.close_connections()
 			
 # Log monitoring class for watching files for growth or specific content
 class LogMonitorHandler(threading.Thread): 
@@ -486,6 +476,8 @@ def monitor_log_file_watchdog(
     handler.start()
 
     logging.info(f"{YELLOW}[{current_host} local check] Monitoring {os.path.basename(filepath)} using inotifywait...{RESET}")
+    # Print minimal status to stdout
+    print(f"Monitoring: {os.path.basename(filepath)}")
 
     start_time = time.time()
     last_countdown_message = 0
@@ -543,6 +535,8 @@ def monitor_remote_log_file(filepath, host, keyword_expr="", timeout=None, print
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
         
         logging.debug(f"{BLUE}[{current_host} local check] Starting remote monitoring of {os.path.basename(filepath)} on {host} using wc -l{RESET}")
+        # Print minimal status to stdout
+        print(f"Remote monitoring: {host}:{os.path.basename(filepath)}")
         
         keywords = set(re.findall(r"'(.*?)'", keyword_expr))
         match_mode = bool(keywords)
@@ -693,5 +687,4 @@ def monitor_remote_log_file(filepath, host, keyword_expr="", timeout=None, print
                 if match_mode:
                     result_dict[f"remote-{host}-{threading.current_thread().name}"] = len(seen_keywords)
                 else:
-                    result_dict[f"remote-{host}-{threading.current_thread().name}"] = total_lines_grown
                     result_dict[f"remote-{host}-{threading.current_thread().name}"] = total_lines_grown
