@@ -9,21 +9,11 @@ import threading
 import logging
 import random
 import shlex
-import datetime
 
 from config import (
     colored, RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, BOLD, RESET
 )
 from logging_utils import get_current_hostname
-
-# Helper function for stdout printing
-def print_step(step, status, details=None):
-    """Print a step status directly to stdout"""
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    msg = f"[{timestamp}] {step}: {status}"
-    if details:
-        msg += f" - {details}"
-    print(msg, flush=True)
 
 def retry_with_backoff(func, max_retries=3, initial_backoff=1, max_backoff=30):
     """Retry a function with exponential backoff"""
@@ -43,7 +33,6 @@ def retry_with_backoff(func, max_retries=3, initial_backoff=1, max_backoff=30):
             sleep_time = min(backoff + jitter, max_backoff)
             
             logging.warning(f"Attempt {retries} failed: {str(e)}. Retrying in {sleep_time:.1f}s...")
-            print(f"Connection attempt {retries} failed. Retrying in {sleep_time:.1f}s...", flush=True)
             time.sleep(sleep_time)
             
             # Exponential backoff
@@ -57,10 +46,7 @@ class SSHConnector:
 
     def _load_ssh_config(self):
         if not os.path.exists(self.ssh_config_path):
-            error_msg = f"SSH config file not found at {self.ssh_config_path}"
-            logging.error(f"{RED}{error_msg}{RESET}")
-            print(f"ERROR: {error_msg}", flush=True)
-            raise FileNotFoundError(error_msg)
+            raise FileNotFoundError(f"{RED}SSH config file not found at {self.ssh_config_path}{RESET}")
         config = paramiko.SSHConfig()
         with open(self.ssh_config_path, 'r') as f:
             config.parse(f)
@@ -86,10 +72,7 @@ class SSHConnector:
         def connect_to_host():
             host_config = self.config.lookup(hostname)
             if not host_config:
-                error_msg = f"No configuration found for {hostname}"
-                logging.error(f"{RED}{error_msg}{RESET}")
-                print(f"ERROR: {error_msg}", flush=True)
-                raise ValueError(error_msg)
+                raise ValueError(f"{RED}No configuration found for {hostname}{RESET}")
 
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -126,9 +109,7 @@ class SSHConnector:
         try:
             return retry_with_backoff(connect_to_host, max_retries=3, initial_backoff=2)
         except Exception as e:
-            error_msg = f"Failed to connect to {hostname} after retries: {str(e)}"
-            logging.error(error_msg)
-            print(f"ERROR: {error_msg}", flush=True)
+            logging.error(f"Failed to connect to {hostname} after retries: {str(e)}")
             raise
 
 def run_command_locally(cmd: str, hosttag="[localhost]"):
@@ -152,12 +133,10 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
             return (result.returncode == 0, result.stdout)
         except subprocess.TimeoutExpired:
-            error_msg = f"Command timed out after {timeout}s: {command}"
-            logging.error(error_msg)
+            logging.error(f"Command timed out after {timeout}s: {command}")
             return (False, f"Timeout exceeded ({timeout}s)")
         except Exception as e:
-            error_msg = f"Error running command locally: {str(e)}"
-            logging.error(error_msg)
+            logging.error(f"Error running command locally: {str(e)}")
             return (False, str(e))
     else:
         # Remote execution
@@ -170,8 +149,7 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             while not channel.exit_status_ready():
                 if time.time() - start > timeout:
                     channel.close()
-                    error_msg = f"[{hostname}] Timeout exceeded while running: {command}"
-                    logging.error(f"{RED}{error_msg}{RESET}")
+                    logging.error(f"{RED}[{hostname}] Timeout exceeded while running: {command}{RESET}")
                     return False, f"Timeout exceeded while running: {command}"
                 time.sleep(0.5)
             
@@ -186,8 +164,7 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             
             return (exit_status == 0, out if out else err)
         except Exception as e:
-            error_msg = f"[{hostname}] Exception during command: {command}\n{e}"
-            logging.error(f"{RED}{error_msg}{RESET}")
+            logging.error(f"{RED}[{hostname}] Exception during command: {command}\n{e}{RESET}")
             return False, str(e)
 
 def pre_kill_conflicting_processes(client, host, programs):
@@ -202,8 +179,6 @@ def pre_kill_conflicting_processes(client, host, programs):
         if status and output.strip():
             pids = output.strip().splitlines()
             logging.info(f"{YELLOW}[{host}] Found running '{prog}' with PIDs: {', '.join(pids)}. Killing...{RESET}")
-            print(f"Killing existing '{prog}' processes on {host} (PIDs: {', '.join(pids)})", flush=True)
-            
             for pid in pids:
                 kill_cmd = f"sudo kill -9 {pid}"
                 if client is None:
@@ -216,7 +191,6 @@ def pre_kill_conflicting_processes(client, host, programs):
 
 def force_kill_all_monitoring_processes():
     """Force kill all monitoring processes across all hosts"""
-    #print_step("CLEANUP", "FORCE KILL", "Terminating all monitoring processes")
     logging.info(f"{MAGENTA}[cleanup] Force killing all monitoring processes...{RESET}")
     
     ssh_connector = SSHConnector()
@@ -236,8 +210,6 @@ def force_kill_all_monitoring_processes():
             continue
             
         logging.info(f"{YELLOW}[cleanup] [{host}] Force killing monitoring processes...{RESET}")
-        print(f"Terminating processes on {host}: {', '.join(processes)}", flush=True)
-        
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
         
@@ -264,7 +236,6 @@ def force_kill_all_monitoring_processes():
             client.close()
     
     logging.info(f"{GREEN}[cleanup] Force kill completed for all monitoring processes.{RESET}")
-    #print_step("CLEANUP", "COMPLETE", "All monitoring processes terminated")
 
 class RemoteProgramRunner:
     def __init__(
@@ -316,18 +287,9 @@ class RemoteProgramRunner:
         current_host = get_current_hostname()
         logging.info(f"{BLUE}[{current_host} local check] {self.hostname}: {msg}{RESET}")
 
-    def print_status(self, msg):
-        """Print status message to stdout"""
-        print(f"[{self.hostname}] {self.program_name}: {msg}", flush=True)
-
     def connect(self):
-        self.print_status(f"Connecting to host")
         connector = SSHConnector()
         self.client = connector.connect(self.hostname)
-        if self.client is None:
-            self.print_status(f"Using local connection")
-        else:
-            self.print_status(f"SSH connection established")
         return self.client is not None
 
     def run_command(self, cmd, timeout=None, verbose=None):
@@ -347,14 +309,12 @@ class RemoteProgramRunner:
                 return (False, "", str(e))
 
     def launch(self):
-        self.print_status(f"Launching program")
         full_cmd = f"cd {self.working_dir} && nohup {self.command} > {self.log_file} 2>&1 & echo $! > {self.pid_file} && echo $!"
         
         try:
             status, output, err = self.run_command(full_cmd, timeout=15)
             if not status:
                 self.result.update({"status": "launch_failed", "error": err})
-                self.print_status(f"Launch failed: {err}")
                 return False
             
             lines = output.strip().split('\n')
@@ -362,7 +322,6 @@ class RemoteProgramRunner:
                 if line.strip().isdigit():
                     self.pid = line.strip()
                     self.result["pid"] = self.pid
-                    self.print_status(f"Running with PID {self.pid}")
                     return True
             
             time.sleep(2)
@@ -370,16 +329,13 @@ class RemoteProgramRunner:
             if status and pid_out.strip().isdigit():
                 self.pid = pid_out.strip()
                 self.result["pid"] = self.pid
-                self.print_status(f"Running with PID {self.pid} (from file)")
                 return True
             
             self.result.update({"status": "pid_fetch_failed", "error": f"Could not get PID. Output: {output}"})
-            self.print_status(f"Failed to get PID")
             return False
             
         except Exception as e:
             self.result.update({"status": "launch_failed", "error": str(e)})
-            self.print_status(f"Exception during launch: {e}")
             return False
 
     def is_process_running(self):
@@ -399,27 +355,22 @@ class RemoteProgramRunner:
 
     def kill(self):
         if self.pid:
-            self.print_status(f"Killing process {self.pid}")
             self.run_command(f"sudo kill {self.pid}", timeout=5)
             self.result["status"] = "killed_stuck"
 
     def collect_logs(self):
-        self.print_status(f"Collecting output from log file")
         success, final_out, _ = self.run_command(f"cat {self.log_file}", timeout=10)
         if success:
             self.result["output"] = final_out
 
     def cleanup_files(self):
-        self.print_status(f"Cleaning up temporary files")
         self.run_command(f"rm -f {self.pid_file}", timeout=5)
 
     def run(self):
         self.log(f"{BOLD}Starting: {self.command}{RESET}")
-        self.print_status(f"Starting program")
 
         if not self.connect():
             self.result["status"] = "connection_failed"
-            self.print_status(f"Connection failed")
             return self.result
 
         if not self.launch():
@@ -431,13 +382,11 @@ class RemoteProgramRunner:
         while time.time() - start_time < self.max_duration:
             if not self.is_process_running():
                 self.result["status"] = "completed"
-                self.print_status(f"Process completed normally")
                 self.collect_logs()
                 break
 
             if self.check_stuck and self.is_stuck():
                 self.log(f"{RED}{self.program_name} appears stuck. Killing it.{RESET}")
-                self.print_status(f"Process appears stuck - killing")
                 self.kill()
                 self.collect_logs()
                 break
@@ -445,13 +394,10 @@ class RemoteProgramRunner:
             elapsed = int(time.time() - start_time)
             if elapsed % 30 == 0:
                 self.log(f"{YELLOW}Running... {elapsed}s elapsed{RESET}")
-                if elapsed > 0:  # Only print status updates after the first 30s
-                    self.print_status(f"Running... {elapsed}s elapsed")
 
             time.sleep(self.stuck_check_interval)
         else:
             self.log(f"{RED}Timeout reached. Killing process.{RESET}")
-            self.print_status(f"Timeout reached after {self.max_duration}s - killing process")
             self.kill()
             self.result["status"] = "timeout"
 
@@ -460,28 +406,32 @@ class RemoteProgramRunner:
 
         if self.client:
             self.client.close()
-            
         self.log(f"{BOLD}Finished with status: {self.result['status']}{RESET}")
-        self.print_status(f"Finished with status: {self.result['status']}")
         return self.result
 
 def get_client_threads(concurrency_n, concurrency_c, tcp_timeout_t):
     """Get client threads for the experiment"""
-    print_step("CLIENT", "CREATING", f"Client threads with N={concurrency_n}, C={concurrency_c}, T={tcp_timeout_t}")
     client_threads = [
         threading.Thread(
             target=build_and_run_client,
             kwargs=dict(
                 hostname="convsrc1",
-                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -w 1 -a 172.16.1.10-22 -k -r 10000-65000 -t {tcp_timeout_t}"
+                command=f"sudo ./tcp_client_er -s 172.16.1.1 -p 2000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.10-22 -k -r 10000-65000 -t {tcp_timeout_t}"
             ),
             name="Client-tcp-convsrc1"
-        )
+         )#,
+        # threading.Thread(
+        #     target=build_and_run_client,
+        #     kwargs=dict(
+        #         hostname="convsrc1",
+        #         command=f"./udp_client_sub -s 172.16.1.1 -p 3000 -n {concurrency_n} -c {concurrency_c} -a 172.16.1.10-22 -r 10000-65000"
+        #     ),
+        #     name="Client-udp-convsrc1"
+        # )
     ]
     return client_threads
 
 def build_and_run_client(hostname, command):
-    print_step("CLIENT", "LAUNCHING", f"Client on {hostname}")
     runner = RemoteProgramRunner(
         hostname=hostname,
         command=command,
@@ -492,5 +442,4 @@ def build_and_run_client(hostname, command):
         timeout=60,
     )
     result = runner.run()
-    print_step("CLIENT", "COMPLETED", f"Client on {hostname} ({result['status']})")
     return result
