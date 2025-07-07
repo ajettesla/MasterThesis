@@ -252,11 +252,8 @@ def main():
 
     footer = (
         "\n=== Experiment Complete ===\n"
-        f"End Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Experiment: {experiment_name}_{experiment_state.current_experiment_id}\n"
         f"Next Iteration: {next_iter}\n"
-        "Status: SUCCESS\n"
-        "===========================\n"
     )
     print(footer)
     print("SUCCESS")
