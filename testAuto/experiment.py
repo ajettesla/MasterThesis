@@ -54,7 +54,7 @@ def check_function():
     ssh_connector = SSHConnector()
 
     # Service restart/check for tcp_server/udp_server
-    print_step("CHECK", "CHECKING", "TCP/UDP servers")
+    #print_step("CHECK", "CHECKING", "TCP/UDP servers")
     for host, services in service_hosts.items():
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
@@ -224,7 +224,7 @@ def check_function():
     logging.info(colored("[check] All services active and conntrack tables flushed.", GREEN))
 
     # Log monitoring (removed PTP monitoring completely)
-    print_step("CHECK", "MONITORING", "Connection logs")
+    print_step("CHECK", "", "Connection logs")
     logging.info(colored("[check] Step: Log Monitoring", BOLD))
 
     conntrack_stop_event = threading.Event()
@@ -744,7 +744,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
     for th in client_threads:
         th.join()
 
-    print_step("EXPERIMENT", "MONITORING", f"Beginning stabilization period (max {DEFAULT_MONITORING_TIME}s)")
+    #print_step("EXPERIMENT", "MONITORING", f"Beginning stabilization period (max {DEFAULT_MONITORING_TIME}s)")
     logging.info("[exp] Client threads completed, beginning monitoring period")
     
     # Start monitoring with continuous condition checks
@@ -758,7 +758,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
         time_remaining = monitoring_time - time_elapsed
         
         # Check condition 1: CSV file growth < 5 lines
-        print_step("EXPERIMENT", "CHECKING", f"CSV file growth (elapsed: {time_elapsed:.1f}s)")
+        #print_step("EXPERIMENT", "CHECKING", f"CSV file growth (elapsed: {time_elapsed:.1f}s)")
         logging.info(f"[exp] Checking condition 1: CSV file growth < 5 lines (Time elapsed: {time_elapsed:.1f}s)")
         condition1_met = check_csv_file_growth(ca_csv_file, "convsrc2")
         
@@ -767,7 +767,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
             print_step("EXPERIMENT", "CONDITION 1 MET", "CSV file growth stabilized")
             
             # Check condition 2: Conntrack entries delta < 100
-            print_step("EXPERIMENT", "CHECKING", f"Conntrack entries (elapsed: {time_elapsed:.1f}s)")
+            #print_step("EXPERIMENT", "CHECKING", f"Conntrack entries (elapsed: {time_elapsed:.1f}s)")
             logging.info(f"[exp] Checking condition 2: Conntrack entries delta < 100 (Time elapsed: {time_elapsed:.1f}s)")
             condition2_met = check_conntrack_entries_delta()
             
@@ -780,7 +780,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
                 break
             else:
                 logging.info(colored("[exp] Condition 2 NOT met: Conntrack entries delta >= 100", YELLOW))
-                print_step("EXPERIMENT", "WAITING", f"Conntrack entries still changing, continuing ({time_remaining:.1f}s left)")
+                #print_step("EXPERIMENT", "WAITING", f"Conntrack entries still changing, continuing ({time_remaining:.1f}s left)")
                 if time_remaining > check_interval:
                     time.sleep(check_interval)
                 else:
@@ -788,7 +788,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
                     time.sleep(time_remaining)
         else:
             logging.info(colored("[exp] Condition 1 NOT met: CSV file still growing rapidly", YELLOW))
-            print_step("EXPERIMENT", "WAITING", f"CSV file still growing, continuing ({time_remaining:.1f}s left)")
+            #print_step("EXPERIMENT", "WAITING", f"CSV file still growing, continuing ({time_remaining:.1f}s left)")
             if time_remaining > check_interval:
                 time.sleep(check_interval)
             else:
