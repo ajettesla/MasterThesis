@@ -45,11 +45,12 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
         dir_suffix += f"_i{iteration}"
 
     current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n=== Chrony Check ({phase}) - {current_time} - User: {CURRENT_USER} ===")
-    print(f"Experiment ID: {experiment_id}{dir_suffix}")
+
+    print(f"=== Chrony Check ({phase}) - {current_time} - User: {CURRENT_USER} === Experiment ID: {experiment_id}{dir_suffix}")
+
 
     for host in hosts:
-        print(f"\n>> Running ChronyLogAnalysis.sh {phase} {experiment_id}{dir_suffix} on {host} (as root):")
+        print(f">> Running ChronyLogAnalysis.sh {phase} {experiment_id}{dir_suffix} on {host} (as root):")
         client = ssh.connect(host)
         if client is None:
             msg = f"Failed to connect to {host} for Chrony check"
@@ -58,34 +59,28 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
             sys.exit(1)
 
         dir_path = f"/tmp/exp/{experiment_id}{dir_suffix}/chrony"
-        mkdir_cmd = f"sudo mkdir -p {dir_path}"
-        stdin, stdout, stderr = client.exec_command(mkdir_cmd)
-        if stdout.channel.recv_exit_status() != 0:
-            print(f"Failed to create temp directory on {host}: {stderr.read().decode('utf-8')}")
-            client.close()
-            sys.exit(1)
-
-        chmod_cmd = f"sudo chmod 777 -R /tmp/exp/{experiment_id}{dir_suffix}"
-        stdin, stdout, stderr = client.exec_command(chmod_cmd)
-        if stdout.channel.recv_exit_status() != 0:
-            print(f"Failed to set permissions on temp directory on {host}: {stderr.read().decode('utf-8')}")
-            client.close()
-            sys.exit(1)
+        for cmd in [
+            f"sudo mkdir -p {dir_path}",
+            f"sudo chmod 777 -R /tmp/exp/{experiment_id}{dir_suffix}"
+        ]:
+            stdin, stdout, stderr = client.exec_command(cmd)
+            if stdout.channel.recv_exit_status() != 0:
+                print(f"Failed to execute '{cmd}' on {host}: {stderr.read().decode('utf-8')}")
+                client.close()
+                sys.exit(1)
 
         cmd = f"sudo /opt/MasterThesis/stats/ChronyLogAnalysis.sh {phase} {experiment_id}{dir_suffix}"
         print(f"Executing: {cmd}")
-
         stdin, stdout, stderr = client.exec_command(cmd)
         exit_status = stdout.channel.recv_exit_status()
-        output = stdout.read().decode('utf-8')
-        error = stderr.read().decode('utf-8')
+        output, error = stdout.read().decode('utf-8'), stderr.read().decode('utf-8')
 
-        print(f"--- Output from {host} ---")
-        print(output)
+
+        print(f"--- Output from {host} ---\n{output}", end='')
         if error:
-            print(f"--- Error from {host} ---")
-            print(error)
-        print(f"--- End of output from {host} ---")
+            print(f"--- Error from {host} ---\n{error}", end='')
+ 
+
 
         if exit_status != 0 or "FAILURE" in output or "FAILURE" in error:
             logging.error(f"ChronyLogAnalysis.sh ({phase}) on {host} failed with status {exit_status}")
@@ -96,8 +91,8 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
         logging.info(f"Chrony NTP status on {host}: OK ({phase})")
         client.close()
 
-    print(f"\n✓ Chrony NTP status on all hosts: OK ({phase})")
-    print(f"=== End of Chrony Check ({phase}) ===\n")
+    print(f"✓ Chrony NTP status on all hosts: OK ({phase})")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Automation script for experiments.")
