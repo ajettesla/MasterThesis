@@ -32,7 +32,6 @@ CURRENT_USER = os.getenv("USER", "unknown")
 
 # Helper functions for stdout printing
 def print_step(step, status, details=None):
-    """Print a step status directly to stdout"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     msg = f"[{timestamp}] {step}: {status}"
     if details:
@@ -40,7 +39,6 @@ def print_step(step, status, details=None):
     print(msg, flush=True)
 
 def print_status(message):
-    """Print a status message directly to stdout"""
     print(message, flush=True)
 
 class ExperimentState:
