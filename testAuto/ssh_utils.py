@@ -264,7 +264,7 @@ def force_kill_all_monitoring_processes():
             client.close()
     
     logging.info(f"{GREEN}[cleanup] Force kill completed for all monitoring processes.{RESET}")
-    print_step("CLEANUP", "COMPLETE", "All monitoring processes terminated")
+    #print_step("CLEANUP", "COMPLETE", "All monitoring processes terminated")
 
 class RemoteProgramRunner:
     def __init__(
@@ -321,15 +321,13 @@ class RemoteProgramRunner:
         print(f"[{self.hostname}] {self.program_name}: {msg}", flush=True)
 
     def connect(self):
-        #self.print_status(f"Connecting to host")
+        self.print_status(f"Connecting to host")
         connector = SSHConnector()
         self.client = connector.connect(self.hostname)
         if self.client is None:
-            #self.print_status(f"Using local connection")
-            pass
+            self.print_status(f"Using local connection")
         else:
-            #self.print_status(f"SSH connection established")
-            pass
+            self.print_status(f"SSH connection established")
         return self.client is not None
 
     def run_command(self, cmd, timeout=None, verbose=None):
@@ -364,7 +362,7 @@ class RemoteProgramRunner:
                 if line.strip().isdigit():
                     self.pid = line.strip()
                     self.result["pid"] = self.pid
-                    #self.print_status(f"Running with PID {self.pid}")
+                    self.print_status(f"Running with PID {self.pid}")
                     return True
             
             time.sleep(2)
@@ -372,7 +370,7 @@ class RemoteProgramRunner:
             if status and pid_out.strip().isdigit():
                 self.pid = pid_out.strip()
                 self.result["pid"] = self.pid
-                #self.print_status(f"Running with PID {self.pid} (from file)")
+                self.print_status(f"Running with PID {self.pid} (from file)")
                 return True
             
             self.result.update({"status": "pid_fetch_failed", "error": f"Could not get PID. Output: {output}"})
@@ -381,7 +379,7 @@ class RemoteProgramRunner:
             
         except Exception as e:
             self.result.update({"status": "launch_failed", "error": str(e)})
-            #self.print_status(f"Exception during launch: {e}")
+            self.print_status(f"Exception during launch: {e}")
             return False
 
     def is_process_running(self):
@@ -401,18 +399,18 @@ class RemoteProgramRunner:
 
     def kill(self):
         if self.pid:
-            #self.print_status(f"Killing process {self.pid}")
+            self.print_status(f"Killing process {self.pid}")
             self.run_command(f"sudo kill {self.pid}", timeout=5)
             self.result["status"] = "killed_stuck"
 
     def collect_logs(self):
-        #self.print_status(f"Collecting output from log file")
+        self.print_status(f"Collecting output from log file")
         success, final_out, _ = self.run_command(f"cat {self.log_file}", timeout=10)
         if success:
             self.result["output"] = final_out
 
     def cleanup_files(self):
-        #self.print_status(f"Cleaning up temporary files")
+        self.print_status(f"Cleaning up temporary files")
         self.run_command(f"rm -f {self.pid_file}", timeout=5)
 
     def run(self):
@@ -433,7 +431,7 @@ class RemoteProgramRunner:
         while time.time() - start_time < self.max_duration:
             if not self.is_process_running():
                 self.result["status"] = "completed"
-                #self.print_status(f"Process completed normally")
+                self.print_status(f"Process completed normally")
                 self.collect_logs()
                 break
 
@@ -483,7 +481,7 @@ def get_client_threads(concurrency_n, concurrency_c, tcp_timeout_t):
     return client_threads
 
 def build_and_run_client(hostname, command):
-    #print_step("CLIENT", "LAUNCHING", f"Client on {hostname}")
+    print_step("CLIENT", "LAUNCHING", f"Client on {hostname}")
     runner = RemoteProgramRunner(
         hostname=hostname,
         command=command,
