@@ -7,30 +7,17 @@ from datetime import datetime
 import yaml
 import sys
 
-# ---- Colors ----
-RESET   = "\033[0m"
-RED     = "\033[31m"
-GREEN   = "\033[32m"
-YELLOW  = "\033[33m"
-BLUE    = "\033[34m"
-CYAN    = "\033[36m"
-MAGENTA = "\033[35m"
-BOLD    = "\033[1m"
-
 # Directory and filename template for state files (per experiment+concurrency)
 STATE_DIR = "/tmp/exp"
 STATE_FILENAME_TEMPLATE = "auto_state_{experiment_name}_{conc_str}.yaml"
-# This global will be initialized at runtime via init_state_file()
 STATE_FILE = None
 
 # Default monitoring time in seconds
 DEFAULT_MONITORING_TIME = 250
 
-# Global constants for timestamp/user
 CURRENT_TIMESTAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 CURRENT_USER = os.getenv("USER", "unknown")
 
-# Helper functions for stdout printing
 def print_step(step, status, details=None):
     timestamp = datetime.now().strftime("%H:%M:%S")
     msg = f"[{timestamp}] {step}: {status}"
@@ -59,11 +46,9 @@ class ExperimentState:
         """Reset the experiment state to initial values."""
         self.__init__()
 
-# Global state instance
 experiment_state = ExperimentState()
 
 class ProgressTracker:
-    """Centralized progress tracking for all monitored log files."""
     def __init__(self):
         self.file_stats        = {}
         self.lock              = threading.Lock()
@@ -85,19 +70,14 @@ class ProgressTracker:
                 'last_update': datetime.now(),
             }
             now_ts = datetime.now().timestamp()
-            
-            # Update log file display if requested
             if update_display and (now_ts - self.last_full_display >= self.display_interval):
                 self._display_full_progress()
                 self.last_full_display = now_ts
-                
-            # Update console with simplified status less frequently
             if now_ts - self.last_console_display >= self.console_interval:
                 self._display_console_progress()
                 self.last_console_display = now_ts
 
     def force_display_progress(self):
-        """Force an immediate display of all file progress."""
         with self.lock:
             self._display_full_progress()
             self._display_console_progress()
@@ -105,7 +85,6 @@ class ProgressTracker:
             self.last_console_display = datetime.now().timestamp()
 
     def _display_full_progress(self):
-        """Display detailed progress in log file only"""
         elapsed = datetime.now().timestamp() - self.start_time
         elapsed_min = elapsed / 60.0
         stats_lines = []
@@ -138,7 +117,6 @@ class ProgressTracker:
             )
     
     def _display_console_progress(self):
-        """Display simplified progress directly to console"""
         elapsed = datetime.now().timestamp() - self.start_time
         elapsed_min = elapsed / 60.0
         
@@ -150,20 +128,14 @@ class ProgressTracker:
             print_status(f"Progress: {elapsed_min:.1f} min | Files: {file_count} | " +
                         f"Size: {total_size/(1024*1024):.2f}MB | Lines: {total_lines}")
 
-# Global progress tracker
 progress_tracker = ProgressTracker()
 
 def generate_experiment_id(length=5):
-    """Generate a random alphanumeric identifier."""
     import string, random
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
 def init_state_file(experiment_name, concurrency_values):
-    """
-    Initialize the global STATE_FILE path based on experiment name and concurrency list.
-    Must be called before load_experiment_state or save_experiment_state.
-    """
     global STATE_FILE
     conc_str = "_".join(str(x) for x in concurrency_values)
     filename = STATE_FILENAME_TEMPLATE.format(
@@ -175,10 +147,6 @@ def init_state_file(experiment_name, concurrency_values):
     print_status(f"State file: {STATE_FILE}")
 
 def load_experiment_state():
-    """
-    Load experiment state from the YAML file.
-    Returns a dict (possibly empty) if file missing or on error.
-    """
     if not STATE_FILE:
         error_msg = "load_experiment_state: STATE_FILE not initialized"
         logging.error(error_msg)
@@ -200,10 +168,6 @@ def load_experiment_state():
         return {}
 
 def save_experiment_state(state):
-    """
-    Save experiment state dict to the YAML file.
-    Returns True on success, False on failure.
-    """
     if not STATE_FILE:
         error_msg = "save_experiment_state: STATE_FILE not initialized"
         logging.error(error_msg)
@@ -229,10 +193,6 @@ def save_experiment_state(state):
         return False
 
 def clear_experiment_state():
-    """
-    Remove the state file if it exists.
-    Returns True if file removed or did not exist.
-    """
     if not STATE_FILE:
         return True
         
@@ -250,12 +210,8 @@ def clear_experiment_state():
     return True
 
 def get_experiment_path(experiment_name, experiment_id, concurrency, iteration=None):
-    """
-    Get the directory path for logs of a given experiment, concurrency, and optional iteration.
-    """
     base = f"/var/log/exp/{experiment_name}_{experiment_id}{concurrency}"
     return f"{base}/{iteration}" if iteration is not None else base
 
 def colored(msg, color):
-    """Wrap a message in ANSI color codes."""
-    return f"{color}{msg}{RESET}"
+    return msg
