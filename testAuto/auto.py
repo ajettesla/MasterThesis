@@ -48,7 +48,6 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
 
     print(f"=== Chrony Check ({phase}) - {current_time} - User: {CURRENT_USER} === Experiment ID: {experiment_id}{dir_suffix}")
 
-
     for host in hosts:
         print(f">> Running ChronyLogAnalysis.sh {phase} {experiment_id}{dir_suffix} on {host} (as root):")
         client = ssh.connect(host)
@@ -75,12 +74,9 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
         exit_status = stdout.channel.recv_exit_status()
         output, error = stdout.read().decode('utf-8'), stderr.read().decode('utf-8')
 
-
         print(f"--- Output from {host} ---\n{output}", end='')
         if error:
             print(f"--- Error from {host} ---\n{error}", end='')
- 
-
 
         if exit_status != 0 or "FAILURE" in output or "FAILURE" in error:
             logging.error(f"ChronyLogAnalysis.sh ({phase}) on {host} failed with status {exit_status}")
@@ -92,7 +88,6 @@ def run_chrony_check(phase, experiment_id, concurrency=None, iteration=None):
         client.close()
 
     print(f"✓ Chrony NTP status on all hosts: OK ({phase})")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Automation script for experiments.")
