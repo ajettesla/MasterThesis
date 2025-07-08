@@ -10,7 +10,6 @@ import getpass
 import logging
 
 from config import (
-    colored, RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, BOLD, RESET,
     progress_tracker, experiment_state, DEFAULT_MONITORING_TIME,
     generate_experiment_id, load_experiment_state, save_experiment_state,
     clear_experiment_state, get_experiment_path
@@ -44,7 +43,7 @@ def print_status(message):
 def check_function():
     """Perform initial service checks and setup for the experiment"""
     print_step("CHECK", "STARTED", "Verifying environment services")
-    logging.info(colored("[check] Step: Service Restart/Check/Flush", BOLD))
+    logging.info("[check] Step: Service Restart/Check/Flush")
     service_hosts = {
         "convsrc8": ["tcp_server", "udp_server"],
         "convsrc5": ["tcp_server", "udp_server"]
@@ -54,7 +53,6 @@ def check_function():
     ssh_connector = SSHConnector()
 
     # Service restart/check for tcp_server/udp_server
-    #print_step("CHECK", "CHECKING", "TCP/UDP servers")
     for host, services in service_hosts.items():
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
@@ -64,28 +62,27 @@ def check_function():
             if client is None:
                 ok, _, err = run_command_locally(cmd_restart, tag)
                 if not ok:
-                    logging.error(colored(f"{tag} {service} restart failed! {err}", RED))
+                    logging.error(f"{tag} {service} restart failed! {err}")
                     print_step("CHECK", "FAILED", f"Service {service} restart failed on {host}")
                     return 1
                 ok, out, err = run_command_locally(cmd_check, tag)
             else:
                 ok, _, err = run_command_remotely(client, cmd_restart, tag)
                 if not ok:
-                    logging.error(colored(f"{tag} {service} restart failed! {err}", RED))
+                    logging.error(f"{tag} {service} restart failed! {err}")
                     print_step("CHECK", "FAILED", f"Service {service} restart failed on {host}")
                     if client: client.close()
                     return 2
                 ok, out, err = run_command_remotely(client, cmd_check, tag)
             if not ok or "active" not in out:
-                logging.error(colored(f"{tag} {service} is not active! Output: {out} Error: {err}", RED))
+                logging.error(f"{tag} {service} is not active! Output: {out} Error: {err}")
                 print_step("CHECK", "FAILED", f"Service {service} not active on {host}")
                 if client: client.close()
                 return 3
         if client: client.close()
 
     # Conntrackd service management
-    #print_step("CHECK", "CHECKING", "Conntrackd service")
-    logging.info(colored("[check] Step: Conntrackd Service Management", BOLD))
+    logging.info("[check] Step: Conntrackd Service Management")
     for host in logger_host:
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
@@ -97,10 +94,9 @@ def check_function():
             status, output, err = run_command_remotely(client, cmd_check_status, tag)
 
         if status and "active" in output.strip():
-            logging.info(colored(f"{tag} conntrackd service is already active.", GREEN))
+            logging.info(f"{tag} conntrackd service is already active.")
         else:
-            logging.warning(colored(f"{tag} conntrackd service is not active. Starting it...", YELLOW))
-            #print_step("CHECK", "STARTING", f"Conntrackd service on {host}")
+            logging.warning(f"{tag} conntrackd service is not active. Starting it...")
 
             cmd_start = "sudo systemctl start conntrackd"
             if client is None:
@@ -109,19 +105,18 @@ def check_function():
                 start_status, start_output, start_err = run_command_remotely(client, cmd_start, tag)
 
             if not start_status:
-                logging.error(colored(f"{tag} Failed to start conntrackd service!", RED))
+                logging.error(f"{tag} Failed to start conntrackd service!")
                 print_step("CHECK", "FAILED", f"Could not start conntrackd on {host}")
                 if client: client.close()
                 return 9
 
             time.sleep(3)
-            logging.info(colored(f"{tag} conntrackd service started successfully.", GREEN))
+            logging.info(f"{tag} conntrackd service started successfully.")
 
         if client: client.close()
 
-    # Chrony service management (added to check time synchronization)
-    #print_step("CHECK", "CHECKING", "Chrony service")
-    logging.info(colored("[check] Step: Chrony Service Management", BOLD))
+    # Chrony service management
+    logging.info("[check] Step: Chrony Service Management")
     for host in logger_hosts:
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
@@ -133,9 +128,9 @@ def check_function():
             status, output, err = run_command_remotely(client, cmd_check_status, tag)
 
         if status and "active" in output.strip():
-            logging.info(colored(f"{tag} chrony service is already active.", GREEN))
+            logging.info(f"{tag} chrony service is already active.")
         else:
-            logging.warning(colored(f"{tag} chrony service is not active. Starting it...", YELLOW))
+            logging.warning(f"{tag} chrony service is not active. Starting it...")
             print_step("CHECK", "STARTING", f"Chrony service on {host}")
 
             cmd_start = "sudo systemctl start chrony"
@@ -145,19 +140,18 @@ def check_function():
                 start_status, start_output, start_err = run_command_remotely(client, cmd_start, tag)
 
             if not start_status:
-                logging.error(colored(f"{tag} Failed to start chrony service!", RED))
+                logging.error(f"{tag} Failed to start chrony service!")
                 print_step("CHECK", "FAILED", f"Could not start chrony on {host}")
                 if client: client.close()
                 return 10
 
             time.sleep(3)
-            logging.info(colored(f"{tag} chrony service started successfully.", GREEN))
+            logging.info(f"{tag} chrony service started successfully.")
 
         if client: client.close()
 
     # Truncate logs
-    #print_step("CHECK", "TRUNCATING", "Log files")
-    logging.info(colored("[check] Step: Truncate Logs", BOLD))
+    logging.info("[check] Step: Truncate Logs")
     ssh_convsrc2 = ssh_connector.connect("convsrc2")
     for logfile in ["/var/log/conntrack.log"]:
         cmd_truncate = f"sudo truncate -s 0 {logfile}"
@@ -166,17 +160,17 @@ def check_function():
         else:
             ok, _, err = run_command_remotely(ssh_convsrc2, cmd_truncate, "[convsrc2 ssh]")
         if not ok:
-            logging.error(colored(f"Failed to truncate {logfile}: {err}", RED))
+            logging.error(f"Failed to truncate {logfile}: {err}")
             print_step("CHECK", "FAILED", f"Could not truncate {logfile}")
             if ssh_convsrc2: ssh_convsrc2.close()
             return 8
         else:
-            logging.info(colored(f"Successfully truncated {logfile}", GREEN))
+            logging.info(f"Successfully truncated {logfile}")
     if ssh_convsrc2: ssh_convsrc2.close()
 
     # Conntrack logger service management
     print_step("CHECK", "CHECKING", "Conntrack logger service")
-    logging.info(colored("[check] Step: Conntrack Logger Service Management", BOLD))
+    logging.info("[check] Step: Conntrack Logger Service Management")
     for host in logger_hosts:
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
@@ -187,26 +181,26 @@ def check_function():
         if client is None:
             ok, _, err = run_command_locally(cmd_restart, tag)
             if not ok:
-                logging.error(colored(f"{tag} conntrack_logger restart failed! {err}", RED))
+                logging.error(f"{tag} conntrack_logger restart failed! {err}")
                 print_step("CHECK", "FAILED", f"Could not restart conntrack_logger on {host}")
                 return 4
             ok, out, err = run_command_locally(cmd_check, tag)
         else:
             ok, _, err = run_command_remotely(client, cmd_restart, tag)
             if not ok:
-                logging.error(colored(f"{tag} conntrack_logger restart failed! {err}", RED))
+                logging.error(f"{tag} conntrack_logger restart failed! {err}")
                 print_step("CHECK", "FAILED", f"Could not restart conntrack_logger on {host}")
                 if client: client.close()
                 return 5
             ok, out, err = run_command_remotely(client, cmd_check, tag)
 
         if not ok or "active" not in out:
-            logging.error(colored(f"{tag} conntrack_logger is not active!", RED))
+            logging.error(f"{tag} conntrack_logger is not active!")
             print_step("CHECK", "FAILED", f"Conntrack_logger not active on {host}")
             if client: client.close()
             return 6
 
-        logging.info(colored(f"{tag} conntrack_logger service is active.", GREEN))
+        logging.info(f"{tag} conntrack_logger service is active.")
 
         print_step("CHECK", "FLUSHING", f"Conntrack tables on {host}")
         if client is None:
@@ -214,18 +208,17 @@ def check_function():
         else:
             ok, _, err = run_command_remotely(client, cmd_flush, tag)
         if not ok:
-            logging.error(colored(f"{tag} conntrack flush failed! {err}", RED))
+            logging.error(f"{tag} conntrack flush failed! {err}")
             print_step("CHECK", "FAILED", f"Could not flush conntrack tables on {host}")
             if client: client.close()
             return 7
 
         if client: client.close()
 
-    logging.info(colored("[check] All services active and conntrack tables flushed.", GREEN))
+    logging.info("[check] All services active and conntrack tables flushed.")
 
-    # Log monitoring (removed PTP monitoring completely)
     print_step("CHECK", "", "Connection logs")
-    logging.info(colored("[check] Step: Log Monitoring", BOLD))
+    logging.info("[check] Step: Log Monitoring")
 
     conntrack_stop_event = threading.Event()
     monitor_results = {}
@@ -243,11 +236,11 @@ def check_function():
         name="conntrack-monitor"
     )
 
-    logging.info(colored("[check] Started log monitors.", CYAN))
+    logging.info("[check] Started log monitors.")
     conntrack_monitor_thread.start()
 
     print_step("CHECK", "STARTING", "Test client threads")
-    logging.info(colored("[check] Step: Start Client Threads", BOLD))
+    logging.info("[check] Step: Start Client Threads")
     client_threads = get_client_threads(10, 1, 1)
     for th in client_threads:
         th.start()
@@ -255,9 +248,7 @@ def check_function():
     for th in client_threads:
         th.join()
 
-    logging.info(colored("[check] All client threads completed.", CYAN))
-    #print_step("CHECK", "COMPLETED", "Test client threads")
-
+    logging.info("[check] All client threads completed.")
     conntrack_monitor_thread.join()
 
     conntrack_matches = monitor_results.get("conntrack-monitor", 0)
@@ -266,11 +257,11 @@ def check_function():
     logging.info(f"[check] Total matches: {total_matches}")
 
     if total_matches == 2:
-        logging.info(colored("[check] MATCH found! Proceeding...", GREEN))
+        logging.info("[check] MATCH found! Proceeding...")
         print_step("CHECK", "PASSED", "All services and connectivity verified")
         return 2
     else:
-        logging.info(colored("[check] Required matches not found!", RED))
+        logging.info("[check] Required matches not found!")
         print_step("CHECK", "FAILED", f"Only {total_matches}/2 connections detected")
         return 0
 
@@ -391,19 +382,19 @@ def verify_critical_processes_running(experiment_name, concurrency, iteration, e
                 status, output = run_command_with_timeout(client, cmd_find, 5, hostname=host)
                 
             if not status or not output.strip():
-                logging.error(colored(f"[verify] ERROR: {tag} Process {process} is not running!", RED))
+                logging.error(f"[verify] ERROR: {tag} Process {process} is not running!")
                 print_step("VERIFY", "WARNING", f"Process {process} not running on {host}")
                 all_ok = False
             else:
-                logging.info(colored(f"[verify] {tag} Process {process} is running.", GREEN))
+                logging.info(f"[verify] {tag} Process {process} is running.")
         
         if client: client.close()
     
     if all_ok:
-        logging.info(colored(f"[verify] All critical processes are running for {experiment_name}_{experiment_id}{concurrency}/{iteration}", GREEN))
+        logging.info(f"[verify] All critical processes are running for {experiment_name}_{experiment_id}{concurrency}/{iteration}")
         print_step("VERIFY", "PASSED", "All critical processes running")
     else:
-        logging.error(colored(f"[verify] SOME CRITICAL PROCESSES ARE NOT RUNNING for {experiment_name}_{experiment_id}{concurrency}/{iteration}", RED))
+        logging.error(f"[verify] SOME CRITICAL PROCESSES ARE NOT RUNNING for {experiment_name}_{experiment_id}{concurrency}/{iteration}")
         print_step("VERIFY", "WARNING", "Some critical processes not running")
     
     return all_ok
@@ -535,9 +526,6 @@ def check_conntrack_entries_delta():
     return total_delta < 100
 
 def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
-    """Prepare for experiment execution"""
-    #print_step("PRE-EXPERIMENT", "STARTED", f"Preparing environment for {experiment_name}_{experiment_id}")
-    
     experiment_state.current_experiment_name = experiment_name
     experiment_state.current_experiment_id = experiment_id
     experiment_state.current_concurrency = concurrency
@@ -546,8 +534,6 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
     exp_path = get_experiment_path(experiment_name, experiment_id, concurrency, iteration)
     logging.info(f"[pre-exp] Running pre_experimentation for {exp_path}")
     
-    # Flush conntrack tables
-    #print_step("PRE-EXPERIMENT", "FLUSHING", "Conntrack tables")
     logger_hosts = ["connt1", "connt2"]
     ssh_connector = SSHConnector()
     
@@ -568,12 +554,9 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
     
     logging.info("[pre-exp] Conntrack tables flushed.")
     
-    # Setup logging scripts
-    #print_step("PRE-EXPERIMENT", "SETUP", "Logging scripts")
     CAlog = f"/tmp/exp/CA_{experiment_id}.log"
     base_path = get_experiment_path(experiment_name, experiment_id, concurrency)
     
-    # Create output directories first
     for host in ["connt1", "convsrc2"]:
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
@@ -589,20 +572,17 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
             return False
         if client: client.close()
     
-    # Define the logging script configurations with corrected path for conntrackAnalysis.py
     log_configs = [
         ("connt1", f"sudo ./start.sh -i {iteration} -l {base_path}/{iteration} -p conntrackd --iface enp3s0 -d", "start.sh", "/opt/MasterThesis/CMNpsutil/", True),
-        ("convsrc2", f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o {base_path}/{iteration}_ca.csv -D -L {CAlog}", "conntrackAnalysis.py", "/opt/MasterThesis/connectiontrackingAnalysis/", True),
+        ("convsrc2", f"sudo ./conntrackAnalysis.py -a connt1 -b connt2 -l /var/log/conntrack.log -o {base_path}/{iteration}_ca.csv -D -L {CAlog}", "conntrackAnalysis.py", "/opt/MasterThesis/connectionAnalysis/", True)
     ]
     
     logging.info("[pre-exp] Setting up logging scripts")
     
     for host, cmd, program_file, working_dir, is_daemon in log_configs:
-        #print_step("PRE-EXPERIMENT", "LAUNCHING", f"{program_file} on {host}")
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
 
-        # Check if program exists first
         check_cmd = f"cd {working_dir} && ls -la ./{program_file}"
         if client is None:
             check_status, check_output, check_stderr = run_command_locally(check_cmd, tag)
@@ -615,11 +595,9 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
             if client: client.close()
             return False
         
-        # Kill any existing processes
         programs_to_kill = ["start.sh", "cm_monitor.py", "n_monitor.py"] if program_file == "start.sh" else ["conntrackAnalysis.py"]
         pre_kill_conflicting_processes(client, host, programs_to_kill)
 
-        # Run the command with verbose output
         logging.info(f"[{host}] Executing: cd {working_dir} && {cmd}")
         full_cmd = f"cd {working_dir} && {cmd}"
         if client is None:
@@ -633,7 +611,6 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
             else:
                 logging.info(f"[{host}] Command output: {output}")
         else:
-            # Use a longer timeout for conntrackAnalysis.py because it might take longer to start
             timeout = 60 if program_file == "conntrackAnalysis.py" else 30
             status, output = run_command_with_timeout(client, full_cmd, timeout, hostname=host)
             if not status:
@@ -645,10 +622,8 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
             else:
                 logging.info(f"[{host}] Command output: {output}")
 
-        # Give the processes time to start
         time.sleep(10)
 
-        # Check if processes are running
         if is_daemon:
             search_cmd = f"pgrep -f {program_file}"
             if client is None:
@@ -657,7 +632,6 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
                 status, output = run_command_with_timeout(client, search_cmd, 5, hostname=host)
                 
             if not status or not output.strip():
-                # If we didn't find the process, try a more permissive search
                 alt_search_cmd = f"ps aux | grep {program_file} | grep -v grep"
                 if client is None:
                     alt_status, alt_output, alt_stderr = run_command_locally(alt_search_cmd, tag)
@@ -679,14 +653,12 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
         if client: client.close()
 
     logging.info(f"[pre-exp] Setup completed for {experiment_name}_{experiment_id}{concurrency}/{iteration}")
-    #print_step("PRE-EXPERIMENT", "VERIFYING", "Critical processes")
     result = verify_critical_processes_running(experiment_name, concurrency, iteration, experiment_id)
     
     print_step("PRE-EXPERIMENT", "COMPLETE", "Environment prepared successfully")
     return True
 
 def experimentation(experiment_name, concurrency, iteration, experiment_id):
-    """Run the experiment with the given parameters"""
     print_step("EXPERIMENT", "STARTED", f"Running experiment with concurrency={concurrency}")
     logging.info(f"[exp] Running experimentation for {experiment_name}_{experiment_id}{concurrency}/{iteration}")
     
@@ -698,7 +670,6 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
         {"filepath": f"{base_path}/{iteration}_conntrackd_n_monitor.csv", "host": "connt1"}
     ]
 
-    #print_step("EXPERIMENT", "SETTING UP", "Log file monitoring")
     logging.info("[exp] Starting log file monitoring")
     
     progress_tracker.file_stats.clear()
@@ -709,7 +680,6 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
     experiment_state.monitoring_threads = []
     experiment_state.monitoring_stop_events = []
     
-    # Set up silent monitoring (with print_output=False)
     for log_info in log_files_to_monitor:
         stop_event = threading.Event()
         experiment_state.monitoring_stop_events.append(stop_event)
@@ -721,7 +691,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
                 "host": log_info["host"],
                 "keyword_expr": "",
                 "timeout": None,
-                "print_output": False,  # Set to False to disable detailed messages
+                "print_output": False,
                 "result_dict": monitor_results,
                 "stop_event": stop_event,
             },
@@ -730,7 +700,6 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
         experiment_state.monitoring_threads.append(t)
         t.start()
     
-    # Use the customized progress display that updates every 5 seconds
     progress_display_stop = threading.Event()
     progress_thread = SimpleProgressDisplay(progress_display_stop)
     progress_thread.start()
@@ -744,55 +713,42 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
     for th in client_threads:
         th.join()
 
-    #print_step("EXPERIMENT", "MONITORING", f"Beginning stabilization period (max {DEFAULT_MONITORING_TIME}s)")
     logging.info("[exp] Client threads completed, beginning monitoring period")
     
-    # Start monitoring with continuous condition checks
-    monitoring_time = DEFAULT_MONITORING_TIME  # Default maximum monitoring time
+    monitoring_time = DEFAULT_MONITORING_TIME
     start_time = time.time()
-    check_interval = 30  # Check conditions every 30 seconds
+    check_interval = 30
     
-    # Continue monitoring until max time reached or both conditions met
     while (time.time() - start_time) < monitoring_time:
         time_elapsed = time.time() - start_time
         time_remaining = monitoring_time - time_elapsed
         
-        # Check condition 1: CSV file growth < 5 lines
-        #print_step("EXPERIMENT", "CHECKING", f"CSV file growth (elapsed: {time_elapsed:.1f}s)")
         logging.info(f"[exp] Checking condition 1: CSV file growth < 5 lines (Time elapsed: {time_elapsed:.1f}s)")
         condition1_met = check_csv_file_growth(ca_csv_file, "convsrc2")
         
         if condition1_met:
-            logging.info(colored("[exp] Condition 1 met: CSV file growth < 5 lines", YELLOW))
+            logging.info("[exp] Condition 1 met: CSV file growth < 5 lines")
             print_step("EXPERIMENT", "CONDITION 1 MET", "CSV file growth stabilized")
             
-            # Check condition 2: Conntrack entries delta < 100
-            #print_step("EXPERIMENT", "CHECKING", f"Conntrack entries (elapsed: {time_elapsed:.1f}s)")
             logging.info(f"[exp] Checking condition 2: Conntrack entries delta < 100 (Time elapsed: {time_elapsed:.1f}s)")
             condition2_met = check_conntrack_entries_delta()
             
             if condition2_met:
-                logging.info(colored("[exp] Condition 2 met: Conntrack entries delta < 100", YELLOW))
-                logging.info(colored("[exp] Both conditions met! Ending monitoring early.", GREEN))
-                #print_step("EXPERIMENT", "CONDITION 2 MET", "Conntrack entries stabilized")
+                logging.info("[exp] Condition 2 met: Conntrack entries delta < 100")
+                logging.info("[exp] Both conditions met! Ending monitoring early.")
                 print_step("EXPERIMENT", "STABILIZED", "Both conditions met - ending monitoring early")
-                # Both conditions met, end monitoring early
                 break
             else:
-                logging.info(colored("[exp] Condition 2 NOT met: Conntrack entries delta >= 100", YELLOW))
-                #print_step("EXPERIMENT", "WAITING", f"Conntrack entries still changing, continuing ({time_remaining:.1f}s left)")
+                logging.info("[exp] Condition 2 NOT met: Conntrack entries delta >= 100")
                 if time_remaining > check_interval:
                     time.sleep(check_interval)
                 else:
-                    # Less than check_interval seconds remaining, just wait the rest
                     time.sleep(time_remaining)
         else:
-            logging.info(colored("[exp] Condition 1 NOT met: CSV file still growing rapidly", YELLOW))
-            #print_step("EXPERIMENT", "WAITING", f"CSV file still growing, continuing ({time_remaining:.1f}s left)")
+            logging.info("[exp] Condition 1 NOT met: CSV file still growing rapidly")
             if time_remaining > check_interval:
                 time.sleep(check_interval)
             else:
-                # Less than check_interval seconds remaining, just wait the rest
                 time.sleep(time_remaining)
     
     total_monitoring_time = time.time() - start_time
@@ -815,14 +771,11 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
     return True
 
 def post_experimentation(experiment_name, concurrency, iteration, experiment_id, update_state=True):
-    """Clean up after experiment and update state if required"""
-    #print_step("POST-EXPERIMENT", "STARTED", f"Cleaning up {experiment_name}_{experiment_id}")
     logging.info(f"[post-exp] Cleanup for {experiment_name}_{experiment_id}{concurrency}/{iteration}")
     
     print_step("POST-EXPERIMENT", "CLEANING", "Terminating logging scripts")
     cleanup_logging_scripts(experiment_name, concurrency, iteration, experiment_id)
     
-    # If requested, update the state file with the next iteration
     if update_state:
         next_iteration = iteration + 1
         print_step("POST-EXPERIMENT", "UPDATING", f"State file to iteration {next_iteration}")
@@ -830,12 +783,10 @@ def post_experimentation(experiment_name, concurrency, iteration, experiment_id,
         if state and state.get('name') == experiment_name and state.get('id') == experiment_id:
             logging.info(f"[post-exp] Updating state file iteration to {next_iteration}")
             state['iteration'] = next_iteration
-            # update timestamp and user dynamically
             state['timestamp'] = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
             state['user'] = getpass.getuser()
             save_experiment_state(state)
         else:
-            # no matching state, create fresh entry
             logging.warning("[post-exp] State file missing or mismatched -- creating fresh state")
             state = {
                 'name': experiment_name,
@@ -849,7 +800,6 @@ def post_experimentation(experiment_name, concurrency, iteration, experiment_id,
             }
             save_experiment_state(state)
     
-    # Reset experiment state
     experiment_state.current_experiment_name = None
     experiment_state.current_experiment_id = None
     experiment_state.current_concurrency = None
