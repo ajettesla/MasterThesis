@@ -11,7 +11,7 @@ import random
 import shlex
 
 from config import (
-    progress_tracker, experiment_state
+    progress_tracker, experiment_state, log_debug, log_info, log_warning, log_error, get_automation_mode
 )
 from logging_utils import get_current_hostname
 
@@ -28,7 +28,7 @@ def retry_with_backoff(func, max_retries=3, initial_backoff=1, max_backoff=30):
                 raise
             jitter = random.uniform(0, 0.1 * backoff)
             sleep_time = min(backoff + jitter, max_backoff)
-            logging.warning(f"Attempt {retries} failed: {str(e)}. Retrying in {sleep_time:.1f}s...")
+            log_warning(f"Attempt {retries} failed: {str(e)}. Retrying in {sleep_time:.1f}s...")
             time.sleep(sleep_time)
             backoff *= 2
 
@@ -60,7 +60,7 @@ class SSHConnector:
         hostname_lower = hostname.lower()
         if hostname_lower in self.local_hostnames:
             current_host = get_current_hostname()
-            logging.info(f"[{current_host} local check] Hostname '{hostname}' resolved as local machine. Using local connection.")
+            log_info(f"[{current_host} local check] Hostname '{hostname}' resolved as local machine. Using local connection.")
             return None
 
         def connect_to_host():
@@ -102,16 +102,16 @@ class SSHConnector:
         try:
             return retry_with_backoff(connect_to_host, max_retries=3, initial_backoff=2)
         except Exception as e:
-            logging.error(f"Failed to connect to {hostname} after retries: {str(e)}")
+            log_error(f"Failed to connect to {hostname} after retries: {str(e)}")
             raise
 
 def run_command_locally(cmd: str, hosttag="[localhost]"):
-    logging.info(f"{hosttag} Executing: {cmd}")
+    log_info(f"{hosttag} Executing: {cmd}")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return (result.returncode == 0, result.stdout, result.stderr)
 
 def run_command_remotely(client, cmd: str, hosttag):
-    logging.info(f"{hosttag} Executing: {cmd}")
+    log_info(f"{hosttag} Executing: {cmd}")
     stdin, stdout, stderr = client.exec_command(cmd)
     exit_code = stdout.channel.recv_exit_status()
     out = stdout.read().decode()
@@ -125,10 +125,10 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
             return (result.returncode == 0, result.stdout)
         except subprocess.TimeoutExpired:
-            logging.error(f"Command timed out after {timeout}s: {command}")
+            log_error(f"Command timed out after {timeout}s: {command}")
             return (False, f"Timeout exceeded ({timeout}s)")
         except Exception as e:
-            logging.error(f"Error running command locally: {str(e)}")
+            log_error(f"Error running command locally: {str(e)}")
             return (False, str(e))
     else:
         try:
@@ -138,18 +138,18 @@ def run_command_with_timeout(client, command, timeout, hostname="unknown"):
             while not channel.exit_status_ready():
                 if time.time() - start > timeout:
                     channel.close()
-                    logging.error(f"[{hostname}] Timeout exceeded while running: {command}")
+                    log_error(f"[{hostname}] Timeout exceeded while running: {command}")
                     return False, f"Timeout exceeded while running: {command}"
                 time.sleep(0.5)
             exit_status = channel.recv_exit_status()
             out = stdout.read().decode()
             err = stderr.read().decode()
             if exit_status != 0 and 'pgrep' not in command:
-                logging.error(f"Command failed with exit status {exit_status}: {command}")
-                logging.error(f"Error output: {err}")
+                log_error(f"Command failed with exit status {exit_status}: {command}")
+                log_error(f"Error output: {err}")
             return (exit_status == 0, out if out else err)
         except Exception as e:
-            logging.error(f"[{hostname}] Exception during command: {command}\n{e}")
+            log_error(f"[{hostname}] Exception during command: {command}\n{e}")
             return False, str(e)
 
 def pre_kill_conflicting_processes(client, host, programs):
@@ -162,7 +162,7 @@ def pre_kill_conflicting_processes(client, host, programs):
             status, output = run_command_with_timeout(client, check_cmd, 5, hostname=host)
         if status and output.strip():
             pids = output.strip().splitlines()
-            logging.info(f"[{host}] Found running '{prog}' with PIDs: {', '.join(pids)}. Killing...")
+            log_info(f"[{host}] Found running '{prog}' with PIDs: {', '.join(pids)}. Killing...")
             for pid in pids:
                 kill_cmd = f"sudo kill -9 {pid}"
                 if client is None:
@@ -171,11 +171,11 @@ def pre_kill_conflicting_processes(client, host, programs):
                     run_command_with_timeout(client, kill_cmd, 5, hostname=host)
             time.sleep(1)
         else:
-            logging.info(f"[{host}] No '{prog}' processes running.")
+            log_info(f"[{host}] No '{prog}' processes running.")
 
 def force_kill_all_monitoring_processes():
     """Force kill all monitoring processes across all hosts"""
-    logging.info(f"[cleanup] Force killing all monitoring processes...")
+    log_info(f"[cleanup] Force killing all monitoring processes...")
     ssh_connector = SSHConnector()
     monitoring_processes = {
         "connt1": ["start.sh", "cm_monitor.py", "n_monitor.py"],
@@ -188,7 +188,7 @@ def force_kill_all_monitoring_processes():
     for host, processes in monitoring_processes.items():
         if not processes:
             continue
-        logging.info(f"[cleanup] [{host}] Force killing monitoring processes...")
+        log_info(f"[cleanup] [{host}] Force killing monitoring processes...")
         client = ssh_connector.connect(host)
         tag = f"[{host} ssh]" if client else f"[{host} localhost]"
         for process in processes:
@@ -203,10 +203,10 @@ def force_kill_all_monitoring_processes():
                 run_command_locally(force_kill_cmd, tag)
             else:
                 run_command_with_timeout(client, force_kill_cmd, 3, hostname=host)
-            logging.info(f"[cleanup] [{host}] Force killed {process}")
+            log_info(f"[cleanup] [{host}] Force killed {process}")
         if client:
             client.close()
-    logging.info(f"[cleanup] Force kill completed for all monitoring processes.")
+    log_info(f"[cleanup] Force kill completed for all monitoring processes.")
 
 class RemoteProgramRunner:
     def __init__(
@@ -256,7 +256,8 @@ class RemoteProgramRunner:
 
     def log(self, msg):
         current_host = get_current_hostname()
-        logging.info(f"[{current_host} local check] {self.hostname}: {msg}")
+        log_info(f"[{current_host} local check] {self.hostname}: {msg}")
+        # No print statements here, using log_info instead which should handle flushing
 
     def connect(self):
         connector = SSHConnector()
