@@ -14,13 +14,14 @@ from datetime import datetime, timezone, UTC
 from queue import Queue, Empty
 
 PID_FILE = '/tmp/exp/cpu_mem_monitor.pid'
-DEFAULT_INTERVAL = 5.0
+DEFAULT_INTERVAL = 1.0
 
 # Shared data structure for measurements
 class CycleData:
     def __init__(self):
         self.system_cycles = 0.0
         self.process_cycles = {}
+        self.clock_delta = None
         self.lock = threading.Lock()
         
     def update_system(self, cycles):
@@ -30,6 +31,10 @@ class CycleData:
     def update_process(self, pid, cycles):
         with self.lock:
             self.process_cycles[pid] = cycles
+            
+    def update_clock_delta(self, delta):
+        with self.lock:
+            self.clock_delta = delta
             
     def get_system(self):
         with self.lock:
@@ -42,6 +47,10 @@ class CycleData:
     def get_total_process(self, pids):
         with self.lock:
             return sum(self.process_cycles.get(pid, 0.0) for pid in pids)
+            
+    def get_clock_delta(self):
+        with self.lock:
+            return self.clock_delta
 
 # Global cycle data instance
 cycle_data = CycleData()
@@ -134,6 +143,60 @@ def process_cycles_thread(pid):
             cycle_data.update_process(pid, 0.0)
         time.sleep(1)  # Update every second
 
+# Thread function for clock difference
+def clockdiff_thread(target_ip, interval):
+    while True:
+        try:
+            cmd = ["sudo", "clockdiff", target_ip]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10 # Add a timeout to prevent hanging
+            )
+            
+            if result.returncode == 0:
+                stdout = result.stdout.strip()
+                
+                # First, try to parse verbose format (e.g., "delta=0ms")
+                match = re.search(r'delta=(-?\d+)ms', stdout)
+                if match:
+                    delta = int(match.group(1))
+                    cycle_data.update_clock_delta(delta)
+                else:
+                    # If verbose fails, try to parse raw format (e.g., "1752341059 0 0")
+                    parts = stdout.split()
+                    if len(parts) >= 2:
+                        try:
+                            # The second part should be the delta
+                            delta = int(parts[1])
+                            cycle_data.update_clock_delta(delta)
+                        except (ValueError, IndexError):
+                            print(f"clockdiff: could not parse delta from raw output: {stdout}", file=sys.stderr)
+                            cycle_data.update_clock_delta(None)
+                    else:
+                        # If both parsing attempts fail
+                        print(f"clockdiff: could not parse delta from unrecognized output: {stdout}", file=sys.stderr)
+                        cycle_data.update_clock_delta(None)
+            else:
+                # Command failed
+                print(f"clockdiff: command failed for IP {target_ip} with exit code {result.returncode}", file=sys.stderr)
+                if result.stderr:
+                    print(f"clockdiff stderr: {result.stderr.strip()}", file=sys.stderr)
+                cycle_data.update_clock_delta(None)
+
+        except subprocess.TimeoutExpired:
+            print(f"clockdiff: command timed out for IP {target_ip}", file=sys.stderr)
+            cycle_data.update_clock_delta(None) # Reset on timeout
+        except FileNotFoundError:
+            print("clockdiff: command not found. Please ensure 'iputils-clockdiff' is installed.", file=sys.stderr)
+            return # Stop the thread
+        except Exception as e:
+            print(f"clockdiff: an unexpected error occurred for IP {target_ip}: {e}", file=sys.stderr)
+            cycle_data.update_clock_delta(None) # Reset on error
+        
+        time.sleep(interval)
+
 def get_system_stats(prev_cpu, elapsed):
     cpu = psutil.cpu_times()
     total = sum(cpu)
@@ -176,6 +239,50 @@ def get_process_stats(pids, prev_cpu, elapsed):
             
     return cpu_pct, mem_used, mem_pct, new_prev, total_cpu_cycles_ghz
 
+def get_clockdiff_target_ip():
+    """Check local IPs and return the remote target for clockdiff."""
+    try:
+        result = subprocess.run(['ip', 'addr'], capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        
+        output = result.stdout
+        if '172.16.1.4' in output:
+            return '172.16.1.3'
+        if '172.16.1.3' in output:
+            return '172.16.1.4'
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    return None
+
+def check_clockdiff_response_time(target_ip):
+    """Runs clockdiff once to measure and print its response time."""
+    if not target_ip:
+        print("clockdiff: No target IP found, skipping response time check.", file=sys.stderr)
+        return
+    
+    print(f"clockdiff: Checking initial response time for {target_ip}...", file=sys.stderr)
+    try:
+        cmd = ["sudo", "clockdiff", target_ip]
+        t0 = time.time()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        t1 = time.time()
+        
+        if result.returncode == 0:
+            print(f"clockdiff: Initial response time: {t1 - t0:.4f} seconds.", file=sys.stderr)
+        else:
+            print(f"clockdiff: Initial check failed. Exit code: {result.returncode}", file=sys.stderr)
+            if result.stderr:
+                print(f"clockdiff stderr: {result.stderr.strip()}", file=sys.stderr)
+                
+    except Exception as e:
+        print(f"clockdiff: An error occurred during initial check: {e}", file=sys.stderr)
+
 def monitor(args, csv_output):
     # Get current date/time and username for the header
     current_datetime = get_formatted_datetime()
@@ -187,7 +294,7 @@ def monitor(args, csv_output):
         'time', 'date_time', 'user', 'sys_cpu_percent', 'sys_cpu_cycles_ghz', 
         'sys_mem_used_mb', 'sys_mem_percent', 'proc_cpu_percent', 
         'proc_cpu_cycles_ghz', 'proc_mem_mb', 'proc_mem_percent', 
-        'conntrack_count', 'pids'
+        'conntrack_count', 'pids', 'clock_delta_ms'
     ]
     writer = csv.DictWriter(csv_output, fieldnames=fieldnames)
     writer.writeheader()
@@ -215,6 +322,21 @@ def monitor(args, csv_output):
     sys_thread = threading.Thread(target=system_cycles_thread, daemon=True)
     sys_thread.start()
     
+    # Find clockdiff target and start the monitoring thread
+    clockdiff_target_ip = get_clockdiff_target_ip()
+    if clockdiff_target_ip:
+        print(f"Found local IP, targeting {clockdiff_target_ip} for clockdiff.", file=sys.stderr)
+        # Perform the one-time response check before starting the thread
+        check_clockdiff_response_time(clockdiff_target_ip)
+        
+        # Start the continuous monitoring thread
+        clockdiff_th = threading.Thread(
+            target=clockdiff_thread, 
+            args=(clockdiff_target_ip, args.interval), 
+            daemon=True
+        )
+        clockdiff_th.start()
+
     # Process threads dictionary
     process_threads = {}
     
@@ -266,6 +388,10 @@ def monitor(args, csv_output):
                 proc_mem_mb_str = ""
                 proc_mem_pct_str = ""
                 pids_str = "[]"
+            
+            # Get clock delta
+            clock_delta = cycle_data.get_clock_delta()
+            clock_delta_str = str(clock_delta) if clock_delta is not None else "N/A"
 
             row = {
                 'time': ts,
@@ -281,6 +407,7 @@ def monitor(args, csv_output):
                 'proc_mem_percent': proc_mem_pct_str,
                 'conntrack_count': str(conntrack_count) if conntrack_count is not None else '',
                 'pids': pids_str,
+                'clock_delta_ms': clock_delta_str
             }
 
             writer.writerow(row)
