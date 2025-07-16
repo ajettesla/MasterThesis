@@ -186,13 +186,13 @@ class SimpleProgressDisplay(threading.Thread):
         self.automation_mode = get_automation_mode()
         if self.automation_mode:
             if self.automation_mode.super_mode:
-                self.display_interval = 10  # Super mode: more frequent updates
+                self.display_interval = 30  # Super mode: more frequent updates
             elif self.automation_mode.quiet_mode:
-                self.display_interval = 40  # Quiet mode: update every 40 seconds (changed from 60)
+                self.display_interval = 120  # Quiet mode: update every 40 seconds (changed from 60)
             else:
-                self.display_interval = 30  # Normal mode: standard updates
+                self.display_interval = 60  # Normal mode: standard updates
         else:
-            self.display_interval = 30  # Default interval
+            self.display_interval = 60  # Default interval
 
     def __del__(self):
         self.close_connections()
