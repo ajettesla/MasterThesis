@@ -390,7 +390,7 @@ def build_and_run_client(hostname, command):
         max_duration=540,
         cleanup=True,
         verbose=True,
-        timeout=60,
+        timeout=250,
     )
     result = runner.run()
     return result
