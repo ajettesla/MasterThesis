@@ -13,7 +13,7 @@ STATE_FILENAME_TEMPLATE = "auto_state_{experiment_name}_{conc_str}.yaml"
 STATE_FILE = None
 
 # Default monitoring time in seconds
-DEFAULT_MONITORING_TIME = 250
+DEFAULT_MONITORING_TIME = 600
 
 CURRENT_TIMESTAMP = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 CURRENT_USER = os.getenv("USER", "unknown")
