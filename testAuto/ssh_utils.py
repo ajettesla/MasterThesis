@@ -387,10 +387,10 @@ def build_and_run_client(hostname, command):
         hostname=hostname,
         command=command,
         working_dir="/opt/MasterThesis/trafGen",
-        max_duration=540,
+        max_duration=600,
         cleanup=True,
         verbose=True,
-        timeout=250,
+        timeout=550,
     )
     result = runner.run()
     return result
