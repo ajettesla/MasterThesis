@@ -8,6 +8,7 @@ import signal
 import datetime
 import getpass
 import logging
+import random
 
 from config import (
     progress_tracker, experiment_state, DEFAULT_MONITORING_TIME,
@@ -643,10 +644,16 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
             monitoring_time = DEFAULT_MONITORING_TIME
             start_time = time.time()
             check_interval = 5  # Check conditions every 5 seconds
+            check_counter = 0   # Counter for reducing print frequency
+            print_probability = 0.2  # Only print 20% of the time for "not met" conditions
             
             while (time.time() - start_time) < monitoring_time:
                 time_elapsed = time.time() - start_time
                 time_remaining = monitoring_time - time_elapsed
+                check_counter += 1
+                
+                # Determine if we should print status this time
+                should_print_status = (random.random() < print_probability)
                 
                 # Check conditions - catch any exceptions in the monitoring checks
                 try:
@@ -655,7 +662,7 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
                     
                     if condition1_met:
                         log_info("[exp] Condition 1 met: CSV file growth < 5 lines")
-                        # Show condition 1 in super and normal modes
+                        # Always show when condition 1 is met (significant event)
                         if not automation_mode or not automation_mode.quiet_mode:
                             print_step("EXPERIMENT", "CONDITION 1 MET", "CSV file growth stabilized")
                         
@@ -666,19 +673,19 @@ def experimentation(experiment_name, concurrency, iteration, experiment_id):
                         if condition2_met:
                             log_info("[exp] Condition 2 met: Conntrack entries delta < 100")
                             log_info("[exp] Both conditions met! Ending monitoring early.")
-                            # Show both conditions met in super and normal modes
+                            # Always show when both conditions are met (significant event)
                             if not automation_mode or not automation_mode.quiet_mode:
                                 print_step("EXPERIMENT", "STABILIZED", "Both conditions met - ending monitoring early")
                             break
                         else:
                             log_info("[exp] Condition 2 NOT met: Conntrack entries delta >= 100")
-                            # Show condition 2 not met in super mode only
-                            if automation_mode and automation_mode.super_mode:
+                            # Only show condition 2 not met occasionally
+                            if should_print_status and automation_mode and automation_mode.super_mode:
                                 print("Condition 2 NOT met: Conntrack entries delta still too high", flush=True)
                     else:
                         log_info("[exp] Condition 1 NOT met: CSV file still growing rapidly")
-                        # Show condition 1 not met in super mode only
-                        if automation_mode and automation_mode.super_mode:
+                        # Only show condition 1 not met occasionally
+                        if should_print_status and automation_mode and automation_mode.super_mode:
                             print("Condition 1 NOT met: CSV file still growing rapidly", flush=True)
                 except Exception as e:
                     log_error(f"[exp] Error checking conditions: {str(e)}")
@@ -1046,5 +1053,3 @@ def pre_experimentation(experiment_name, concurrency, iteration, experiment_id):
         log_error(f"[pre-exp] Critical error during pre-experimentation: {str(e)}")
         print_step("PRE-EXPERIMENT", "FAILED", f"Critical error: {str(e)}")
         return False
-
-
