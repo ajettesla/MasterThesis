@@ -5,9 +5,10 @@
  * Added explicit timeout checking to prevent stalled/stuck connections.
  * Auto-terminates when all connections are processed.
  * Robust shutdown mechanism to prevent orphaned processes.
+ * Enforces connection rate limiting to match concurrency level.
  *
  * Usage:
- *   tcp_client_er -s <server IP> -p <server port> -n <total connections> -c <concurrency> -a <client IP range> -r <port range> [-t <threads> ...]
+ *   tcp_client_er -s <server IP> -p <server port> -n <total connections> -c <concurrency> -a <client IP range> -r <port range> [-t <threads> -R <rate>...]
  */
 
 #define _GNU_SOURCE // For pthread_setname_np
@@ -31,6 +32,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/prctl.h>  // For prctl to set process name
+#include <sys/time.h>   // For gettimeofday
 
 #define MAX_EVENTS_PER_THREAD 2048
 #define MAX_MSG 6
@@ -56,6 +58,12 @@ static atomic_int stat_peak_concurrency = 0;
 static atomic_long global_connections_started = 0;
 static long total_connections_target = 0;
 
+// Rate limiting variables
+static int target_rate = 0;  // Target connections per second (0 = unlimited)
+static atomic_int connections_this_second = 0;
+static time_t current_rate_second = 0;
+static pthread_mutex_t rate_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Used for clean shutdown
 static volatile sig_atomic_t global_stop = 0;
 static atomic_int threads_running = 0;
@@ -80,6 +88,7 @@ void print_help(const char *prog);
 void debug_log_msg(const char *fmt, ...);
 void parse_ip_range(char *range, struct in_addr **ips, int *num_ips);
 void parse_port_range(char *range, int **ports, int *num_ports);
+bool check_rate_limit(void);
 
 // ========== Debug Logging ==========
 void debug_log_msg(const char *fmt, ...) {
@@ -92,6 +101,36 @@ void debug_log_msg(const char *fmt, ...) {
         va_end(args);
         pthread_mutex_unlock(&debug_log_mutex);
     }
+}
+
+// ========== Rate Limiting ==========
+// Returns true if we can proceed with creating a new connection, false if we should wait
+bool check_rate_limit(void) {
+    if (target_rate <= 0) return true;  // No rate limiting
+    
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t now_sec = tv.tv_sec;
+    
+    pthread_mutex_lock(&rate_mutex);
+    
+    // If we're in a new second, reset the counter
+    if (now_sec > current_rate_second) {
+        current_rate_second = now_sec;
+        atomic_store(&connections_this_second, 0);
+    }
+    
+    // Check if we've reached our rate limit for this second
+    int current_count = atomic_load(&connections_this_second);
+    if (current_count >= target_rate) {
+        pthread_mutex_unlock(&rate_mutex);
+        return false;  // Rate limit exceeded
+    }
+    
+    // Increment the counter and allow this connection
+    atomic_fetch_add(&connections_this_second, 1);
+    pthread_mutex_unlock(&rate_mutex);
+    return true;
 }
 
 // ========== Statistics Printing ==========
@@ -166,9 +205,16 @@ void* connection_worker(void *arg) {
 
     // Check for global stop FIRST in the loop
     while (!global_stop) {
-        // --- AGGRESSIVE CONNECTION CREATION LOOP ---
+        // --- AGGRESSIVE CONNECTION CREATION LOOP WITH RATE LIMITING ---
         // Keep creating connections until the concurrency limit is hit or all connections are started.
         while (atomic_load(&stat_current_inflight) < args->max_concurrent && !global_stop) {
+            // Rate limiting check
+            if (!check_rate_limit()) {
+                // If we've hit the rate limit, sleep for a short time and try again
+                usleep(1000); // 1ms sleep
+                continue;
+            }
+            
             long conn_id = atomic_fetch_add(&global_connections_started, 1);
             if (conn_id >= total_connections_target) {
                 atomic_fetch_sub(&global_connections_started, 1); // Correct for overshoot
@@ -234,8 +280,8 @@ void* connection_worker(void *arg) {
         }
 
         // --- I/O EVENT PROCESSING ---
-        // Short timeout (50ms) to ensure we check global_stop frequently
-        int n = epoll_wait(epfd, events, MAX_EVENTS_PER_THREAD, 50); 
+        // Short timeout (10ms) to ensure we check global_stop and rate limits frequently
+        int n = epoll_wait(epfd, events, MAX_EVENTS_PER_THREAD, 10); 
         time_t now = time(NULL);
 
         // Break immediately if stop flag is set
@@ -433,13 +479,14 @@ void* progress_reporter(void *arg) {
 
         long delta_conns = current_count - last_conn_count;
         double rate = (double)delta_conns / time_diff;
-        time_t now = time(NULL);                // Declare and initialize 'now'
-        char timestamp[20];                     // Declare 'timestamp' buffer
+        int current_second_conns = atomic_load(&connections_this_second);
+        time_t now = time(NULL);
+        char timestamp[20];
         strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
-        printf("[%s] [Progress] Total Conns: %ld/%ld | In-flight: %d | Rate: %.0f conn/s\n",
-               timestamp, current_count, total_connections_target, current_inflight, rate);
-
+        printf("[%s] [Progress] Total: %ld/%ld | In-flight: %d | Rate: %.0f conn/s | This Second: %d/%d\n",
+               timestamp, current_count, total_connections_target, current_inflight, 
+               rate, current_second_conns, target_rate > 0 ? target_rate : current_inflight);
 
         last_conn_count = current_count;
         start_time = current_time;
@@ -464,7 +511,7 @@ int main(int argc, char **argv) {
     char *client_ip_range = NULL, *client_port_range = NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "s:p:n:c:a:r:w:kvhl:t:")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:n:c:a:r:w:kvhl:t:R:")) != -1) {
         switch (opt) {
             case 's': server_ip = strdup(optarg); break;
             case 'p': server_port = atoi(optarg); break;
@@ -475,11 +522,20 @@ int main(int argc, char **argv) {
             case 'k': kill_flag = true; break;
             case 'v': verbose_mode = true; break;
             case 't': num_threads = atoi(optarg); break;
+            case 'R': target_rate = atoi(optarg); break;  // New: connection rate per second
             case 'h': default: print_help(argv[0]); exit(0);
         }
     }
     if (!server_ip || !server_port || total_connections_target <= 0 || max_concurrent <= 0) { 
         print_help(argv[0]); exit(1); 
+    }
+
+    // If rate is not specified, set it to match concurrency
+    if (target_rate <= 0) {
+        target_rate = max_concurrent;
+        printf("[INFO] Setting connection rate to match concurrency: %d connections/sec\n", target_rate);
+    } else {
+        printf("[INFO] Connection rate set to: %d connections/sec\n", target_rate);
     }
 
     struct in_addr *source_ips = NULL; int num_source_ips = 0;
@@ -524,6 +580,12 @@ int main(int argc, char **argv) {
     
     // Initialize the thread counter
     atomic_store(&threads_running, 0);
+    
+    // Initialize rate limiting variables
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    current_rate_second = tv.tv_sec;
+    atomic_store(&connections_this_second, 0);
     
     for (int t = 0; t < num_threads; t++) { 
         targs.thread_id = t; 
@@ -588,6 +650,7 @@ void print_help(const char *prog) {
     printf("  -a <client IP range>   Source IP range, e.g., 192.168.1.1-10 (required)\n");
     printf("  -r <client port range> Source port range, e.g., 5000-5100 (required)\n");
     printf("  -t <threads>           Number of worker threads (default: 4)\n");
+    printf("  -R <rate>              Target connection rate per second (default: same as concurrency)\n");
     printf("  -k                     Enable SO_LINGER to send RST on close\n");
     printf("  -v                     Enable verbose debugging output\n");
     printf("  -h                     Show this help message\n");
