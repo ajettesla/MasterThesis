@@ -1,575 +1,455 @@
 #!/bin/bash
 
-# Function to print a header with date and user information (to file, not stdout)
-print_header() {
-    local current_date=$(date -u "+%Y-%m-%d %H:%M:%S")
-    local current_user=$(whoami)
-    {
-        echo "============================================================"
-        echo "Chrony Log Analysis Report"
-        echo "============================================================"
-        echo "Date and Time (UTC): $current_date"
-        echo "User: $current_user"
-        echo "============================================================"
-        echo ""
-    } >> "$1"
+# Chrony PRE/POST validator (compact) with:
+#  - Per-sample absolute bands (offset/freq/skew)
+#  - Global offset mean/std percent rule
+#  - Global offset std rule
+#  - Empirical 97.5% percentiles & parametric mean+1.96*std
+#  - Per-IP distributions for offset std & mean/std% (for percentile extraction)
+#
+# Environment:
+#   CHRONY_LOG_FILE (/var/log/chrony/tracking.log)
+#   SAMPLE_COUNT_PRE (50)
+#   MAX_OFFSET_SEC (0.000450) MAX_FREQ_PPM (65) MAX_SKEW_PPM (0.065)
+#   OFFSET_STD_MAX (RECOMMENDED e.g. 0.000050)  # If unset => skip std check
+#   OFFSET_MEAN_STD_PERCENT_MAX (10)            # mean/std*100 threshold
+#   MIN_SAMPLES_FOR_SYNC (1)
+#   ENABLE_JSON (1)
+#   JSON_PRETTY (1)
+#   SHOW_PHASE_RESULT_STDOUT (1)
+#   FIELD_FREQ (5) FIELD_SKEW (7) FIELD_OFFSET (8)
+#
+# Output (per id): /tmp/exp/<id>/chrony/
+#   chrony_pre_raw.txt / chrony_post_raw.txt
+#   chrony_last_timestamp.txt
+#   chrony_<phase>_per_sample_policy.csv
+#   chrony_<phase>_per_ip_stats.csv
+#   chrony_<phase>_phase_summary.txt
+#   chrony_final_report.txt
+#
+# PASS CRITERIA per phase:
+#   samples >= MIN_SAMPLES_FOR_SYNC
+#   per-sample policy PASS
+#   (if OFFSET_STD_MAX set) global_offset_std <= OFFSET_STD_MAX
+#   (offset_std>0) => (|offset_mean|/offset_std*100) <= OFFSET_MEAN_STD_PERCENT_MAX
+#   if offset_std=0 then offset_mean must be 0
+#
+# OVERALL PASS = Pre PASS AND Post PASS
+set -euo pipefail
+IFS=$'\n\t'
+
+CHRONY_LOG_FILE="${CHRONY_LOG_FILE:-/var/log/chrony/tracking.log}"
+SAMPLE_COUNT_PRE="${SAMPLE_COUNT_PRE:-50}"
+
+MAX_OFFSET_SEC="${MAX_OFFSET_SEC:-0.000450}"
+MAX_FREQ_PPM="${MAX_FREQ_PPM:-65}"
+MAX_SKEW_PPM="${MAX_SKEW_PPM:-0.065}"
+
+OFFSET_STD_MAX="${OFFSET_STD_MAX:-}"                       # optional (if empty -> skip)
+OFFSET_MEAN_STD_PERCENT_MAX="${OFFSET_MEAN_STD_PERCENT_MAX:-1}"
+
+MIN_SAMPLES_FOR_SYNC="${MIN_SAMPLES_FOR_SYNC:-1}"
+ENABLE_JSON="${ENABLE_JSON:-1}"
+JSON_PRETTY="${JSON_PRETTY:-1}"
+SHOW_PHASE_RESULT_STDOUT="${SHOW_PHASE_RESULT_STDOUT:-1}"
+
+FIELD_FREQ="${FIELD_FREQ:-5}"
+FIELD_SKEW="${FIELD_SKEW:-7}"
+FIELD_OFFSET="${FIELD_OFFSET:-8}"
+
+# ---------- Helpers ----------
+timestamp_filter() {
+  awk '/^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}/'
+}
+safe_epoch() { date -d "$1" +%s 2>/dev/null || echo ""; }
+abs() { awk -v v="$1" 'BEGIN{if(v<0)v=-v;print v}'; }
+
+empirical_q97_5() {
+  # read values from stdin, one per line
+  awk '
+    NF {
+      a[++n]=$1
+    }
+    END{
+      if(n==0){print "NA"; exit}
+      asort(a)
+      idx=int(0.975*n); if((0.975*n)>idx) idx++
+      if(idx<1) idx=1
+      if(idx>n) idx=n
+      printf "%.15g", a[idx]
+    }'
+}
+parametric_97_5() {
+  # args: mean std
+  awk -v m="$1" -v s="$2" 'BEGIN{printf "%.15g", m+1.96*s}'
 }
 
-# Function to setup the chrony directory (silent operation)
-setup_chrony_dir() {
-    local id=$1
-    local mode=$2
-    local dir="/tmp/exp/$id/chrony"
-    
-    # Create directory if it doesn't exist
-    if [ ! -d "$dir" ]; then
-        mkdir -p "$dir" > /dev/null 2>&1
-    fi
-    
-    # Clean up any previous files in pre mode
-    if [ "$mode" = "pre" ]; then
-        rm -f "$dir"/* > /dev/null 2>&1
-    fi
+# ---------- Collection ----------
+collect_pre() {
+  local id="$1" dir="/tmp/exp/$id/chrony"
+  mkdir -p "$dir"; rm -f "$dir"/* || true
+  local raw="$dir/chrony_pre_raw.txt" log="$dir/chrony_pre_phase_summary.txt"
+  echo "Running pre analysis..."
+  if [ ! -f "$CHRONY_LOG_FILE" ]; then
+    echo "ERROR: chrony log not found: $CHRONY_LOG_FILE"
+    return 1
+  fi
+  tail -"$SAMPLE_COUNT_PRE" "$CHRONY_LOG_FILE" | timestamp_filter > "$raw"
+  local total
+  total=$(wc -l < "$raw" || echo 0)
+  local last_ts="NO_TIMESTAMP"
+  if [ "$total" -gt 0 ]; then
+    last_ts=$(tail -1 "$raw" | awk '{print $1" "$2}')
+    echo "$last_ts" > "$dir/chrony_last_timestamp.txt"
+  fi
+  analyze_phase pre "$id" "$raw" "$log"
+  local rc=$?
+  if [ "$SHOW_PHASE_RESULT_STDOUT" = "1" ]; then
+    local ps; ps=$(grep '^PHASE_PASS=' "$log" | cut -d'=' -f2)
+    echo "Pre analysis result: $ps (details in $log)"
+  fi
+  echo "Timestamp: $last_ts"
+  return $rc
 }
 
-# Function to extract and analyze chrony tracking log data
-analyze_chrony_data() {
-    local mode=$1     # "pre" or "post"
-    local id=$2       # unique ID for directory
-    local start_timestamp=$3  # Only used in "post" mode
-    
-    # Setup chrony directory silently
-    setup_chrony_dir "$id" "$mode"
-    local chrony_dir="/tmp/exp/$id/chrony"
-    
-    local output_file="$chrony_dir/chrony_analysis_${mode}.txt"
-    local log_file="/var/log/chrony/tracking.log"
-    local sample_count_file="$chrony_dir/chrony_${mode}_sample_counts.txt"
-    local temp_data_file="$chrony_dir/chrony_data_temp.txt"
-    local timestamp_file="$chrony_dir/chrony_last_timestamp.txt"
-    local stats_file="$chrony_dir/chrony_${mode}_stats.txt"
-    local analysis_log="$chrony_dir/chrony_${mode}_analysis.log"
-    
-    # Start logging all detailed output to the analysis log
-    print_header "$analysis_log"
-    
-    echo "Running ${mode} analysis..." # Line 1 of stdout
-    
-    # Log details to file instead of stdout
-    {
-        echo "Running ${mode}-experimentation analysis..."
-        echo "Directory: $chrony_dir"
-        echo "Log file: $log_file"
-    } >> "$analysis_log"
-    
-    # For pre-experimentation: get last 50 data lines
-    if [ "$mode" = "pre" ]; then
-        # Get the last 50 non-header lines from the log file
-        grep -v "=\|Date (UTC) Time" "$log_file" | tail -50 > "$temp_data_file"
-        
-        # Store the last timestamp for post-experimentation
-        last_timestamp=$(tail -1 "$temp_data_file" | awk '{print $1 " " $2}')
-        echo "$last_timestamp" > "$timestamp_file"
-        echo "Timestamp captured: $last_timestamp" >> "$analysis_log"
-        
-    # For post-experimentation: get data from the stored timestamp onwards
+collect_post() {
+  local id="$1" dir="/tmp/exp/$id/chrony"
+  mkdir -p "$dir"
+  local raw="$dir/chrony_post_raw.txt" log="$dir/chrony_post_phase_summary.txt"
+  local anchor="$dir/chrony_last_timestamp.txt"
+  echo "Running post analysis..."
+  if [ ! -f "$CHRONY_LOG_FILE" ]; then
+    echo "ERROR: chrony log not found: $CHRONY_LOG_FILE"
+    return 1
+  fi
+  if [ ! -f "$anchor" ]; then
+    echo "ERROR: missing pre baseline timestamp (run pre first)"
+    return 1
+  fi
+  local baseline; baseline=$(cat "$anchor")
+  local ep; ep=$(safe_epoch "$baseline")
+  if [ -z "$ep" ]; then
+    echo "ERROR: invalid baseline timestamp"
+    return 1
+  fi
+  timestamp_filter < "$CHRONY_LOG_FILE" | awk -v bts="$baseline" '$1" "$2 >= bts' > "$raw"
+  analyze_phase post "$id" "$raw" "$log"
+  local rc=$?
+  return $rc
+}
+
+# ---------- Phase Analysis ----------
+analyze_phase() {
+  local phase="$1" id="$2" raw="$3" out="$4"
+  local dir="/tmp/exp/$id/chrony"
+  local per_sample="$dir/chrony_${phase}_per_sample_policy.csv"
+  local per_ip="$dir/chrony_${phase}_per_ip_stats.csv"
+
+  local total; total=$( [ -f "$raw" ] && wc -l < "$raw" || echo 0 )
+
+  # Per-sample policy file
+  {
+    echo "Index,IP,Offset_s,Freq_ppm,Skew_ppm,Offset_OK,Freq_OK,Skew_OK,All_OK"
+    if [ "$total" -gt 0 ]; then
+      awk -v OFREQ=$FIELD_FREQ -v OSKEW=$FIELD_SKEW -v OOFF=$FIELD_OFFSET \
+          -v mo="$MAX_OFFSET_SEC" -v mf="$MAX_FREQ_PPM" -v ms="$MAX_SKEW_PPM" '
+        function abs(x){return x<0?-x:x}
+        /^[0-9]/ {
+          ip=$3
+          f=$(OFREQ)+0
+          skew=$(OSKEW)+0
+          off=$(OOFF)+0
+          ok_o=(abs(off)<=mo); ok_f=(abs(f)<=mf); ok_s=(abs(skew)<=ms)
+          all=(ok_o && ok_f && ok_s)
+          if(!all){viol++}
+          printf "%d,%s,%.15g,%.15g,%.15g,%s,%s,%s,%s\n",
+            NR,ip,off,f,skew,(ok_o?"YES":"NO"),(ok_f?"YES":"NO"),(ok_s?"YES":"NO"),(all?"YES":"NO")
+        }
+        END{
+          if(NR==0) print "RESULT:NO_DATA"
+          else if(viol==0) print "RESULT:PASS"
+          else print "RESULT:FAIL"
+        }' "$raw"
     else
-        if [ -z "$start_timestamp" ]; then
-            echo "Error: No start timestamp found" # Line 2 of stdout on error
-            echo "Error: No start timestamp provided for post-experimentation analysis" >> "$analysis_log"
-            return 1
-        fi
-        
-        # Convert timestamp to a format that can be used for comparison
-        formatted_timestamp=$(date -d "$start_timestamp" +"%Y-%m-%d %H:%M:%S")
-        echo "Analyzing data from $formatted_timestamp onwards" >> "$analysis_log"
-        
-        # Extract lines with timestamps after or equal to the start timestamp
-        awk -v ts="$formatted_timestamp" '
-            $1 " " $2 >= ts && !/=|Date \(UTC\) Time/ {print}
-        ' "$log_file" > "$temp_data_file"
+      echo "RESULT:NO_DATA"
     fi
-    
-    # Count total samples and samples per IP
-    total_samples=$(wc -l < "$temp_data_file")
-    echo "Total samples for ${mode}-experimentation: $total_samples" > "$sample_count_file"
-    
-    # Count samples per IP
-    awk '{print $3}' "$temp_data_file" | sort | uniq -c | while read count ip; do
-        echo "IP $ip: $count samples" >> "$sample_count_file"
-    done
-    
-    # Calculate time range of samples
-    if [ "$total_samples" -gt 0 ]; then
-        first_timestamp=$(head -1 "$temp_data_file" | awk '{print $1 " " $2}')
-        last_timestamp=$(tail -1 "$temp_data_file" | awk '{print $1 " " $2}')
-        
-        # Calculate duration if both timestamps are available
-        if [ -n "$first_timestamp" ] && [ -n "$last_timestamp" ]; then
-            first_seconds=$(date -d "$first_timestamp" +%s)
-            last_seconds=$(date -d "$last_timestamp" +%s)
-            duration_seconds=$((last_seconds - first_seconds))
-            
-            # Convert seconds to a more readable format
-            duration_formatted=$(date -u -d @"$duration_seconds" +"%H:%M:%S")
-            echo "Time range: $first_timestamp to $last_timestamp (duration: $duration_formatted)" >> "$sample_count_file"
-        fi
-    fi
-    
-    # Process the extracted data for unique IPs and calculate averages, min, max
-    awk '
-    BEGIN {
-        print "IP Address,Count,Avg_Freq_ppm,Avg_Skew_ppm,Avg_Offset,Avg_Root_delay,Avg_Root_disp,Avg_Max_error"
-        
-        # Initialize global min/max trackers for overall stats
-        global_min_freq = 1e10; global_max_freq = -1e10;
-        global_min_skew = 1e10; global_max_skew = -1e10;
-        global_min_offset = 1e10; global_max_offset = -1e10;
-        global_min_root_delay = 1e10; global_max_root_delay = -1e10;
-        global_min_root_disp = 1e10; global_max_root_disp = -1e10;
-        global_min_max_error = 1e10; global_max_max_error = -1e10;
-        
-        global_sum_freq = 0; global_sum_skew = 0; global_sum_offset = 0;
-        global_sum_root_delay = 0; global_sum_root_disp = 0; global_sum_max_error = 0;
-        global_count = 0;
-    }
-    {
-        ip = $3;
-        freq = $5;
-        skew = $7;
-        offset = $8;
-        root_delay = $13;
-        root_disp = $15;
-        max_error = $17;
-        
-        count[ip]++;
-        global_count++;
-        
-        # First sample for this IP, initialize min/max
-        if (count[ip] == 1) {
-            min_freq[ip] = max_freq[ip] = freq;
-            min_skew[ip] = max_skew[ip] = skew;
-            min_offset[ip] = max_offset[ip] = offset;
-            min_root_delay[ip] = max_root_delay[ip] = root_delay;
-            min_root_disp[ip] = max_root_disp[ip] = root_disp;
-            min_max_error[ip] = max_max_error[ip] = max_error;
-        } else {
-            # Update min/max for this IP
-            if (freq < min_freq[ip]) min_freq[ip] = freq;
-            if (freq > max_freq[ip]) max_freq[ip] = freq;
-            
-            if (skew < min_skew[ip]) min_skew[ip] = skew;
-            if (skew > max_skew[ip]) max_skew[ip] = skew;
-            
-            if (offset < min_offset[ip]) min_offset[ip] = offset;
-            if (offset > max_offset[ip]) max_offset[ip] = offset;
-            
-            if (root_delay < min_root_delay[ip]) min_root_delay[ip] = root_delay;
-            if (root_delay > max_root_delay[ip]) max_root_delay[ip] = root_delay;
-            
-            if (root_disp < min_root_disp[ip]) min_root_disp[ip] = root_disp;
-            if (root_disp > max_root_disp[ip]) max_root_disp[ip] = root_disp;
-            
-            if (max_error < min_max_error[ip]) min_max_error[ip] = max_error;
-            if (max_error > max_max_error[ip]) max_max_error[ip] = max_error;
-        }
-        
-        # Update global min/max
-        if (freq < global_min_freq) global_min_freq = freq;
-        if (freq > global_max_freq) global_max_freq = freq;
-        
-        if (skew < global_min_skew) global_min_skew = skew;
-        if (skew > global_max_skew) global_max_skew = skew;
-        
-        if (offset < global_min_offset) global_min_offset = offset;
-        if (offset > global_max_offset) global_max_offset = offset;
-        
-        if (root_delay < global_min_root_delay) global_min_root_delay = root_delay;
-        if (root_delay > global_max_root_delay) global_max_root_delay = root_delay;
-        
-        if (root_disp < global_min_root_disp) global_min_root_disp = root_disp;
-        if (root_disp > global_max_root_disp) global_max_root_disp = root_disp;
-        
-        if (max_error < global_min_max_error) global_min_max_error = max_error;
-        if (max_error > global_max_max_error) global_max_max_error = max_error;
-        
-        # Accumulate sums for averages
-        sum_freq[ip] += freq;
-        sum_skew[ip] += skew;
-        sum_offset[ip] += offset;
-        sum_root_delay[ip] += root_delay;
-        sum_root_disp[ip] += root_disp;
-        sum_max_error[ip] += max_error;
-        
-        # Accumulate global sums
-        global_sum_freq += freq;
-        global_sum_skew += skew;
-        global_sum_offset += offset;
-        global_sum_root_delay += root_delay;
-        global_sum_root_disp += root_disp;
-        global_sum_max_error += max_error;
-    }
-    END {
-        # Output per-IP statistics
-        for (ip in count) {
-            printf "%s,%d,%.6f,%.6f,%.6e,%.6e,%.6e,%.6e\n", 
-                ip, count[ip],
-                sum_freq[ip]/count[ip],
-                sum_skew[ip]/count[ip],
-                sum_offset[ip]/count[ip],
-                sum_root_delay[ip]/count[ip],
-                sum_root_disp[ip]/count[ip],
-                sum_max_error[ip]/count[ip];
-        }
-        
-        # Output global statistics to a separate file with units
-        if (global_count > 0) {
-            print "OVERALL STATISTICS" > "/tmp/chrony_stats.tmp";
-            print "Total samples across all IPs: " global_count > "/tmp/chrony_stats.tmp";
-            print "" > "/tmp/chrony_stats.tmp";
-            
-            print "Frequency (ppm):" > "/tmp/chrony_stats.tmp";
-            printf "  Min: %.6f ppm\n", global_min_freq > "/tmp/chrony_stats.tmp";
-            printf "  Max: %.6f ppm\n", global_max_freq > "/tmp/chrony_stats.tmp";
-            printf "  Avg: %.6f ppm\n", global_sum_freq/global_count > "/tmp/chrony_stats.tmp";
-            print "" > "/tmp/chrony_stats.tmp";
-            
-            print "Skew (ppm):" > "/tmp/chrony_stats.tmp";
-            printf "  Min: %.6f ppm\n", global_min_skew > "/tmp/chrony_stats.tmp";
-            printf "  Max: %.6f ppm\n", global_max_skew > "/tmp/chrony_stats.tmp";
-            printf "  Avg: %.6f ppm\n", global_sum_skew/global_count > "/tmp/chrony_stats.tmp";
-            print "" > "/tmp/chrony_stats.tmp";
-            
-            print "Offset:" > "/tmp/chrony_stats.tmp";
-            printf "  Min: %.6e seconds\n", global_min_offset > "/tmp/chrony_stats.tmp";
-            printf "  Max: %.6e seconds\n", global_max_offset > "/tmp/chrony_stats.tmp";
-            printf "  Avg: %.6e seconds\n", global_sum_offset/global_count > "/tmp/chrony_stats.tmp";
-            print "" > "/tmp/chrony_stats.tmp";
-            
-            print "Root Delay:" > "/tmp/chrony_stats.tmp";
-            printf "  Min: %.6e seconds\n", global_min_root_delay > "/tmp/chrony_stats.tmp";
-            printf "  Max: %.6e seconds\n", global_max_root_delay > "/tmp/chrony_stats.tmp";
-            printf "  Avg: %.6e seconds\n", global_sum_root_delay/global_count > "/tmp/chrony_stats.tmp";
-            print "" > "/tmp/chrony_stats.tmp";
-            
-            print "Root Dispersion:" > "/tmp/chrony_stats.tmp";
-            printf "  Min: %.6e seconds\n", global_min_root_disp > "/tmp/chrony_stats.tmp";
-            printf "  Max: %.6e seconds\n", global_max_root_disp > "/tmp/chrony_stats.tmp";
-            printf "  Avg: %.6e seconds\n", global_sum_root_disp/global_count > "/tmp/chrony_stats.tmp";
-            print "" > "/tmp/chrony_stats.tmp";
-            
-            print "Max Error:" > "/tmp/chrony_stats.tmp";
-            printf "  Min: %.6e seconds\n", global_min_max_error > "/tmp/chrony_stats.tmp";
-            printf "  Max: %.6e seconds\n", global_max_max_error > "/tmp/chrony_stats.tmp";
-            printf "  Avg: %.6e seconds\n", global_sum_max_error/global_count > "/tmp/chrony_stats.tmp";
-        }
-    }
-    ' "$temp_data_file" > "$output_file"
-    
-    # Move the temporary stats file to the final stats file
-    if [ "$mode" = "post" ] && [ -f "/tmp/chrony_stats.tmp" ]; then
-        mv "/tmp/chrony_stats.tmp" "$stats_file"
-    fi
-    
-    # Log all the detailed output instead of sending to stdout
-    {
-        echo "Analysis complete. Results stored in $output_file"
-        cat "$output_file"
-        
-        echo ""
-        echo "Sample statistics:"
-        cat "$sample_count_file"
-        
-        if [ "$mode" = "post" ] && [ -f "$stats_file" ]; then
-            echo ""
-            echo "Overall statistics:"
-            cat "$stats_file"
-        fi
-    } >> "$analysis_log"
-    
-    echo "Analysis complete. Details in $analysis_log" # Line 2 of stdout
-    
-    # Return the last timestamp for pre-experimentation
-    if [ "$mode" = "pre" ]; then
-        echo "Timestamp: $last_timestamp" # Line 3 of stdout for pre mode
-    fi
-}
+  } > "$per_sample"
 
-# Function to compare pre and post experimentation results
-compare_results() {
-    local id=$1
-    local chrony_dir="/tmp/exp/$id/chrony"
-    
-    local pre_file="$chrony_dir/chrony_analysis_pre.txt"
-    local post_file="$chrony_dir/chrony_analysis_post.txt"
-    local pre_samples_file="$chrony_dir/chrony_pre_sample_counts.txt"
-    local post_samples_file="$chrony_dir/chrony_post_sample_counts.txt"
-    local post_stats_file="$chrony_dir/chrony_post_stats.txt"
-    local threshold=30  # 30% variation threshold
-    local failure_reason_file="$chrony_dir/chrony_failure_reasons.txt"
-    local detailed_report_file="$chrony_dir/chrony_detailed_report.txt"
-    local comparison_file="$chrony_dir/chrony_comparison.txt"
-    
-    if [ ! -f "$pre_file" ] || [ ! -f "$post_file" ]; then
-        echo "Error: Analysis files not found" # Line 3 of stdout on error
-        return 1
-    fi
-    
-    echo "Comparing results..." # Line 3 of stdout
-    
-    # Create a temporary file to store comparison results and failure reasons
-    echo "IP Address,Status,Freq_Var%,Skew_Var%,Offset_Var%,Root_delay_Var%,Root_disp_Var%,Max_error_Var%" > "$comparison_file"
-    > "$failure_reason_file"  # Initialize empty failure reason file
-    
-    # Start building a detailed report
-    print_header "$detailed_report_file"
-    
-    {
-        echo "EXPERIMENT ANALYSIS DETAILED REPORT"
-        echo "====================================="
-        echo ""
-        
-        echo "PRE-EXPERIMENTATION SAMPLE STATISTICS"
-        echo "-------------------------------------"
-        cat "$pre_samples_file"
-        echo ""
-        
-        echo "POST-EXPERIMENTATION SAMPLE STATISTICS"
-        echo "--------------------------------------"
-        cat "$post_samples_file"
-        echo ""
-        
-        if [ -f "$post_stats_file" ]; then
-            echo "POST-EXPERIMENTATION OVERALL STATISTICS"
-            echo "--------------------------------------"
-            cat "$post_stats_file"
-            echo ""
-        fi
-        
-        echo "COMPARISON RESULTS (Threshold: ${threshold}%)"
-        echo "-------------------------------------"
-    } >> "$detailed_report_file"
-    
-    # Extract the data using grep and process line by line
-    for ip in $(tail -n +2 "$pre_file" | cut -d, -f1); do
-        pre_line=$(grep "^$ip," "$pre_file")
-        post_line=$(grep "^$ip," "$post_file")
-        
-        if [ -n "$post_line" ]; then
-            # Extract values from pre line
-            pre_count=$(echo "$pre_line" | cut -d, -f2)
-            pre_freq=$(echo "$pre_line" | cut -d, -f3)
-            pre_skew=$(echo "$pre_line" | cut -d, -f4)
-            pre_offset=$(echo "$pre_line" | cut -d, -f5)
-            pre_root_delay=$(echo "$pre_line" | cut -d, -f6)
-            pre_root_disp=$(echo "$pre_line" | cut -d, -f7)
-            pre_max_error=$(echo "$pre_line" | cut -d, -f8)
-            
-            # Extract values from post line
-            post_count=$(echo "$post_line" | cut -d, -f2)
-            post_freq=$(echo "$post_line" | cut -d, -f3)
-            post_skew=$(echo "$post_line" | cut -d, -f4)
-            post_offset=$(echo "$post_line" | cut -d, -f5)
-            post_root_delay=$(echo "$post_line" | cut -d, -f6)
-            post_root_disp=$(echo "$post_line" | cut -d, -f7)
-            post_max_error=$(echo "$post_line" | cut -d, -f8)
-            
-            # Using awk for simple percentage calculations - much safer than bc
-            freq_var=$(awk -v pre="$pre_freq" -v post="$post_freq" 'BEGIN {
-                if (pre == 0 && post == 0) { print "0.00"; exit; }
-                if (pre == 0) { print "100.00"; exit; }
-                diff = post - pre;
-                if (diff < 0) diff = -diff;
-                if (pre < 0) pre = -pre;
-                printf "%.2f", (100 * diff / pre);
-            }')
-            
-            skew_var=$(awk -v pre="$pre_skew" -v post="$post_skew" 'BEGIN {
-                if (pre == 0 && post == 0) { print "0.00"; exit; }
-                if (pre == 0) { print "100.00"; exit; }
-                diff = post - pre;
-                if (diff < 0) diff = -diff;
-                if (pre < 0) pre = -pre;
-                printf "%.2f", (100 * diff / pre);
-            }')
-            
-            offset_var=$(awk -v pre="$pre_offset" -v post="$post_offset" 'BEGIN {
-                if (pre == 0 && post == 0) { print "0.00"; exit; }
-                if (pre == 0) { print "100.00"; exit; }
-                diff = post - pre;
-                if (diff < 0) diff = -diff;
-                if (pre < 0) pre = -pre;
-                printf "%.2f", (100 * diff / pre);
-            }')
-            
-            root_delay_var=$(awk -v pre="$pre_root_delay" -v post="$post_root_delay" 'BEGIN {
-                if (pre == 0 && post == 0) { print "0.00"; exit; }
-                if (pre == 0) { print "100.00"; exit; }
-                diff = post - pre;
-                if (diff < 0) diff = -diff;
-                if (pre < 0) pre = -pre;
-                printf "%.2f", (100 * diff / pre);
-            }')
-            
-            root_disp_var=$(awk -v pre="$pre_root_disp" -v post="$post_root_disp" 'BEGIN {
-                if (pre == 0 && post == 0) { print "0.00"; exit; }
-                if (pre == 0) { print "100.00"; exit; }
-                diff = post - pre;
-                if (diff < 0) diff = -diff;
-                if (pre < 0) pre = -pre;
-                printf "%.2f", (100 * diff / pre);
-            }')
-            
-            max_error_var=$(awk -v pre="$pre_max_error" -v post="$post_max_error" 'BEGIN {
-                if (pre == 0 && post == 0) { print "0.00"; exit; }
-                if (pre == 0) { print "100.00"; exit; }
-                diff = post - pre;
-                if (diff < 0) diff = -diff;
-                if (pre < 0) pre = -pre;
-                printf "%.2f", (100 * diff / pre);
-            }')
-            
-            # Determine status - using awk for comparison to avoid bc
-            status="PASS"
-            
-            # Create an array of metrics and their variations to check
-            metrics=("Freq" "Skew" "Offset" "Root_delay" "Root_disp" "Max_error")
-            variations=("$freq_var" "$skew_var" "$offset_var" "$root_delay_var" "$root_disp_var" "$max_error_var")
-            pre_values=("$pre_freq" "$pre_skew" "$pre_offset" "$pre_root_delay" "$pre_root_disp" "$pre_max_error")
-            post_values=("$post_freq" "$post_skew" "$post_offset" "$post_root_delay" "$post_root_disp" "$post_max_error")
-            
-            # Check if any variation exceeds the threshold
-            for i in "${!metrics[@]}"; do
-                var="${variations[$i]}"
-                if [ -n "$var" ]; then
-                    # Use a simple numeric comparison with awk
-                    exceeds=$(awk -v var="$var" -v threshold="$threshold" 'BEGIN { print (var > threshold) ? "yes" : "no" }')
-                    if [ "$exceeds" = "yes" ]; then
-                        status="FAIL"
-                        failure_msg="IP $ip: ${metrics[$i]} variation ($var%) exceeds threshold ($threshold%)"
-                        failure_detail="  Pre-value: ${pre_values[$i]}, Post-value: ${post_values[$i]}, Samples: Pre=$pre_count, Post=$post_count"
-                        echo "$failure_msg" >> "$failure_reason_file"
-                        echo "$failure_detail" >> "$failure_reason_file"
-                    fi
-                fi
-            done
-            
-            echo "$ip,$status,$freq_var,$skew_var,$offset_var,$root_delay_var,$root_disp_var,$max_error_var" >> "$comparison_file"
-            
-            # Add to detailed report
-            {
-                echo "IP: $ip"
-                echo "  Status: $status"
-                echo "  Samples: Pre=$pre_count, Post=$post_count"
-                echo "  Variations:"
-                echo "    Freq: $freq_var% (Pre=$pre_freq ppm, Post=$post_freq ppm)"
-                echo "    Skew: $skew_var% (Pre=$pre_skew ppm, Post=$post_skew ppm)"
-                echo "    Offset: $offset_var% (Pre=$pre_offset seconds, Post=$post_offset seconds)"
-                echo "    Root delay: $root_delay_var% (Pre=$pre_root_delay seconds, Post=$post_root_delay seconds)"
-                echo "    Root disp: $root_disp_var% (Pre=$pre_root_disp seconds, Post=$post_root_disp seconds)"
-                echo "    Max error: $max_error_var% (Pre=$pre_max_error seconds, Post=$post_max_error seconds)"
-                echo ""
-            } >> "$detailed_report_file"
-            
-        else
-            echo "$ip,NOT_FOUND_IN_POST,N/A,N/A,N/A,N/A,N/A,N/A" >> "$comparison_file"
-            echo "IP $ip: Not found in post-experimentation data" >> "$failure_reason_file"
-            
-            # Add to detailed report
-            {
-                echo "IP: $ip"
-                echo "  Status: NOT_FOUND_IN_POST"
-                echo "  Samples: Pre=$pre_count, Post=0"
-                echo ""
-            } >> "$detailed_report_file"
-        fi
-    done
-    
-    # Check for any new IPs in post that weren't in pre
-    for ip in $(tail -n +2 "$post_file" | cut -d, -f1); do
-        if ! grep -q "^$ip," "$pre_file"; then
-            post_count=$(grep "^$ip," "$post_file" | cut -d, -f2)
-            echo "$ip,NEW_IP_IN_POST,N/A,N/A,N/A,N/A,N/A,N/A" >> "$comparison_file"
-            echo "IP $ip: New IP found only in post-experimentation data" >> "$failure_reason_file"
-            
-            # Add to detailed report
-            {
-                echo "IP: $ip"
-                echo "  Status: NEW_IP_IN_POST"
-                echo "  Samples: Pre=0, Post=$post_count"
-                echo ""
-            } >> "$detailed_report_file"
-        fi
-    done
-    
-    # Add overall status to detailed report
-    {
-        echo "OVERALL EXPERIMENT RESULT"
-        echo "========================="
-    } >> "$detailed_report_file"
-    
-    # Overall experiment status
-    if grep -q "FAIL" "$comparison_file"; then
-        echo "RESULT: FAIL (See $detailed_report_file for details)" # Line 4 of stdout
-        
-        # Add failure reasons to detailed report
-        {
-            echo "Status: FAIL"
-            echo "Reasons for failure:"
-            cat "$failure_reason_file"
-        } >> "$detailed_report_file"
-        
-        return 1
+  local per_sample_result; per_sample_result=$(tail -1 "$per_sample" | cut -d':' -f2)
+
+  # Collect per-IP stats (means & std)
+  if [ "$total" -gt 0 ]; then
+    awk -F'[[:space:]]+' -v OFREQ=$FIELD_FREQ -v OSKEW=$FIELD_SKEW -v OOFF=$FIELD_OFFSET '
+      {
+        ip=$3
+        f=$(OFREQ)+0; sk=$(OSKEW)+0; off=$(OOFF)+0
+        c[ip]++
+        sf[ip]+=f; ss[ip]+=sk; so[ip]+=off
+        sf2[ip]+=f*f; ss2[ip]+=sk*sk; so2[ip]+=off*off
+      }
+      END{
+        print "IP,Count,Mean_Freq_ppm,Mean_Skew_ppm,Mean_Offset_s,Std_Freq_ppm,Std_Skew_ppm,Std_Offset_s,MeanOffsetToStdPercent"
+        for(ip in c){
+          n=c[ip]
+          mf=sf[ip]/n; msk=ss[ip]/n; mo=so[ip]/n
+          vf=(sf2[ip]/n)-(mf*mf); if(vf<0)vf=0
+          vsk=(ss2[ip]/n)-(msk*msk); if(vsk<0)vsk=0
+          vo=(so2[ip]/n)-(mo*mo); if(vo<0)vo=0
+          sfreq=sqrt(vf); sskew=sqrt(vsk); soff=sqrt(vo)
+          # mean/std percent (offset)
+          msp="NA"
+          if(soff==0){
+            if(mo==0) msp=0.0; else msp="INF"
+          } else {
+            am=(mo<0?-mo:mo)
+            msp= (am/soff)*100.0
+          }
+          printf "%s,%d,%.15g,%.15g,%.15g,%.15g,%.15g,%.15g,%.15g\n", ip,n,mf,msk,mo,sfreq,sskew,soff,msp
+        }
+      }' "$raw" > "$per_ip"
+  else
+    echo "IP,Count,Mean_Freq_ppm,Mean_Skew_ppm,Mean_Offset_s,Std_Freq_ppm,Std_Skew_ppm,Std_Offset_s,MeanOffsetToStdPercent" > "$per_ip"
+  fi
+
+  # Global aggregates (across all samples)
+  # Build temporary arrays for offsets, freq, skew absolute values
+  local g_mean_off=0 g_mean_freq=0 g_mean_skew=0 g_std_off=0 g_std_freq=0 g_std_skew=0
+  if [ "$total" -gt 0 ]; then
+    # Use awk to compute global stats and also produce lists for empirical
+    local temp_global="$dir/.__global_${phase}_values.tmp"
+    awk -v OFREQ=$FIELD_FREQ -v OSKEW=$FIELD_SKEW -v OOFF=$FIELD_OFFSET '
+      function abs(x){return x<0?-x:x}
+      /^[0-9]/ {
+        off=$(OOFF)+0; f=$(OFREQ)+0; sk=$(OSKEW)+0
+        o[++no]=off; fA[++nf]=f; sA[++ns]=sk
+        so+=off; so2+=off*off
+        sf+=f; sf2+=f*f
+        ss+=sk; ss2+=sk*sk
+      }
+      END{
+        if(no>0){
+          mo=so/no; vo=(so2/no)-(mo*mo); if(vo<0)vo=0
+          mf=sf/nf; vf=(sf2/nf)-(mf*mf); if(vf<0)vf=0
+          ms=ss/ns; vs=(ss2/ns)-(ms*ms); if(vs<0)vs=0
+          printf "G_MEAN_OFFSET %.15g\nG_STD_OFFSET %.15g\n", mo, sqrt(vo)
+          printf "G_MEAN_FREQ %.15g\nG_STD_FREQ %.15g\n", mf, sqrt(vf)
+          printf "G_MEAN_SKEW %.15g\nG_STD_SKEW %.15g\n", ms, sqrt(vs)
+          # Output raw lists for percentiles:
+          for(i=1;i<=no;i++) printf "LIST_OFFSET %.15g\n", o[i]
+          for(i=1;i<=nf;i++) printf "LIST_FREQ %.15g\n", fA[i]
+          for(i=1;i<=ns;i++) printf "LIST_SKEW %.15g\n", sA[i]
+        }
+      }' "$raw" > "$temp_global"
+
+    g_mean_off=$(awk '/^G_MEAN_OFFSET/ {print $2}' "$temp_global")
+    g_std_off=$(awk '/^G_STD_OFFSET/ {print $2}' "$temp_global")
+    g_mean_freq=$(awk '/^G_MEAN_FREQ/ {print $2}' "$temp_global")
+    g_std_freq=$(awk '/^G_STD_FREQ/ {print $2}' "$temp_global")
+    g_mean_skew=$(awk '/^G_MEAN_SKEW/ {print $2}' "$temp_global")
+    g_std_skew=$(awk '/^G_STD_SKEW/ {print $2}' "$temp_global")
+
+    # Build empirical 97.5% for sample-level absolute values
+    local emp_off emp_freq emp_skew
+    emp_off=$(grep '^LIST_OFFSET' "$temp_global" | awk '{print ($2<0)?-$2:$2}' | sort -n | empirical_q97_5)
+    emp_freq=$(grep '^LIST_FREQ' "$temp_global" | awk '{print ($2<0)?-$2:$2}' | sort -n | empirical_q97_5)
+    emp_skew=$(grep '^LIST_SKEW' "$temp_global" | awk '{print ($2<0)?-$2:$2}' | sort -n | empirical_q97_5)
+
+    local par_off par_freq par_skew
+    par_off=$(parametric_97_5 "$g_mean_off" "$g_std_off")
+    par_freq=$(parametric_97_5 "$g_mean_freq" "$g_std_freq")
+    par_skew=$(parametric_97_5 "$g_mean_skew" "$g_std_skew")
+
+    # Per-IP distributions for offset std & mean/std%
+    local ip_std_p97 ip_msp_p97 ip_std_list ip_msp_list
+    ip_std_list=$(tail -n +2 "$per_ip" | cut -d',' -f8 | grep -v '^$' || true)
+    if [ -n "$ip_std_list" ]; then
+      ip_std_p97=$(printf "%s\n" "$ip_std_list" | sort -n | empirical_q97_5)
     else
-        echo "RESULT: PASS (See $detailed_report_file for details)" # Line 4 of stdout
-        
-        # Add success message to detailed report
-        {
-            echo "Status: PASS"
-            echo "All metrics are within acceptable threshold limits (${threshold}%)."
-        } >> "$detailed_report_file"
-        
-        return 0
+      ip_std_p97="NA"
     fi
+    ip_msp_list=$(tail -n +2 "$per_ip" | cut -d',' -f9 | grep -v '^$' | grep -v 'NA' || true)
+    if [ -n "$ip_msp_list" ]; then
+      # Replace INF with a huge number to sort (will become FAIL anyway at validation)
+      ip_msp_p97=$(printf "%s\n" "$ip_msp_list" | sed 's/INF/1e309/' | sort -n | empirical_q97_5)
+      # Convert 1e309 back to INF if produced
+      if [[ "$ip_msp_p97" == "inf" || "$ip_msp_p97" == "1e+309" || "$ip_msp_p97" == "1e309" ]]; then
+        ip_msp_p97="INF"
+      fi
+    else
+      ip_msp_p97="NA"
+    fi
+
+    # Global offset mean/std percent
+    local global_offset_mean_std_percent="NA"
+    if awk -v s="$g_std_off" 'BEGIN{exit (s==0)?0:1}'; then
+      # std = 0
+      if awk -v m="$g_mean_off" 'BEGIN{exit (m==0)?0:1}'; then
+        global_offset_mean_std_percent="0"
+      else
+        global_offset_mean_std_percent="INF"
+      fi
+    else
+      global_offset_mean_std_percent=$(awk -v m="$g_mean_off" -v s="$g_std_off" '
+        function abs(x){return x<0?-x:x}
+        BEGIN{ printf "%.9f", (abs(m)/s)*100.0 }')
+    fi
+
+    # Evaluate checks
+    local check_sample_policy="FAIL"
+    [ "$per_sample_result" = "PASS" ] && check_sample_policy="PASS"
+    local check_offset_std="SKIP"
+    if [ -n "$OFFSET_STD_MAX" ] && [ "$total" -gt 0 ]; then
+      check_offset_std=$(awk -v s="$g_std_off" -v lim="$OFFSET_STD_MAX" 'BEGIN{print (s<=lim)?"PASS":"FAIL"}')
+    fi
+    local check_offset_mean_std="FAIL"
+    if [ "$global_offset_mean_std_percent" = "INF" ]; then
+      check_offset_mean_std="FAIL"
+    elif [ "$global_offset_mean_std_percent" = "NA" ]; then
+      check_offset_mean_std="FAIL"
+    else
+      check_offset_mean_std=$(awk -v v="$global_offset_mean_std_percent" -v lim="$OFFSET_MEAN_STD_PERCENT_MAX" 'BEGIN{print (v<=lim)?"PASS":"FAIL"}')
+    fi
+
+    local phase_pass="PASS"
+    if [ "$total" -lt "$MIN_SAMPLES_FOR_SYNC" ]; then phase_pass="FAIL"; fi
+    if [ "$per_sample_result" != "PASS" ]; then phase_pass="FAIL"; fi
+    if [ "$check_offset_std" = "FAIL" ]; then phase_pass="FAIL"; fi
+    if [ "$check_offset_mean_std" = "FAIL" ]; then phase_pass="FAIL"; fi
+
+    {
+      echo "PHASE=$phase"
+      echo "TOTAL_SAMPLES=$total"
+      echo "GLOBAL_OFFSET_MEAN=$g_mean_off"
+      echo "GLOBAL_OFFSET_STD=$g_std_off"
+      echo "GLOBAL_FREQ_MEAN=$g_mean_freq"
+      echo "GLOBAL_FREQ_STD=$g_std_freq"
+      echo "GLOBAL_SKEW_MEAN=$g_mean_skew"
+      echo "GLOBAL_SKEW_STD=$g_std_skew"
+      echo "EMP_97P5_OFFSET_ABS=$emp_off"
+      echo "EMP_97P5_FREQ_ABS=$emp_freq"
+      echo "EMP_97P5_SKEW_ABS=$emp_skew"
+      echo "PAR_97P5_OFFSET=$par_off"
+      echo "PAR_97P5_FREQ=$par_freq"
+      echo "PAR_97P5_SKEW=$par_skew"
+      echo "PERIP_OFFSET_STD_EMP97P5=$ip_std_p97"
+      echo "PERIP_MEAN_STD_PERCENT_EMP97P5=$ip_msp_p97"
+      echo "GLOBAL_OFFSET_MEAN_STD_PERCENT=$global_offset_mean_std_percent"
+      echo "CHECK_SAMPLE_POLICY=$check_sample_policy"
+      echo "CHECK_OFFSET_STD=$check_offset_std"
+      echo "CHECK_OFFSET_MEAN_STD_PERCENT=$check_offset_mean_std"
+      echo "OFFSET_STD_MAX=${OFFSET_STD_MAX:-<unset>}"
+      echo "OFFSET_MEAN_STD_PERCENT_MAX=$OFFSET_MEAN_STD_PERCENT_MAX"
+      echo "PHASE_PASS=$phase_pass"
+    } > "$out"
+
+    # JSON (minimal)
+    if [ "$ENABLE_JSON" = "1" ]; then
+      local indent=""; [ "$JSON_PRETTY" = "1" ] && indent="  "
+      {
+        echo "{"
+        echo "${indent}\"phase\": \"$phase\","
+        echo "${indent}\"total_samples\": $total,"
+        echo "${indent}\"phase_pass\": \"$phase_pass\","
+        echo "${indent}\"global_offset_mean\": $g_mean_off,"
+        echo "${indent}\"global_offset_std\": $g_std_off,"
+        echo "${indent}\"global_offset_mean_std_percent\": \"$global_offset_mean_std_percent\","
+        echo "${indent}\"offset_std_check\": \"$check_offset_std\","
+        echo "${indent}\"offset_mean_std_percent_check\": \"$check_offset_mean_std\","
+        echo "${indent}\"empirical_97p5\": {"
+        echo "${indent}  \"offset_abs\": \"$emp_off\","
+        echo "${indent}  \"freq_abs\": \"$emp_freq\","
+        echo "${indent}  \"skew_abs\": \"$emp_skew\","
+        echo "${indent}  \"per_ip_offset_std\": \"$ip_std_p97\","
+        echo "${indent}  \"per_ip_mean_std_percent\": \"$ip_msp_p97\""
+        echo "${indent}},"
+        echo "${indent}\"parametric_97p5\": {"
+        echo "${indent}  \"offset\": \"$par_off\","
+        echo "${indent}  \"freq\": \"$par_freq\","
+        echo "${indent}  \"skew\": \"$par_skew\""
+        echo "${indent}}"
+        echo "}"
+      } > "$out.json"
+    fi
+
+  else
+    {
+      echo "PHASE=$phase"
+      echo "TOTAL_SAMPLES=0"
+      echo "PHASE_PASS=FAIL"
+      echo "CHECK_SAMPLE_POLICY=NO_DATA"
+      echo "CHECK_OFFSET_STD=SKIP"
+      echo "CHECK_OFFSET_MEAN_STD_PERCENT=FAIL"
+    } > "$out"
+  fi
 }
 
-# Main function
+# ---------- Final Report ----------
+final_report() {
+  local id="$1" dir="/tmp/exp/$id/chrony"
+  local pre="$dir/chrony_pre_phase_summary.txt"
+  local post="$dir/chrony_post_phase_summary.txt"
+  local report="$dir/chrony_final_report.txt"
+
+  local pre_pass post_pass
+  pre_pass=$(grep '^PHASE_PASS=' "$pre" 2>/dev/null | cut -d'=' -f2 || echo "FAIL")
+  post_pass=$(grep '^PHASE_PASS=' "$post" 2>/dev/null | cut -d'=' -f2 || echo "FAIL")
+
+  local overall="PASS"
+  [ "$pre_pass" != "PASS" ] && overall="FAIL"
+  [ "$post_pass" != "PASS" ] && overall="FAIL"
+
+  {
+    echo "==== FINAL REPORT ===="
+    echo "Per-sample bands: offset<=$MAX_OFFSET_SEC s freq<=$MAX_FREQ_PPM ppm skew<=$MAX_SKEW_PPM ppm"
+    echo "OffsetStd threshold: ${OFFSET_STD_MAX:-<unset>}"
+    echo "OffsetMean/Std% threshold: $OFFSET_MEAN_STD_PERCENT_MAX %"
+    echo "Min samples per phase: $MIN_SAMPLES_FOR_SYNC"
+    echo ""
+    echo "Pre phase:  $pre_pass"
+    echo "Post phase: $post_pass"
+    echo ""
+
+    echo "PRE SUMMARY:"
+    if [ -f "$pre" ]; then
+      grep -E '^(TOTAL_SAMPLES|GLOBAL_OFFSET_MEAN=|GLOBAL_OFFSET_STD=|GLOBAL_FREQ_MEAN=|GLOBAL_FREQ_STD=|GLOBAL_SKEW_MEAN=|GLOBAL_SKEW_STD=|EMP_97P5_|PAR_97P5_|PERIP_OFFSET_STD_EMP97P5=|PERIP_MEAN_STD_PERCENT_EMP97P5=|GLOBAL_OFFSET_MEAN_STD_PERCENT=|CHECK_)' "$pre"
+    else
+      echo " (missing)"
+    fi
+    echo ""
+    echo "POST SUMMARY:"
+    if [ -f "$post" ]; then
+      grep -E '^(TOTAL_SAMPLES|GLOBAL_OFFSET_MEAN=|GLOBAL_OFFSET_STD=|GLOBAL_FREQ_MEAN=|GLOBAL_FREQ_STD=|GLOBAL_SKEW_MEAN=|GLOBAL_SKEW_STD=|EMP_97P5_|PAR_97P5_|PERIP_OFFSET_STD_EMP97P5=|PERIP_MEAN_STD_PERCENT_EMP97P5=|GLOBAL_OFFSET_MEAN_STD_PERCENT=|CHECK_)' "$post"
+    else
+      echo " (missing)"
+    fi
+    echo ""
+    echo "OVERALL RESULT: $overall"
+  } > "$report"
+
+  echo "Comparing results..."
+  if [ "$overall" = "PASS" ]; then
+    echo "RESULT: PASS (See $report for details)"
+  else
+    echo "RESULT: FAIL (See $report for details)"
+  fi
+}
+
+# ---------- Main ----------
+usage(){ echo "Usage: $0 {pre|post} <id>"; exit 1; }
+
 main() {
-    # Check if ID is provided
-    if [ -z "$2" ]; then
-        echo "Usage: $0 {pre|post} <unique_id>"
-        exit 1
-    fi
-    
-    local mode="$1"
-    local id="$2"
-    
-    case "$mode" in
-        pre)
-            # Pre-experimentation analysis
-            analyze_chrony_data "pre" "$id"
-            ;;
-        post)
-            # Get the stored timestamp from pre-experimentation
-            local timestamp_file="/tmp/exp/$id/chrony/chrony_last_timestamp.txt"
-            if [ ! -f "$timestamp_file" ]; then
-                echo "Error: No stored timestamp found. Run pre-experimentation analysis first."
-                exit 1
-            fi
-            start_timestamp=$(cat "$timestamp_file")
-            
-            # Post-experimentation analysis
-            analyze_chrony_data "post" "$id" "$start_timestamp"
-            
-            # Compare results
-            compare_results "$id"
-            ;;
-        *)
-            echo "Usage: $0 {pre|post} <unique_id>"
-            exit 1
-            ;;
-    esac
+  [ $# -lt 2 ] && usage
+  local mode="$1" id="$2"
+  case "$mode" in
+    pre)
+      collect_pre "$id" || exit 1
+      ;;
+    post)
+      collect_post "$id" || exit 1
+      final_report "$id"
+      ;;
+    *)
+      usage
+      ;;
+  esac
 }
-
-# Execute main function with provided arguments
-main "$@"
