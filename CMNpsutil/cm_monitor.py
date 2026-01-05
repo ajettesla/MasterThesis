@@ -125,7 +125,6 @@ def system_cycles_thread():
     while True:
         cycles = get_cycles_per_sec()
         cycle_data.update_system(cycles)
-        time.sleep(1)  # Update every second
 
 # Thread function for process CPU cycles
 def process_cycles_thread(pid):
